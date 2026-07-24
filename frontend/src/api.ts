@@ -1,0 +1,110 @@
+export type MediaInfo = {
+  duration: number;
+  size: number;
+  width: number | null;
+  height: number | null;
+  fps: number;
+  has_audio: boolean;
+  vcodec: string | null;
+};
+
+export type MediaItem = { name: string; url: string; info: MediaInfo };
+
+export type JobOutput = { name: string; url: string; size: number };
+
+export type Job = {
+  id: string;
+  type: string;
+  input: string;
+  status: "queued" | "running" | "done" | "error";
+  progress: number;
+  message: string;
+  outputs: JobOutput[];
+  error: string | null;
+  created: number;
+};
+
+export type Health = {
+  status: string;
+  version: string;
+  gpu: { name: string; vram_total_mb: number } | null;
+  features: Record<string, boolean>;
+};
+
+export async function authStatus(): Promise<{ auth_required: boolean; authenticated: boolean }> {
+  const r = await fetch("/api/auth-status");
+  return r.json();
+}
+
+export async function login(password: string): Promise<void> {
+  const r = await fetch("/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password }),
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({ detail: "Đăng nhập thất bại" }));
+    throw new Error(e.detail);
+  }
+}
+
+export async function logout(): Promise<void> {
+  await fetch("/api/logout", { method: "POST" });
+}
+
+export async function getHealth(): Promise<Health> {
+  const r = await fetch("/api/health");
+  if (r.status === 401) throw new Error("401");
+  return r.json();
+}
+
+export async function getMedia(): Promise<MediaItem[]> {
+  const r = await fetch("/api/media");
+  return r.json();
+}
+
+export async function getJobs(): Promise<Job[]> {
+  const r = await fetch("/api/jobs");
+  return r.json();
+}
+
+export async function uploadFile(file: File): Promise<MediaItem> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const r = await fetch("/api/upload", { method: "POST", body: fd });
+  if (!r.ok) throw new Error("Upload thất bại");
+  return r.json();
+}
+
+export async function createJob(
+  type: string,
+  file: string,
+  params: Record<string, unknown>
+): Promise<Job> {
+  const r = await fetch("/api/jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type, file, params }),
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(e.detail || "Tạo job thất bại");
+  }
+  return r.json();
+}
+
+export async function openOutputs(): Promise<void> {
+  await fetch("/api/open-outputs", { method: "POST" });
+}
+
+export function fmtSize(b: number): string {
+  if (b > 1e9) return (b / 1e9).toFixed(2) + " GB";
+  if (b > 1e6) return (b / 1e6).toFixed(1) + " MB";
+  return (b / 1e3).toFixed(0) + " KB";
+}
+
+export function fmtDur(s: number): string {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, "0")}`;
+}
