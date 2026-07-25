@@ -84,6 +84,17 @@
   lệnh ép chạy Bash bị từ chối, không tạo file độc); semaphore 2 chặn nghẽn FastAPI; router engine
   fallback 2 chiều (máy chỉ có Claude không crash); CHUNK 120k cho sonnet 200k context; check envelope non-dict
 
+## ✅ ĐÃ XONG — v0.8 (wave 6 "Đạo diễn nhớ hội thoại + Giáo án nối AI-LMS")
+
+- [x] 🧠 **Đạo diễn AI nhớ hội thoại nhiều lượt**: giữ 12 lượt gần nhất, gửi lại cho Claude nên hiểu
+  tham chiếu ngữ cảnh ("tăng tốc *video đó*", "*cái vừa nãy*"). Nút 🗑 Quên + `POST /api/director/reset`.
+  Test thật: lượt 2 hiểu "video đó" = short.mp4 dù không nhắc tên.
+- [x] 📚 **Bài giảng → Giáo án + Quiz** (`lesson`): video/audio → transcript → AI soạn giáo án hoàn chỉnh
+  (mục tiêu, nội dung, ghi chú, N câu hỏi trắc nghiệm kèm đáp án) → xuất .md; chọn não Local/Claude.
+- [x] 🔗 **Nối AI-LMS**: tuỳ chọn đẩy thẳng giáo án vào SQLite `~/ai-lms/data/lms.db` làm bài học mới
+  (level 1-4 + bộ phận cho level 3, ord tự tính, rubric mặc định) — hai dự án gặp nhau. Test: đẩy PASS,
+  bản ghi đúng schema. `_push_to_ailms` dùng ? placeholder (không SQL injection), whitelist department/level.
+
 ## TIẾP THEO (đề xuất)
 
 ### GĐ 6 — SAM 2 track đối tượng (đã đánh giá khả thi 2026-07-25)

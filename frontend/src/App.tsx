@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   askDirector, authStatus, cancelJob, createJob, fmtDur, fmtSize, getHealth, getJobs,
-  getMedia, login, logout, openOutputs, uploadFile,
+  getMedia, login, logout, openOutputs, resetDirector, uploadFile,
   type Health, type Job, type MediaItem,
 } from "./api";
 
@@ -39,7 +39,7 @@ function LoginScreen({ onOk }: { onOk: () => void }) {
 type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" | "bg_remove"
   | "tts" | "reframe" | "speed" | "color" | "music" | "stabilize" | "export"
   | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
-  | "highlights" | "face_blur" | "content" | "director";
+  | "highlights" | "face_blur" | "content" | "director" | "lesson";
 
 const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: boolean }[] = [
   { key: "director", icon: "🎬", name: "Đạo diễn AI (Claude)", desc: "ra lệnh bằng lời — Claude tự xếp job", gpu: false },
@@ -59,6 +59,7 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "music", icon: "🎵", name: "Nhạc nền + ducking", desc: "tự nén nhạc khi có giọng nói", gpu: false },
   { key: "face_blur", icon: "🫥", name: "Làm mờ mặt tự động", desc: "YuNet AI · che mặt học sinh/người lạ", gpu: false },
   { key: "content", icon: "📝", name: "AI viết nội dung", desc: "tiêu đề · mô tả · hashtags · chapters", gpu: true },
+  { key: "lesson", icon: "📚", name: "Bài giảng → Giáo án + Quiz", desc: "AI soạn giáo án · đẩy sang AI-LMS", gpu: true },
   { key: "audio_enhance", icon: "🎚️", name: "Chuẩn hoá âm thanh", desc: "khử ồn + loudnorm -16 LUFS", gpu: false },
   { key: "brand", icon: "🏷️", name: "Tiêu đề & Logo", desc: "title mở đầu · chữ ký · watermark PNG", gpu: false },
   { key: "audiogram", icon: "📻", name: "Audiogram sóng nhạc", desc: "audio/TTS → video đăng MXH", gpu: false },
@@ -139,6 +140,11 @@ export default function App() {
   const [brOpacity, setBrOpacity] = useState(0.7);
   const [agTarget, setAgTarget] = useState("11");
   const [agTitle, setAgTitle] = useState("");
+  // wave 6 (v0.8) — giáo án
+  const [lsQuiz, setLsQuiz] = useState(5);
+  const [lsPush, setLsPush] = useState(false);
+  const [lsLevel, setLsLevel] = useState(1);
+  const [lsDept, setLsDept] = useState("");
   // wave 5 (v0.7) — Claude sub
   const [aiEngine, setAiEngine] = useState("local");
   const [dirMsg, setDirMsg] = useState("");
@@ -280,7 +286,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v0.7 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v0.8 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -371,6 +377,7 @@ export default function App() {
                      (t.key === "content" && !feats.content) ||
                      (t.key === "face_blur" && !feats.face_blur) ||
                      (t.key === "director" && !feats.director) ||
+                     (t.key === "lesson" && !feats.lesson) ||
                      (["reframe", "speed", "color", "music", "stabilize",
                        "merge", "audio_enhance", "brand", "audiogram"].includes(t.key) && !feats.ffmpeg) ||
                      (t.key === "export" && !feats.export) ? " disabled" : "")}
@@ -644,15 +651,75 @@ export default function App() {
                     {dirBusy && <div className="dmsg ai">⏳ Đạo diễn đang suy nghĩ...</div>}
                   </div>
                   <textarea className="ttsbox" rows={3} maxLength={2000} value={dirMsg}
-                    placeholder="Gõ yêu cầu cho đạo diễn..."
+                    placeholder="Gõ yêu cầu cho đạo diễn... (nhớ được hội thoại trước)"
                     onChange={(e) => setDirMsg(e.target.value)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendDirector(); }
                     }} />
-                  <button className="btn pri big" disabled={dirBusy || !dirMsg.trim()}
-                    onClick={sendDirector}>
-                    {dirBusy ? "⏳ Đang xử lý..." : "🎬 Gửi cho đạo diễn"}
-                  </button>
+                  <div className="optrow">
+                    <button className="btn pri big" style={{ flex: 1 }} disabled={dirBusy || !dirMsg.trim()}
+                      onClick={sendDirector}>
+                      {dirBusy ? "⏳ Đang xử lý..." : "🎬 Gửi cho đạo diễn"}
+                    </button>
+                    <button className="btn" title="Xoá bộ nhớ hội thoại"
+                      disabled={dirBusy || dirLog.length === 0}
+                      onClick={async () => { await resetDirector(); setDirLog([]); }}>🗑 Quên</button>
+                  </div>
+                </>
+              )}
+
+              {tool === "lesson" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    📚 AI nghe bài giảng và soạn giáo án hoàn chỉnh (mục tiêu, nội dung,
+                    ghi chú, câu hỏi ôn tập kèm đáp án) — xuất .md, có thể đẩy thẳng vào
+                    hệ đào tạo AI-LMS của bạn.
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Số câu hỏi ôn tập</span><b>{lsQuiz}</b></div>
+                    <input type="range" min={3} max={15} step={1} value={lsQuiz}
+                      onChange={(e) => setLsQuiz(parseInt(e.target.value))} />
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  {feats.ailms && (
+                    <div className="optrow">
+                      <label className="chk"><input type="checkbox" checked={lsPush} onChange={(e) => setLsPush(e.target.checked)} />
+                        Đẩy thẳng vào AI-LMS làm bài học mới</label>
+                    </div>
+                  )}
+                  {lsPush && feats.ailms && (
+                    <>
+                      <div className="field"><label>Cấp độ (level)</label>
+                        <div className="seg">
+                          {[1, 2, 3, 4].map((v) => (
+                            <button key={v} className={lsLevel === v ? "on" : ""} onClick={() => setLsLevel(v)}>{v}</button>
+                          ))}
+                        </div>
+                      </div>
+                      {lsLevel === 3 && (
+                        <div className="field"><label>Bộ phận (level 3)</label>
+                          <select value={lsDept} onChange={(e) => setLsDept(e.target.value)}>
+                            <option value="">— chung —</option>
+                            {["Marketing", "Sales", "Kế toán - Tài chính", "Nhân sự",
+                              "Vận hành", "Kỹ thuật - IT", "Ban lãnh đạo"].map((d) => (
+                              <option key={d} value={d}>{d}</option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+                    </>
+                  )}
+                  <button className="btn pri big" onClick={() => run("lesson", {
+                    quiz: lsQuiz, model: whModel, ai: aiEngine,
+                    push_lms: lsPush, level: lsLevel, department: lsLevel === 3 ? lsDept : null,
+                  })}>📚 Soạn giáo án</button>
                 </>
               )}
 

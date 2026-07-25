@@ -2009,6 +2009,123 @@ def job_content(job_id: str, src: Path, p: dict):
     return [out_entry(out)]
 
 
+# ---------------------------------------------------------------- job: lesson (bài giảng → giáo án + quiz)
+AILMS_DB = Path.home() / "ai-lms" / "data" / "lms.db"
+AILMS_DEPARTMENTS = {"Marketing", "Sales", "Kế toán - Tài chính", "Nhân sự",
+                     "Vận hành", "Kỹ thuật - IT", "Ban lãnh đạo"}
+
+
+def _safe_int(v, default: int) -> int:
+    """Ép về int an toàn — null/chuỗi lạ/float đều không làm sập job."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def ailms_available() -> bool:
+    return AILMS_DB.exists()
+
+
+def _push_to_ailms(title: str, summary: str, content: str,
+                   level: int, department) -> int:
+    """Chèn 1 bài học vào SQLite của AI-LMS (cùng máy). WAL cho phép ghi
+    song song trong lúc AI-LMS đang đọc."""
+    import sqlite3
+    if not AILMS_DB.exists():
+        raise RuntimeError("Không thấy CSDL AI-LMS (~/ai-lms/data/lms.db)")
+    con = sqlite3.connect(str(AILMS_DB), timeout=10)
+    try:
+        dept = department if department in AILMS_DEPARTMENTS else None
+        ord_row = con.execute(
+            "SELECT COALESCE(MAX(ord),0)+1 FROM lessons WHERE level=? AND "
+            "((department IS NULL AND ? IS NULL) OR department=?)",
+            (level, dept, dept)).fetchone()
+        rubric = ("Mức độ hoàn thành yêu cầu (40đ)\n"
+                  "Chất lượng và tính thực tế (30đ)\n"
+                  "Quá trình sử dụng AI: prompt và vòng lặp (30đ)")
+        cur = con.execute(
+            "INSERT INTO lessons (level, department, ord, title, summary, content, rubric) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (level, dept, ord_row[0], title, summary, content, rubric))
+        con.commit()
+        return cur.lastrowid
+    finally:
+        con.close()
+
+
+def job_lesson(job_id: str, src: Path, p: dict):
+    """Bài giảng (video/audio) → transcript → AI viết giáo án + câu hỏi quiz,
+    xuất .md; tuỳ chọn đẩy thẳng vào hệ AI-LMS."""
+    info = media_info(src)
+    dur = info["duration"] or 1
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    language = p.get("language") if p.get("language") in ("vi", "en") else None
+    seg_list, _l, lang = _speech_recognize(
+        job_id, src, model_size, language, p.get("engine"), dur, 3, 55)
+    lines = _transcript_lines(seg_list)
+    if not lines:
+        raise RuntimeError("Bài giảng không có lời thoại để soạn giáo án")
+    _cancel_point(job_id)
+
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+    if p.get("ai") == "claude" and not claude_available():
+        ai = "local"
+    if not llm_available() and claude_available():
+        ai = "claude"
+    brain = "Claude (gói sub)" if ai == "claude" else "Qwen3 local"
+
+    text_all = "\n".join(l.split("] ", 1)[-1] for l in lines)  # bỏ timestamp
+    cap = 120000 if ai == "claude" else 12000
+    if len(text_all) > cap:
+        text_all = text_all[:cap] + "\n[...lược bớt...]"
+    n_quiz = min(15, max(3, _safe_int(p.get("quiz"), 5)))
+
+    _set(job_id, progress=60, message=f"AI ({brain}) đang soạn giáo án + {n_quiz} câu hỏi...")
+    prompt = (
+        "Bạn là giáo viên soạn giáo án. Dưới đây là lời thoại một bài giảng "
+        f"(ngôn ngữ {lang}):\n\n{text_all}\n\n"
+        f"Soạn giáo án tiếng Việt. Trả về DUY NHẤT một object JSON:\n"
+        '{"title": "<tiêu đề bài học ngắn gọn>", '
+        '"summary": "<tóm tắt 1-2 câu>", '
+        '"content": "<nội dung Markdown: ## Mục tiêu bài học, ## Nội dung chính '
+        '(các ý gạch đầu dòng), ## Ghi chú cho học viên, ## Câu hỏi ôn tập '
+        f'({n_quiz} câu trắc nghiệm A/B/C/D kèm **Đáp án** cuối mỗi câu)>"}}'
+    )
+    try:
+        data = _extract_json(llm_generate(prompt, max_tokens=3000,
+                                          job_id=job_id, engine=ai))
+    except (ValueError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"AI không soạn được giáo án hợp lệ: {str(e)[:150]}")
+    if not isinstance(data, dict) or not data.get("content"):
+        raise RuntimeError("AI trả giáo án thiếu nội dung")
+
+    title = str(data.get("title") or src.stem)[:200]
+    summary = str(data.get("summary") or "")[:500]
+    content = str(data["content"])
+    _cancel_point(job_id)
+
+    md = unique_out(f"{src.stem}_giaoan", ".md")
+    md.write_text(f"# {title}\n\n> {summary}\n\n{content}\n", encoding="utf-8")
+    outputs = [out_entry(md)]
+
+    if p.get("push_lms"):
+        _set(job_id, progress=95, message="Đẩy bài học sang AI-LMS...")
+        level = _safe_int(p.get("level"), 1)
+        if level not in (1, 2, 3, 4):
+            level = 1
+        dept = p.get("department") or None
+        try:
+            lid = _push_to_ailms(title, summary, content, level, dept)
+            _set(job_id, message=f"Xong — giáo án ({brain}) + đã thêm vào AI-LMS (bài #{lid})")
+            return outputs
+        except Exception as e:  # noqa: BLE001 - giáo án đã có, chỉ báo lỗi bước đẩy
+            _set(job_id, message=f"Xong giáo án nhưng đẩy AI-LMS lỗi: {str(e)[:120]}")
+            return outputs
+    _set(job_id, message=f"Xong — giáo án + {n_quiz} câu hỏi ({brain})")
+    return outputs
+
+
 # ---------------------------------------------------------------- job: face blur
 def job_face_blur(job_id: str, src: Path, mode: str, strength: float):
     """Tự phát hiện & làm mờ mọi khuôn mặt (YuNet ONNX) — che mặt học sinh,
@@ -2157,7 +2274,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "0.7.0",
+        "version": "0.8.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "gpu": gpu_info(),
@@ -2189,6 +2306,8 @@ def health():
             "highlights": (llm_available() or claude_available()) and whisper_ok and ffmpeg_ok,
             "content": (llm_available() or claude_available()) and whisper_ok,
             "face_blur": cv2_available() and YUNET_ONNX.exists() and ffmpeg_ok,
+            "lesson": (llm_available() or claude_available()) and whisper_ok,
+            "ailms": ailms_available(),
         },
     }
 
@@ -2401,6 +2520,10 @@ def create_job(req: JobRequest):
             mode = "blur"
         strength = min(2.0, max(0.5, float(p.get("strength", 1.0))))
         return submit_job("face_blur", src.name, job_face_blur, src, mode, strength)
+    if req.type == "lesson":
+        if not llm_available() and not claude_available():
+            raise HTTPException(400, "Cần mlx-lm (LLM local) hoặc Claude CLI trên máy chủ")
+        return submit_job("lesson", src.name, job_lesson, src, dict(p))
     raise HTTPException(400, f"Loại job không hỗ trợ: {req.type}")
 
 
@@ -2409,7 +2532,7 @@ DIRECTOR_ALLOWED_TYPES = {
     "transcribe", "silence_cut", "upscale", "export", "rife", "bg_remove",
     "auto_edit", "reframe", "speed", "color", "music", "stabilize", "merge",
     "beatsync", "audio_enhance", "brand", "audiogram", "highlights", "content",
-    "face_blur", "tts",
+    "face_blur", "tts", "lesson",
 }
 
 DIRECTOR_CATALOG = """\
@@ -2433,20 +2556,38 @@ DIRECTOR_CATALOG = """\
 - highlights: AI cắt shorts từ video dài. params: count(1-6), min_dur, max_dur, make_shorts(bool), ai(local/claude)
 - content: AI viết tiêu đề/mô tả/hashtags. params: platform(tiktok/youtube), ai(local/claude)
 - face_blur: che mặt tự động. params: mode(blur/pixelate), strength(0.5-2)
+- lesson: bài giảng → giáo án + câu hỏi quiz (.md). params: quiz(số câu 3-15), push_lms(bool đẩy sang AI-LMS), level(1-4), department, ai(local/claude)
 - tts: đọc văn bản (KHÔNG cần file). params: text(chuỗi), voice(vi/en), speed(0.6-1.5)"""
 
 
 class DirectorReq(BaseModel):
     message: str
+    reset: bool = False
+
+
+# Bộ nhớ hội thoại của Đạo diễn (app cá nhân 1 người — 1 luồng chung, có khoá)
+DIRECTOR_HISTORY: list = []       # [{role: user|ai, text}]
+DIRECTOR_HISTORY_LOCK = threading.Lock()
+DIRECTOR_MAX_TURNS = 12           # giữ tối đa 12 lượt gần nhất gửi lại cho Claude
+
+
+@app.post("/api/director/reset")
+def director_reset():
+    with DIRECTOR_HISTORY_LOCK:
+        DIRECTOR_HISTORY.clear()
+    return {"ok": True}
 
 
 @app.post("/api/director")
 def director(req: DirectorReq):
     """Claude (gói sub) đọc yêu cầu → lập kế hoạch job. Backend validate lại
     TOÀN BỘ (whitelist type + create_job) rồi mới xếp hàng — Claude không có
-    quyền chạy gì trực tiếp."""
+    quyền chạy gì trực tiếp. Nhớ hội thoại nhiều lượt để hiểu 'cái vừa nãy'."""
     if not claude_available():
         raise HTTPException(400, "Chưa cài / đăng nhập Claude Code CLI trên máy chủ")
+    if req.reset:
+        with DIRECTOR_HISTORY_LOCK:
+            DIRECTOR_HISTORY.clear()
     msg = (req.message or "").strip()
     if not msg:
         raise HTTPException(400, "Thiếu nội dung yêu cầu")
@@ -2462,11 +2603,21 @@ def director(req: DirectorReq):
             items.append(f"- {pth.name} ({kind}, {inf['duration']:.0f}s)")
     media_desc = "\n".join(items) or "(kho media trống)"
 
+    with DIRECTOR_HISTORY_LOCK:
+        hist = list(DIRECTOR_HISTORY[-DIRECTOR_MAX_TURNS * 2:])
+    hist_desc = ""
+    if hist:
+        lines = [("Người dùng: " if h["role"] == "user" else "Bạn: ") + h["text"]
+                 for h in hist]
+        hist_desc = "HỘI THOẠI TRƯỚC ĐÓ (để hiểu 'cái vừa nãy', 'video đó'...):\n" \
+            + "\n".join(lines) + "\n\n"
+
     prompt = (
         "Bạn là đạo diễn hậu kỳ điều khiển app dựng video Local Studio.\n\n"
         f"KHO MEDIA (tên file phải dùng CHÍNH XÁC):\n{media_desc}\n\n"
         f"CÔNG CỤ (job type + params):\n{DIRECTOR_CATALOG}\n\n"
-        f"YÊU CẦU NGƯỜI DÙNG: {msg}\n\n"
+        f"{hist_desc}"
+        f"YÊU CẦU MỚI CỦA NGƯỜI DÙNG: {msg}\n\n"
         "Trả về DUY NHẤT một object JSON, không giải thích ngoài JSON:\n"
         '{"reply": "<trả lời ngắn gọn tiếng Việt: sẽ làm gì / hoặc câu trả lời nếu chỉ hỏi>", '
         '"actions": [{"type": "<job type>", "file": "<tên file trong kho, hoặc \\"\\" với tts>", '
@@ -2500,6 +2651,16 @@ def director(req: DirectorReq):
             errors.append(f"{jtype}: {e.detail}")
         except (ValueError, TypeError) as e:
             errors.append(f"{jtype}: tham số không hợp lệ ({str(e)[:80]})")
+
+    # ghi vào bộ nhớ hội thoại (tóm tắt hành động để lượt sau hiểu ngữ cảnh)
+    ai_note = reply
+    if created:
+        ai_note += " [đã xếp: " + ", ".join(
+            f"{j['type']}({j['input']})" for j in created) + "]"
+    with DIRECTOR_HISTORY_LOCK:
+        DIRECTOR_HISTORY.append({"role": "user", "text": msg[:500]})
+        DIRECTOR_HISTORY.append({"role": "ai", "text": ai_note[:500]})
+        del DIRECTOR_HISTORY[:-DIRECTOR_MAX_TURNS * 2]
     return {"reply": reply, "jobs": created, "errors": errors}
 
 

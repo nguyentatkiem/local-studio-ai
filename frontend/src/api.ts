@@ -108,6 +108,10 @@ export async function askDirector(message: string): Promise<{
   return r.json();
 }
 
+export async function resetDirector(): Promise<void> {
+  await fetch("/api/director/reset", { method: "POST" });
+}
+
 export async function cancelJob(id: string): Promise<void> {
   await fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
 }
