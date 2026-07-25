@@ -69,6 +69,21 @@
 - [x] 🫥 **Làm mờ mặt tự động** (`face_blur`): YuNet ONNX (232KB) phát hiện mặt mỗi khung ở bản
   thu nhỏ 640px, giữ box 6 khung chống nhấp nháy, blur Gaussian hoặc pixelate, nới box che tóc/cằm
 
+## ✅ ĐÃ XONG — v0.7 (wave 5 "Claude sub làm điều khiển")
+
+- [x] 🔌 **Kết nối gói Claude subscription** qua Claude Code CLI headless (`claude -p --output-format json`,
+  prompt qua stdin) — không cần API key trả phí; dùng chung pattern với AI-LMS. Model qua env `LS_CLAUDE_MODEL`
+  (mặc định sonnet). Video không rời máy — chỉ văn bản (transcript/lệnh) được gửi.
+- [x] 🧠 **Router não AI** `llm_generate(engine=local|claude)`: highlights + content chọn được
+  "Local (Qwen)" hay "✨ Claude (sub)" trong UI; với Claude, transcript đọc 1 lần không cần chia phần
+- [x] 🎬 **Đạo diễn AI** (`POST /api/director` + panel chat): ra lệnh tiếng Việt tự nhiên → Claude đọc
+  kho media + catalog 21 công cụ → trả kế hoạch JSON → **backend validate toàn bộ** (whitelist type +
+  create_job) rồi mới xếp hàng — Claude không có quyền chạy gì trực tiếp
+- [x] Hardening sau review đối kháng (11 agents): **`claude -p --tools ""`** vô hiệu hoá mọi tool Claude Code
+  (prompt chứa input người dùng + tên file không tin cậy → chặn prompt-injection RCE — đã test thật:
+  lệnh ép chạy Bash bị từ chối, không tạo file độc); semaphore 2 chặn nghẽn FastAPI; router engine
+  fallback 2 chiều (máy chỉ có Claude không crash); CHUNK 120k cho sonnet 200k context; check envelope non-dict
+
 ## TIẾP THEO (đề xuất)
 
 ### GĐ 6 — SAM 2 track đối tượng (đã đánh giá khả thi 2026-07-25)

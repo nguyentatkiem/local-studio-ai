@@ -1,6 +1,6 @@
 # 🎬 Local Studio — AI Video Editor chạy 100% trên máy
 
-> v0.6 — Không cloud · Không credit · Không watermark · Footage không bao giờ rời máy bạn.
+> v0.7 — Không cloud · Không credit · Không watermark · Footage không bao giờ rời máy bạn.
 
 **Máy mới clone repo:** chạy `./setup-binaries.sh` một lần để tải engine AI (~350MB), rồi `./start.sh`.
 
@@ -13,12 +13,13 @@
 vào `backend/auth_config.json` rồi khởi động lại. Muốn bật lại: xoá file đó — mật khẩu mới
 sẽ được sinh vào `backend/ADMIN-PASSWORD.txt`.
 
-## Tính năng v0.4
+## Tính năng v0.7
 
 | Tính năng | Engine | Ghi chú |
 |---|---|---|
-| 🎯 AI cắt Shorts từ video dài | Whisper + Qwen3 4B (MLX) | LLM chọn khoảnh khắc → shorts 9:16 + caption, kiểu Opus Clip |
-| 📝 AI viết nội dung | Qwen3 4B local | 3 tiêu đề hook · mô tả SEO · hashtags · chapters |
+| 🎬 Đạo diễn AI | Claude (gói sub, qua CLI) | ra lệnh bằng lời → tự lập kế hoạch & xếp job, backend validate |
+| 🎯 AI cắt Shorts từ video dài | Whisper + Qwen3 4B / Claude | LLM chọn khoảnh khắc → shorts 9:16 + caption, kiểu Opus Clip |
+| 📝 AI viết nội dung | Qwen3 4B local / Claude sub | 3 tiêu đề hook · mô tả SEO · hashtags · chapters |
 | 🫥 Làm mờ mặt tự động | YuNet ONNX | blur/pixelate mọi khuôn mặt, chống nhấp nháy |
 | ✨ Tự động dựng AI 1 chạm | pipeline | cắt lặng → caption karaoke → preset/9:16 · chạy batch qua đêm |
 | 📝 Caption tự động (+ burn-in, .srt/.ass/.txt) | faster-whisper CPU · **MLX GPU Metal (Mac)** | tiny/base/small/medium, karaoke/6 hiệu ứng |

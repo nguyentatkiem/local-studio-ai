@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  authStatus, cancelJob, createJob, fmtDur, fmtSize, getHealth, getJobs, getMedia,
-  login, logout, openOutputs, uploadFile,
+  askDirector, authStatus, cancelJob, createJob, fmtDur, fmtSize, getHealth, getJobs,
+  getMedia, login, logout, openOutputs, uploadFile,
   type Health, type Job, type MediaItem,
 } from "./api";
 
@@ -39,10 +39,11 @@ function LoginScreen({ onOk }: { onOk: () => void }) {
 type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" | "bg_remove"
   | "tts" | "reframe" | "speed" | "color" | "music" | "stabilize" | "export"
   | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
-  | "highlights" | "face_blur" | "content";
+  | "highlights" | "face_blur" | "content" | "director";
 
 const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: boolean }[] = [
-  { key: "highlights", icon: "🎯", name: "AI cắt Shorts từ video dài", desc: "LLM local chọn khoảnh khắc → shorts 9:16", gpu: true },
+  { key: "director", icon: "🎬", name: "Đạo diễn AI (Claude)", desc: "ra lệnh bằng lời — Claude tự xếp job", gpu: false },
+  { key: "highlights", icon: "🎯", name: "AI cắt Shorts từ video dài", desc: "AI chọn khoảnh khắc → shorts 9:16", gpu: true },
   { key: "auto_edit", icon: "✨", name: "Tự động dựng (AI 1 chạm)", desc: "cắt lặng → caption → preset · batch", gpu: false },
   { key: "merge", icon: "🎬", name: "Ghép clip + chuyển cảnh", desc: "xfade 10 hiệu ứng · chọn nhiều clip", gpu: false },
   { key: "beatsync", icon: "🥁", name: "Cắt theo nhịp nhạc", desc: "beat-sync kiểu CapCut · librosa", gpu: false },
@@ -138,6 +139,11 @@ export default function App() {
   const [brOpacity, setBrOpacity] = useState(0.7);
   const [agTarget, setAgTarget] = useState("11");
   const [agTitle, setAgTitle] = useState("");
+  // wave 5 (v0.7) — Claude sub
+  const [aiEngine, setAiEngine] = useState("local");
+  const [dirMsg, setDirMsg] = useState("");
+  const [dirBusy, setDirBusy] = useState(false);
+  const [dirLog, setDirLog] = useState<{ role: "user" | "ai"; text: string }[]>([]);
   // wave 4 (v0.6) — AI
   const [hlCount, setHlCount] = useState(3);
   const [hlMin, setHlMin] = useState(15);
@@ -204,6 +210,29 @@ export default function App() {
     } catch (e) { showToast("❌ " + String(e)); }
   };
 
+  const sendDirector = async () => {
+    const m = dirMsg.trim();
+    if (!m || dirBusy) return;
+    setDirLog((l) => [...l, { role: "user", text: m }]);
+    setDirMsg("");
+    setDirBusy(true);
+    try {
+      const res = await askDirector(m);
+      let text = res.reply || "(không có phản hồi)";
+      if (res.jobs.length) text += `\n\n▶ Đã xếp ${res.jobs.length} việc vào hàng đợi.`;
+      if (res.errors.length) text += `\n⚠ ${res.errors.join("; ")}`;
+      setDirLog((l) => [...l, { role: "ai", text }]);
+      if (res.jobs.length) {
+        setJobs(await getJobs());
+        setRightTab("jobs");
+      }
+    } catch (e) {
+      setDirLog((l) => [...l, { role: "ai", text: "❌ " + String((e as Error).message) }]);
+    } finally {
+      setDirBusy(false);
+    }
+  };
+
   // merge/beatsync: NHIỀU clip vào MỘT job (thứ tự = thứ tự chọn trong batch)
   const runMulti = async (type: string, params: Record<string, unknown>) => {
     const sources = batch && batchSel.length > 0 ? batchSel
@@ -251,7 +280,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v0.6 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v0.7 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -341,6 +370,7 @@ export default function App() {
                      (t.key === "highlights" && !feats.highlights) ||
                      (t.key === "content" && !feats.content) ||
                      (t.key === "face_blur" && !feats.face_blur) ||
+                     (t.key === "director" && !feats.director) ||
                      (["reframe", "speed", "color", "music", "stabilize",
                        "merge", "audio_enhance", "brand", "audiogram"].includes(t.key) && !feats.ffmpeg) ||
                      (t.key === "export" && !feats.export) ? " disabled" : "")}
@@ -599,6 +629,33 @@ export default function App() {
                 </>
               )}
 
+              {tool === "director" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎬 Ra lệnh bằng lời — Claude (gói sub của bạn) đọc kho media, tự lập
+                    kế hoạch và xếp job. Backend kiểm tra lại mọi lệnh trước khi chạy.
+                    VD: <i>"cắt lặng video mới nhất, caption vàng, xuất tiktok rồi viết mô tả"</i>
+                  </div>
+                  <div className="dlog">
+                    {dirLog.length === 0 && <div className="nores">Chưa có hội thoại nào.</div>}
+                    {dirLog.map((m, i) => (
+                      <div key={i} className={"dmsg " + m.role}>{m.text}</div>
+                    ))}
+                    {dirBusy && <div className="dmsg ai">⏳ Đạo diễn đang suy nghĩ...</div>}
+                  </div>
+                  <textarea className="ttsbox" rows={3} maxLength={2000} value={dirMsg}
+                    placeholder="Gõ yêu cầu cho đạo diễn..."
+                    onChange={(e) => setDirMsg(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendDirector(); }
+                    }} />
+                  <button className="btn pri big" disabled={dirBusy || !dirMsg.trim()}
+                    onClick={sendDirector}>
+                    {dirBusy ? "⏳ Đang xử lý..." : "🎬 Gửi cho đạo diễn"}
+                  </button>
+                </>
+              )}
+
               {tool === "highlights" && (
                 <>
                   <div className="hint" style={{ marginBottom: 10 }}>
@@ -627,6 +684,14 @@ export default function App() {
                       ))}
                     </div>
                   </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
                   <div className="optrow">
                     <label className="chk"><input type="checkbox" checked={hlMake} onChange={(e) => setHlMake(e.target.checked)} />
                       Dựng hoàn chỉnh (9:16 nền mờ + caption karaoke)</label>
@@ -634,7 +699,7 @@ export default function App() {
                   <button className="btn pri big" onClick={() => run("highlights", {
                     count: hlCount, min_dur: hlMin, max_dur: hlMax, make_shorts: hlMake,
                     model: whModel, effect: whEffect, max_words: whMaxWords,
-                    font: whFont, size: whSize, position: whPos,
+                    font: whFont, size: whSize, position: whPos, ai: aiEngine,
                   })}>🎯 AI cắt shorts</button>
                 </>
               )}
@@ -681,8 +746,16 @@ export default function App() {
                       ))}
                     </div>
                   </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
                   <button className="btn pri big" onClick={() => run("content", {
-                    platform: ctPlatform, model: whModel,
+                    platform: ctPlatform, model: whModel, ai: aiEngine,
                   })}>📝 AI viết nội dung</button>
                 </>
               )}

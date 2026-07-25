@@ -93,6 +93,21 @@ export async function createJob(
   return r.json();
 }
 
+export async function askDirector(message: string): Promise<{
+  reply: string; jobs: Job[]; errors: string[];
+}> {
+  const r = await fetch("/api/director", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message }),
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(e.detail || "Đạo diễn không phản hồi");
+  }
+  return r.json();
+}
+
 export async function cancelJob(id: string): Promise<void> {
   await fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
 }

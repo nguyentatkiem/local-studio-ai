@@ -1611,9 +1611,67 @@ def llm_available() -> bool:
         return False
 
 
-def llm_generate(prompt: str, max_tokens: int = 1500, job_id: str = None) -> str:
-    """Sinh văn bản bằng Qwen3 4B 4-bit qua MLX — nạp model 1 lần, khoá tuần tự.
-    Trong lúc chờ khoá vẫn phản hồi lệnh hủy job."""
+# --- Claude qua gói subscription (Claude Code CLI headless — như AI-LMS chấm bài)
+CLAUDE_BIN = shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
+_CLAUDE_SEM = threading.Semaphore(2)  # trần số lệnh Claude song song
+
+
+def claude_available() -> bool:
+    return bool(CLAUDE_BIN) and Path(CLAUDE_BIN).exists()
+
+
+def claude_generate(prompt: str, job_id: str = None, model: str = None,
+                    timeout: int = 420) -> str:
+    """Gọi Claude bằng gói sub của người dùng (claude -p, prompt qua stdin).
+    Video không rời máy — chỉ văn bản trong prompt được gửi đi."""
+    if not claude_available():
+        raise RuntimeError("Chưa cài / chưa đăng nhập Claude Code CLI trên máy")
+    model = model or os.environ.get("LS_CLAUDE_MODEL", "sonnet")
+    # BẢO MẬT: --tools "" vô hiệu hoá MỌI tool của Claude Code — prompt chứa
+    # input người dùng + tên file (không tin cậy), nên agent chỉ được sinh text,
+    # KHÔNG được chạy Bash/Read/Write dù prompt có bị tiêm chỉ thị độc.
+    with _CLAUDE_SEM:  # chặn tối đa 2 lệnh Claude song song (khỏi nghẽn FastAPI)
+        proc = subprocess.Popen(
+            [CLAUDE_BIN, "-p", "--output-format", "json", "--model", model,
+             "--tools", "", "--disallowedTools", "Bash", "Read", "Write", "Edit",
+             "WebFetch", "WebSearch"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if job_id:
+            _track_proc(job_id, proc)
+        try:
+            so, se = proc.communicate(input=prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(f"Claude CLI không phản hồi sau {timeout}s")
+    if job_id:
+        _cancel_point(job_id)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Claude CLI lỗi: {(se or so)[-400:]}")
+    try:
+        env = json.loads(so)
+    except json.JSONDecodeError:
+        return so  # CLI đổi định dạng — trả thô, _extract_json phía trên tự lo
+    if not isinstance(env, dict):
+        raise RuntimeError("Claude CLI trả định dạng lạ (không phải object)")
+    if env.get("is_error"):
+        raise RuntimeError(f"Claude trả lỗi: {str(env.get('result'))[:300]}")
+    return env.get("result") or ""
+
+
+def llm_generate(prompt: str, max_tokens: int = 1500, job_id: str = None,
+                 engine: str = "local") -> str:
+    """Router não AI: 'claude' → gói sub qua CLI; 'local' → Qwen3 4B MLX.
+    Qwen: nạp model 1 lần, khoá tuần tự; trong lúc chờ khoá vẫn phản hồi hủy job."""
+    # Chọn engine khả dụng: nếu engine yêu cầu không có, thử engine kia
+    if engine == "claude" and not claude_available():
+        engine = "local"
+    if engine == "local" and not llm_available() and claude_available():
+        engine = "claude"  # máy chỉ có Claude (vd không cài mlx-lm) → khỏi crash
+    if engine == "claude":
+        return claude_generate(prompt, job_id=job_id)
     global _llm_cache
     from mlx_lm import load, generate
     while not _llm_lock.acquire(timeout=1.0):
@@ -1720,9 +1778,10 @@ def _window_segments(seg_list, t0: float, t1: float):
     return out
 
 
-def _pick_highlights(lines: list, dur: float, count: int,
-                     smin: float, smax: float, job_id: str = None) -> list:
-    """LLM chọn các khoảnh khắc đáng làm shorts. Transcript dài thì chia phần."""
+def _pick_highlights(lines: list, dur: float, count: int, smin: float,
+                     smax: float, job_id: str = None, engine: str = "local") -> list:
+    """LLM chọn các khoảnh khắc đáng làm shorts. Transcript dài thì chia phần
+    (Claude đọc 1 lần không cần chia nhờ context lớn)."""
     def ask(sub_lines, n):
         prompt = (
             "Bạn là biên tập viên video ngắn chuyên nghiệp. Dưới đây là transcript "
@@ -1737,13 +1796,16 @@ def _pick_highlights(lines: list, dur: float, count: int,
             '"hook": "<1 câu vì sao đoạn này hay>"}]'
         )
         try:
-            data = _extract_json(llm_generate(prompt, max_tokens=1200, job_id=job_id))
+            data = _extract_json(llm_generate(prompt, max_tokens=1200,
+                                              job_id=job_id, engine=engine))
             return [c for c in data if isinstance(c, dict)] if isinstance(data, list) else []
         except (ValueError, json.JSONDecodeError):
             return []
 
-    # transcript quá dài → chọn sơ bộ theo từng phần rồi chung kết
-    CHUNK = 11000
+    # transcript quá dài → chọn sơ bộ theo từng phần rồi chung kết.
+    # Claude (sonnet ~200k token) đọc phần lớn hơn Qwen; giữ dưới ~120k ký tự để
+    # chừa cho prompt+output (tiếng Việt ~0.5+ token/ký tự) — quá dài thì tự chia.
+    CHUNK = 11000 if engine != "claude" else 120000
     text_all = "\n".join(lines)
     if len(text_all) <= CHUNK:
         cands = ask(lines, count)
@@ -1771,7 +1833,8 @@ def _pick_highlights(lines: list, dur: float, count: int,
                       f"\n\nChọn {count} đoạn hay nhất, đa dạng chủ đề. "
                       'Trả về DUY NHẤT mảng JSON các chỉ số: [0, 3, ...]')
             try:
-                idx = _extract_json(llm_generate(prompt, max_tokens=200, job_id=job_id))
+                idx = _extract_json(llm_generate(prompt, max_tokens=200,
+                                                 job_id=job_id, engine=engine))
                 sel = []
                 for i in (idx if isinstance(idx, list) else []):
                     try:
@@ -1838,8 +1901,10 @@ def job_highlights(job_id: str, src: Path, p: dict):
         raise RuntimeError("Video không có lời thoại — AI highlights cần giọng nói")
     _cancel_point(job_id)
 
-    _set(job_id, progress=48, message="AI (Qwen3 local) đang chọn khoảnh khắc hay...")
-    picked = _pick_highlights(lines, dur, count, smin, smax, job_id)
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+    brain = "Claude (gói sub)" if ai == "claude" else "Qwen3 local"
+    _set(job_id, progress=48, message=f"AI ({brain}) đang chọn khoảnh khắc hay...")
+    picked = _pick_highlights(lines, dur, count, smin, smax, job_id, engine=ai)
     if not picked:
         raise RuntimeError("AI không chọn được đoạn phù hợp — thử giảm độ dài tối thiểu")
     _cancel_point(job_id)
@@ -1921,7 +1986,9 @@ def job_content(job_id: str, src: Path, p: dict):
     if len(text_all) > 15000:  # transcript rất dài → giữ đầu + cuối
         text_all = text_all[:9000] + "\n[...phần giữa lược bớt...]\n" + text_all[-5000:]
 
-    _set(job_id, progress=65, message="AI (Qwen3 local) đang viết nội dung...")
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+    brain = "Claude (gói sub)" if ai == "claude" else "Qwen3 local"
+    _set(job_id, progress=65, message=f"AI ({brain}) đang viết nội dung...")
     chapters_req = ("\n5. CHAPTERS: các mốc chương dạng 'mm:ss Tên phần' (dựa mốc giây "
                     "trong transcript, chương đầu là 00:00)") if dur > 120 else ""
     prompt = (
@@ -1933,7 +2000,7 @@ def job_content(job_id: str, src: Path, p: dict):
         "3. MÔ TẢ: đoạn mô tả chuẩn SEO (2-4 câu + CTA)\n"
         "4. HASHTAGS: 8-12 hashtag phù hợp" + chapters_req
     )
-    content = llm_generate(prompt, max_tokens=1600, job_id=job_id)
+    content = llm_generate(prompt, max_tokens=1600, job_id=job_id, engine=ai)
     _cancel_point(job_id)
     out = unique_out(f"{src.stem}_content", ".md")
     out.write_text(f"# Nội dung cho: {src.name} ({platform})\n\n{content}\n",
@@ -2090,7 +2157,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "0.6.0",
+        "version": "0.7.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "gpu": gpu_info(),
@@ -2117,8 +2184,10 @@ def health():
             "brand": ffmpeg_ok,
             "audiogram": ffmpeg_ok,
             "llm": llm_available(),
-            "highlights": llm_available() and whisper_ok and ffmpeg_ok,
-            "content": llm_available() and whisper_ok,
+            "claude": claude_available(),
+            "director": claude_available(),
+            "highlights": (llm_available() or claude_available()) and whisper_ok and ffmpeg_ok,
+            "content": (llm_available() or claude_available()) and whisper_ok,
             "face_blur": cv2_available() and YUNET_ONNX.exists() and ffmpeg_ok,
         },
     }
@@ -2319,12 +2388,12 @@ def create_job(req: JobRequest):
         title = str(p.get("title") or "")[:80]
         return submit_job("audiogram", src.name, job_audiogram, src, target, title)
     if req.type == "highlights":
-        if not llm_available():
-            raise HTTPException(400, "Chưa cài mlx-lm (LLM local) trên máy chủ")
+        if not llm_available() and not claude_available():
+            raise HTTPException(400, "Cần mlx-lm (LLM local) hoặc Claude CLI trên máy chủ")
         return submit_job("highlights", src.name, job_highlights, src, dict(p))
     if req.type == "content":
-        if not llm_available():
-            raise HTTPException(400, "Chưa cài mlx-lm (LLM local) trên máy chủ")
+        if not llm_available() and not claude_available():
+            raise HTTPException(400, "Cần mlx-lm (LLM local) hoặc Claude CLI trên máy chủ")
         return submit_job("content", src.name, job_content, src, dict(p))
     if req.type == "face_blur":
         mode = p.get("mode", "blur")
@@ -2333,6 +2402,105 @@ def create_job(req: JobRequest):
         strength = min(2.0, max(0.5, float(p.get("strength", 1.0))))
         return submit_job("face_blur", src.name, job_face_blur, src, mode, strength)
     raise HTTPException(400, f"Loại job không hỗ trợ: {req.type}")
+
+
+# ---------------------------------------------------------------- Đạo diễn AI (Claude sub)
+DIRECTOR_ALLOWED_TYPES = {
+    "transcribe", "silence_cut", "upscale", "export", "rife", "bg_remove",
+    "auto_edit", "reframe", "speed", "color", "music", "stabilize", "merge",
+    "beatsync", "audio_enhance", "brand", "audiogram", "highlights", "content",
+    "face_blur", "tts",
+}
+
+DIRECTOR_CATALOG = """\
+- transcribe: caption tự động. params: model(tiny/base/small), effect(classic/bold/yellow/karaoke/neon/box), max_words(0-7), burn(bool), language(vi/en/null)
+- silence_cut: cắt khoảng lặng. params: margin(0-1, giây)
+- upscale: phóng to AI. params: mode(ai/fast), scale(2/3/4)
+- export: xuất preset. params: preset(tiktok/youtube/square/reels45/gif/mp3)
+- rife: nội suy khung hình. params: mode(smooth=mượt gấp đôi fps / slowmo=quay chậm 2x)
+- bg_remove: tách nền. params: bg(green/black/white/alpha)
+- auto_edit: dựng tự động trọn gói. params: cut(bool), caption(bool), preset(reframe916/tiktok/youtube/square/reels45/null), effect, max_words
+- reframe: đổi khung dọc 9:16. params: mode(blur=nền mờ CapCut / crop=cắt giữa)
+- speed: đổi tốc độ. params: factor(0.5/0.75/1.25/1.5/2/3)
+- color: filter màu. params: filter(vivid/warm/cool/bw/film/sharp)
+- music: trộn nhạc nền. params: music(tên file audio trong kho), volume(0-1), duck(bool)
+- stabilize: chống rung. params: (không)
+- merge: ghép nhiều clip. file=clip đầu, params: files([tên clip khác]), transition(fade/dissolve/wipeleft/slideleft/circleopen...), duration(giây), target(169/916/11), music(tên file, tùy chọn)
+- beatsync: cắt theo nhịp nhạc. file=clip đầu, params: files([clip khác, tùy chọn]), music(tên file audio, BẮT BUỘC), target(916/169/11), max_segments(10-120)
+- audio_enhance: khử ồn + chuẩn âm lượng. params: denoise(bool), loudness(bool)
+- brand: tiêu đề + chữ ký + logo. params: title(chuỗi), sign(chuỗi), logo(tên file ảnh, tùy chọn), corner(tl/tr/bl/br), opacity(0-1)
+- audiogram: audio → video sóng nhạc. params: target(11/916/169), title(chuỗi)
+- highlights: AI cắt shorts từ video dài. params: count(1-6), min_dur, max_dur, make_shorts(bool), ai(local/claude)
+- content: AI viết tiêu đề/mô tả/hashtags. params: platform(tiktok/youtube), ai(local/claude)
+- face_blur: che mặt tự động. params: mode(blur/pixelate), strength(0.5-2)
+- tts: đọc văn bản (KHÔNG cần file). params: text(chuỗi), voice(vi/en), speed(0.6-1.5)"""
+
+
+class DirectorReq(BaseModel):
+    message: str
+
+
+@app.post("/api/director")
+def director(req: DirectorReq):
+    """Claude (gói sub) đọc yêu cầu → lập kế hoạch job. Backend validate lại
+    TOÀN BỘ (whitelist type + create_job) rồi mới xếp hàng — Claude không có
+    quyền chạy gì trực tiếp."""
+    if not claude_available():
+        raise HTTPException(400, "Chưa cài / đăng nhập Claude Code CLI trên máy chủ")
+    msg = (req.message or "").strip()
+    if not msg:
+        raise HTTPException(400, "Thiếu nội dung yêu cầu")
+    if len(msg) > 2000:
+        raise HTTPException(400, "Yêu cầu quá dài (tối đa 2000 ký tự)")
+
+    items = []
+    for pth in sorted(UPLOADS.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)[:40]:
+        if pth.is_file():
+            inf = media_info(pth)
+            kind = ("ảnh" if inf["width"] and inf["duration"] < 0.1
+                    else "video" if inf["width"] else "audio")
+            items.append(f"- {pth.name} ({kind}, {inf['duration']:.0f}s)")
+    media_desc = "\n".join(items) or "(kho media trống)"
+
+    prompt = (
+        "Bạn là đạo diễn hậu kỳ điều khiển app dựng video Local Studio.\n\n"
+        f"KHO MEDIA (tên file phải dùng CHÍNH XÁC):\n{media_desc}\n\n"
+        f"CÔNG CỤ (job type + params):\n{DIRECTOR_CATALOG}\n\n"
+        f"YÊU CẦU NGƯỜI DÙNG: {msg}\n\n"
+        "Trả về DUY NHẤT một object JSON, không giải thích ngoài JSON:\n"
+        '{"reply": "<trả lời ngắn gọn tiếng Việt: sẽ làm gì / hoặc câu trả lời nếu chỉ hỏi>", '
+        '"actions": [{"type": "<job type>", "file": "<tên file trong kho, hoặc \\"\\" với tts>", '
+        '"params": {...}}]}\n'
+        "Quy tắc: tối đa 8 actions; chỉ dùng type trong danh sách; chỉ dùng file có trong kho; "
+        "nếu yêu cầu mơ hồ hoặc thiếu file thì actions để rỗng và hỏi lại trong reply."
+    )
+    try:
+        data = _extract_json(claude_generate(prompt, timeout=180))
+    except (RuntimeError, ValueError, json.JSONDecodeError) as e:
+        raise HTTPException(502, f"Đạo diễn không phản hồi hợp lệ: {str(e)[:200]}")
+    if not isinstance(data, dict):
+        raise HTTPException(502, "Đạo diễn trả sai định dạng")
+
+    reply = str(data.get("reply") or "")[:1200]
+    actions = data.get("actions") if isinstance(data.get("actions"), list) else []
+    created, errors = [], []
+    for a in actions[:8]:
+        if not isinstance(a, dict):
+            continue
+        jtype = a.get("type")
+        if jtype not in DIRECTOR_ALLOWED_TYPES:
+            errors.append(f"bỏ qua công cụ lạ: {jtype}")
+            continue
+        try:
+            params = a.get("params") if isinstance(a.get("params"), dict) else {}
+            job = create_job(JobRequest(type=jtype, file=str(a.get("file") or ""),
+                                        params=params))
+            created.append(job)
+        except HTTPException as e:
+            errors.append(f"{jtype}: {e.detail}")
+        except (ValueError, TypeError) as e:
+            errors.append(f"{jtype}: tham số không hợp lệ ({str(e)[:80]})")
+    return {"reply": reply, "jobs": created, "errors": errors}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
