@@ -9,6 +9,10 @@
 - **Windows**: nháy đúp `start.bat` → trình duyệt tự mở `http://127.0.0.1:8765`
 - **macOS/Linux**: chạy `./start.sh` (hoặc mở **Local Studio.app** trong /Applications — tự khởi động backend)
 
+**Tắt mật khẩu đăng nhập** (máy cá nhân, server chỉ bind 127.0.0.1): ghi `{"disabled": true}`
+vào `backend/auth_config.json` rồi khởi động lại. Muốn bật lại: xoá file đó — mật khẩu mới
+sẽ được sinh vào `backend/ADMIN-PASSWORD.txt`.
+
 ## Tính năng v0.4
 
 | Tính năng | Engine | Ghi chú |

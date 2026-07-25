@@ -80,6 +80,8 @@ LOGIN_FAILS: list = []       # timestamps of failed attempts (rate limit)
 
 
 def _load_auth() -> dict:
+    """auth_config.json chứa {"disabled": true} → app mở thẳng không cần mật khẩu
+    (an toàn vì server chỉ bind 127.0.0.1). Mặc định vẫn sinh mật khẩu admin."""
     if AUTH_FILE.exists():
         return json.loads(AUTH_FILE.read_text(encoding="utf-8"))
     salt = secrets.token_hex(16)
@@ -96,12 +98,19 @@ def _load_auth() -> dict:
 AUTH = _load_auth()
 
 
+AUTH_DISABLED = bool(AUTH.get("disabled"))
+
+
 def _check_password(pw: str) -> bool:
+    if AUTH_DISABLED:
+        return True
     digest = hashlib.sha256((AUTH["salt"] + pw).encode()).hexdigest()
     return hmac.compare_digest(digest, AUTH["hash"])
 
 
 def _session_ok(request: Request) -> bool:
+    if AUTH_DISABLED:
+        return True
     tok = request.cookies.get("ls_session")
     return bool(tok and SESSIONS.get(tok, 0) > time.time())
 
@@ -151,7 +160,7 @@ def login(req: LoginReq):
 
 @app.get("/api/auth-status")
 def auth_status(request: Request):
-    return {"auth_required": True, "authenticated": _session_ok(request)}
+    return {"auth_required": not AUTH_DISABLED, "authenticated": _session_ok(request)}
 
 
 @app.post("/api/logout")
