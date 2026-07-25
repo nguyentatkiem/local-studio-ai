@@ -36,6 +36,26 @@
 - [x] 🎵 Nhạc nền + **ducking** (sidechaincompress tự nén nhạc khi có giọng nói), loop nhạc, chống clip
 - [x] 🧷 Chống rung deshake (ffmpeg static không có vidstab)
 
+## ✅ ĐÃ XONG — v0.5 (build 2026-07-25 chiều, wave 3 "CapCut nâng cao + hàng loạt")
+
+- [x] 🎬 **Ghép clip + chuyển cảnh** (`merge`): 2-8 clip, 10 hiệu ứng xfade, chuẩn hoá khung 16:9/9:16/1:1,
+  acrossfade âm gốc hoặc thay nhạc nền; chọn thứ tự bằng "Chọn nhiều"
+- [x] 🥁 **Beat-sync** (`beatsync`): librosa dò nhịp → cắt video đúng nhịp, xoay vòng nhiều clip,
+  nhạc làm âm chính — kiểu template CapCut
+- [x] 🎚️ **Chuẩn hoá âm thanh** (`audio_enhance`): khử ồn afftdn + loudnorm -16 LUFS; video giữ hình copy,
+  audio thuần xuất mp3
+- [x] 🏷️ **Tiêu đề & Logo** (`brand`): title mở đầu fade (ASS), chữ ký góc suốt video, logo PNG watermark
+  4 góc + độ đậm; kho media nhận thêm ảnh png/jpg/webp
+- [x] 📻 **Audiogram** (`audiogram`): audio/TTS → video sóng nhạc (showwaves màu amber) 1:1/9:16/16:9 + tiêu đề
+- [x] 📦 `setup-binaries.sh`: máy mới clone tự tải đủ engine (realesrgan, rife, rvm, ffmpeg-libass, giọng piper)
+- [x] Hạ tầng: `run_ffmpeg_progress` nhận `cwd` (bỏ os.chdir không an toàn đa luồng), helper
+  `_extract_norm_clip` dùng chung merge/beatsync, verify bằng workflow đa agent
+- [x] Hardening sau review đối kháng (23 agents): fix deadlock stderr PIPE (run_ffmpeg_progress +
+  bg_remove — lỗi lặp mỗi frame làm đầy buffer treo job vĩnh viễn); beatsync fix numpy 2.x tempo
+  ndarray, bù trừ drift lượng tử 30fps theo mốc nhịp thật, clamp đoạn theo độ dài clip, cap nhạc
+  240s, cancel points; brand/audio_enhance tự re-encode khi codec không hợp mp4 (webm VP9/Opus);
+  merge chặn >8 clip có báo lỗi, sửa clamp tdur clip ngắn; UI nhận mp3 có ảnh bìa + upload ảnh logo
+
 ## TIẾP THEO (đề xuất)
 
 ### GĐ 6 — SAM 2 track đối tượng (đã đánh giá khả thi 2026-07-25)

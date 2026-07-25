@@ -225,6 +225,7 @@ def media_info(path: Path) -> dict:
         "fps": round(fps, 3),
         "has_audio": a is not None,
         "vcodec": v.get("codec_name") if v else None,
+        "acodec": a.get("codec_name") if a else None,
     }
     if key:
         if len(_PROBE_CACHE) > 500:
@@ -254,30 +255,35 @@ def gpu_info() -> Optional[dict]:
     return None
 
 
-def run_ffmpeg_progress(args: list, duration: float, on_progress, job_id: str = None):
-    """Run ffmpeg with -progress pipe:1 and report percent via callback."""
+def run_ffmpeg_progress(args: list, duration: float, on_progress,
+                        job_id: str = None, cwd: str = None):
+    """Run ffmpeg with -progress pipe:1 and report percent via callback.
+    stderr ghi ra file tạm (KHÔNG PIPE — lỗi lặp mỗi frame làm đầy buffer → treo)."""
+    import tempfile
     cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
            "-progress", "pipe:1", "-nostats"] + args
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    if job_id:
-        _track_proc(job_id, proc)
-    for line in proc.stdout:
-        line = line.strip()
-        if line.startswith("out_time_ms=") and duration > 0:
-            try:
-                ms = int(line.split("=")[1]) / 1_000_000
-                on_progress(min(99, ms / duration * 100))
-            except ValueError:
-                pass
-    proc.wait()
-    if job_id and job_id in CANCEL_REQUESTED:
-        raise JobCancelled()
-    if proc.returncode != 0:
-        err = proc.stderr.read() if proc.stderr else ""
-        raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {err[-800:]}")
+    with tempfile.TemporaryFile() as ef:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=ef,
+            text=True, encoding="utf-8", errors="replace", cwd=cwd,
+        )
+        if job_id:
+            _track_proc(job_id, proc)
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("out_time_ms=") and duration > 0:
+                try:
+                    ms = int(line.split("=")[1]) / 1_000_000
+                    on_progress(min(99, ms / duration * 100))
+                except ValueError:
+                    pass
+        proc.wait()
+        if job_id and job_id in CANCEL_REQUESTED:
+            raise JobCancelled()
+        if proc.returncode != 0:
+            ef.seek(0)
+            err = ef.read().decode("utf-8", "replace")
+            raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {err[-800:]}")
 
 
 def unique_out(stem: str, suffix: str) -> Path:
@@ -919,8 +925,11 @@ def job_bg_remove(job_id: str, src: Path, bg: str):
         enc_cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "medium",
                     "-pix_fmt", "yuv420p", str(out)]
         channels = 3
+    # stderr encoder ra file — PIPE không được drain sẽ deadlock khi vp9/x264 in cảnh báo mỗi frame
+    enc_log = TMP / f"bgenc_{job_id}.log"
+    enc_ef = open(enc_log, "wb")
     enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.PIPE)
+                           stderr=enc_ef)
     _track_proc(job_id, enc)
 
     bg_arr = None
@@ -967,10 +976,12 @@ def job_bg_remove(job_id: str, src: Path, bg: str):
             except BrokenPipeError:
                 pass
         enc.wait()
+        enc_ef.close()
     _cancel_point(job_id)
     if enc.returncode != 0 or not out.exists():
-        err = enc.stderr.read().decode("utf-8", "replace") if enc.stderr else ""
+        err = enc_log.read_text(encoding="utf-8", errors="replace") if enc_log.exists() else ""
         raise RuntimeError(f"Encode failed: {err[-500:]}")
+    enc_log.unlink(missing_ok=True)
     return [out_entry(out)]
 
 
@@ -1226,6 +1237,352 @@ def job_stabilize(job_id: str, src: Path):
     return [out_entry(out)]
 
 
+# ================================================================ wave 3 (v0.5)
+FRAME_SIZES = {"169": (1920, 1080), "916": (1080, 1920), "11": (1080, 1080)}
+XFADE_TRANSITIONS = {"fade", "dissolve", "wipeleft", "wiperight", "slideleft",
+                     "slideright", "circleopen", "circleclose", "pixelize", "radial"}
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def _extract_norm_clip(job_id: str, src: Path, t0: float, t_dur: float,
+                       size: tuple, fps: int, out_path: Path, keep_audio: bool):
+    """Cắt 1 đoạn và chuẩn hoá cùng khung/fps (48kHz stereo nếu giữ audio) để concat."""
+    w, h = size
+    vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+          f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,fps={fps},setsar=1")
+    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+           "-ss", f"{max(0.0, t0):.3f}", "-t", f"{t_dur:.3f}", "-i", str(src)]
+    if keep_audio:
+        if media_info(src)["has_audio"]:
+            cmd += ["-map", "0:v:0", "-map", "0:a:0", "-ar", "48000", "-ac", "2",
+                    "-c:a", "aac", "-b:a", "192k"]
+        else:
+            cmd += ["-f", "lavfi", "-t", f"{t_dur:.3f}",
+                    "-i", "anullsrc=r=48000:cl=stereo",
+                    "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k"]
+    else:
+        cmd += ["-an"]
+    cmd += ["-vf", vf, "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
+            "-pix_fmt", "yuv420p", str(out_path)]
+    r = _run_tracked(job_id, cmd)
+    if r.returncode != 0 or not out_path.exists():
+        raise RuntimeError(f"Cắt/chuẩn hoá đoạn thất bại: {r.stderr_text[-300:]}")
+
+
+# ---------------------------------------------------------------- job: merge + xfade
+def job_merge(job_id: str, files: list, transition: str, tdur: float,
+              target: str, music, music_vol: float):
+    """Ghép nhiều clip thành một với chuyển cảnh xfade; tuỳ chọn thay nhạc nền."""
+    size = FRAME_SIZES[target]
+    fps = 30
+    tmp_clips = []
+    try:
+        durs = []
+        for i, f in enumerate(files):
+            _cancel_point(job_id)
+            _set(job_id, progress=i / len(files) * 55,
+                 message=f"Chuẩn hoá clip {i + 1}/{len(files)}: {f.name}")
+            info = media_info(f)
+            if not info["width"]:
+                raise RuntimeError(f"'{f.name}' không có luồng video")
+            d = info["duration"] or 1
+            tc = TMP / f"mg_{job_id}_{i:02d}.mp4"
+            tmp_clips.append(tc)  # append TRƯỚC khi cắt để finally dọn cả file dở
+            _extract_norm_clip(job_id, f, 0, d, size, fps, tc, keep_audio=music is None)
+            durs.append(media_info(tc)["duration"] or d)
+        # xfade không được dài hơn nửa clip ngắn nhất (floor 0.05s, KHÔNG kéo ngược lên)
+        tdur = max(0.05, min(tdur, min(durs) / 2 - 0.05))
+
+        _set(job_id, progress=58, message=f"Ghép {len(files)} clip (xfade {transition})...")
+        out = unique_out(f"{files[0].stem}_merge{len(files)}", ".mp4")
+        cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error"]
+        for tc in tmp_clips:
+            cmd += ["-i", str(tc)]
+        if music is not None:
+            cmd += ["-stream_loop", "-1", "-i", str(music)]
+        fc_parts = []
+        # chuỗi video xfade
+        prev = "[0:v]"
+        offset = 0.0
+        for i in range(1, len(tmp_clips)):
+            offset += durs[i - 1] - tdur
+            lab = f"[vx{i}]" if i < len(tmp_clips) - 1 else "[vout]"
+            fc_parts.append(f"{prev}[{i}:v]xfade=transition={transition}:"
+                            f"duration={tdur:.3f}:offset={offset:.3f}{lab}")
+            prev = lab
+        total_dur = sum(durs) - tdur * (len(durs) - 1)
+        # audio
+        if music is not None:
+            mi = len(tmp_clips)
+            fc_parts.append(f"[{mi}:a]volume={music_vol},"
+                            f"atrim=0:{total_dur:.3f},asetpts=PTS-STARTPTS[aout]")
+        else:
+            prev_a = "[0:a]"
+            for i in range(1, len(tmp_clips)):
+                lab = f"[ax{i}]" if i < len(tmp_clips) - 1 else "[aout]"
+                fc_parts.append(f"{prev_a}[{i}:a]acrossfade=d={tdur:.3f}{lab}")
+                prev_a = lab
+        cmd += ["-filter_complex", ";".join(fc_parts),
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-crf", "19", "-preset", "medium",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(out)]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _track_proc(job_id, proc)
+        _, se = proc.communicate()
+        _cancel_point(job_id)
+        if proc.returncode != 0 or not out.exists():
+            raise RuntimeError(f"xfade thất bại: {se.decode('utf-8', 'replace')[-400:]}")
+        _set(job_id, message=f"Xong — {len(files)} clip → {total_dur:.1f}s ({transition})")
+        return [out_entry(out)]
+    finally:
+        for tc in tmp_clips:
+            tc.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- job: beat-sync
+def librosa_available() -> bool:
+    try:
+        import librosa  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def job_beatsync(job_id: str, files: list, music: Path, target: str, max_seg: int):
+    """Cắt video theo nhịp nhạc (kiểu template CapCut): mỗi nhịp một đoạn,
+    xoay vòng qua các clip đã chọn, nhạc làm âm thanh chính."""
+    import librosa
+
+    import numpy as np
+
+    _set(job_id, progress=2, message="Phân tích nhịp bài nhạc (librosa)...")
+    # cap 240s: đủ cho 120 đoạn, tránh nuốt RAM khi chọn nhầm mix vài giờ
+    y, sr = librosa.load(str(music), mono=True, duration=240)
+    _cancel_point(job_id)
+    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+    _cancel_point(job_id)
+    # numpy 2.x: tempo có thể là ndarray shape (1,) — ép về scalar
+    tempo = float(np.atleast_1d(tempo)[0] or 0)
+    beat_times = [float(t) for t in librosa.frames_to_time(beat_frames, sr=sr)]
+    music_dur = len(y) / sr
+    if len(beat_times) < 4:
+        raise RuntimeError("Không dò được nhịp — thử bài nhạc khác (wav/mp3 có trống rõ)")
+
+    size = FRAME_SIZES[target]
+    fps = 30
+    infos = [media_info(f) for f in files]
+    for f, inf in zip(files, infos):
+        if not inf["width"]:
+            raise RuntimeError(f"'{f.name}' không có luồng video")
+    max_src = max((inf["duration"] or 1) for inf in infos)
+
+    # ghép các nhịp thành đoạn >= 0.35s, tối đa max_seg đoạn
+    MIN_SEG = 0.35
+    cuts = [0.0]
+    for t in beat_times:
+        if t - cuts[-1] >= MIN_SEG:
+            cuts.append(float(t))
+        if len(cuts) > max_seg:
+            break
+    # đoạn đuôi không dài quá clip dài nhất (tránh video ngắn hơn -t)
+    tail = min(4.0, max(MIN_SEG, max_src - 0.1))
+    if cuts[-1] < music_dur and len(cuts) <= max_seg and music_dur - cuts[-1] >= MIN_SEG:
+        cuts.append(min(music_dur, cuts[-1] + tail))
+
+    cursors = [0.0] * len(files)
+    tmp_clips = []
+    try:
+        actual_end = 0.0  # tổng thời lượng THẬT đã cắt — bù trừ lệch lượng tử 30fps
+        n_segs = len(cuts) - 1
+        for i in range(n_segs):
+            _cancel_point(job_id)
+            si = i % len(files)
+            src_dur = infos[si]["duration"] or 1
+            # thời lượng yêu cầu = mốc nhịp kế tiếp trừ vị trí thật hiện tại
+            d = max(0.15, cuts[i + 1] - actual_end)
+            d = min(d, src_dur - 0.05)  # không cắt quá độ dài clip nguồn
+            if cursors[si] + d > src_dur - 0.05:
+                cursors[si] = 0.0  # hết clip -> quay lại đầu
+            tc = TMP / f"bs_{job_id}_{i:03d}.mp4"
+            tmp_clips.append(tc)  # append TRƯỚC khi cắt để finally dọn cả file dở
+            _extract_norm_clip(job_id, files[si], cursors[si], d, size, fps, tc,
+                               keep_audio=False)
+            cursors[si] += d
+            actual_end += media_info(tc)["duration"] or d
+            _set(job_id, progress=8 + (i + 1) / n_segs * 72,
+                 message=f"Cắt theo nhịp: {i + 1}/{n_segs} đoạn (~{tempo:.0f} BPM)")
+
+        _set(job_id, progress=82, message="Nối đoạn + ghép nhạc...")
+        lst = TMP / f"bs_{job_id}.txt"
+        lst.write_text("".join(f"file '{c.as_posix()}'\n" for c in tmp_clips),
+                       encoding="utf-8")
+        tmp_clips.append(lst)
+        out = unique_out(f"{files[0].stem}_beatsync", ".mp4")
+        total = actual_end
+        cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+               "-f", "concat", "-safe", "0", "-i", str(lst), "-i", str(music),
+               "-map", "0:v", "-map", "1:a", "-t", f"{total:.3f}",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(out)]
+        r = _run_tracked(job_id, cmd)
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Nối đoạn thất bại: {r.stderr_text[-400:]}")
+        _set(job_id, message=f"Xong — {n_segs} đoạn theo ~{tempo:.0f} BPM, {total:.1f}s")
+        return [out_entry(out)]
+    finally:
+        for tc in tmp_clips:
+            tc.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- job: audio enhance
+def job_audio_enhance(job_id: str, src: Path, denoise: bool, loudness: bool):
+    """Khử ồn + chuẩn hoá âm lượng chuẩn mạng xã hội (loudnorm -16 LUFS)."""
+    info = media_info(src)
+    if not info["has_audio"]:
+        raise RuntimeError("Tệp không có âm thanh")
+    dur = info["duration"] or 1
+    af = ["highpass=f=70"]
+    if denoise:
+        af.append("afftdn=nf=-28")
+    if loudness:
+        af.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+    _set(job_id, message="Xử lý âm thanh: " +
+         " + ".join(x for x, on in (("khử ồn", denoise), ("chuẩn hoá -16 LUFS", loudness)) if on))
+    if info["width"]:
+        out = unique_out(f"{src.stem}_audio", ".mp4")
+        # video copy nếu codec hợp mp4; vp8/vp9/khác → re-encode x264
+        vcopy = (info.get("vcodec") or "") in ("h264", "hevc", "mpeg4", "av1")
+        vopts = ["-c:v", "copy"] if vcopy else \
+            ["-c:v", "libx264", "-crf", "19", "-preset", "medium", "-pix_fmt", "yuv420p"]
+        args = ["-i", str(src), "-af", ",".join(af)] + vopts + \
+               ["-c:a", "aac", "-b:a", "192k", str(out)]
+    else:
+        out = unique_out(f"{src.stem}_clean", ".mp3")
+        args = ["-i", str(src), "-af", ",".join(af),
+                "-c:a", "libmp3lame", "-b:a", "320k", str(out)]
+    run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: brand (title + logo)
+def _title_ass(text: str, w: int, h: int, dur: float, persist: str = "") -> str:
+    """ASS tiêu đề lớn giữa màn hình, fade in/out; persist = dòng chữ ký nhỏ góc dưới."""
+    size = max(28, int(h * 0.075))
+    small = max(16, int(h * 0.028))
+    head = (
+        "[Script Info]\nScriptType: v4.00+\n"
+        f"PlayResX: {w}\nPlayResY: {h}\nScaledBorderAndShadow: yes\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Title,Arial,{size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,"
+        "1,0,0,0,100,100,0,0,1,3.5,1.5,5,60,60,40,163\n"
+        f"Style: Sign,Arial,{small},&H60FFFFFF,&H60FFFFFF,&H00000000,&H80000000,"
+        "0,0,0,0,100,100,0,0,1,1.2,0,3,30,30,26,163\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+    lines = []
+    if text:
+        lines.append(f"Dialogue: 0,{ass_ts(0.2)},{ass_ts(0.2 + dur)},Title,,0,0,0,,"
+                     rf"{{\fad(350,350)}}{ass_escape(text)}")
+    if persist:
+        lines.append(f"Dialogue: 0,{ass_ts(0)},{ass_ts(359999)},Sign,,0,0,0,,"
+                     f"{ass_escape(persist)}")
+    return head + "\n".join(lines) + "\n"
+
+
+LOGO_CORNERS = {
+    "tl": "24:24", "tr": "main_w-overlay_w-24:24",
+    "bl": "24:main_h-overlay_h-24", "br": "main_w-overlay_w-24:main_h-overlay_h-24",
+}
+
+
+def job_brand(job_id: str, src: Path, title: str, sign: str, logo,
+              corner: str, opacity: float, title_dur: float):
+    """Đóng dấu thương hiệu: tiêu đề mở đầu + chữ ký + logo watermark PNG."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Tệp không có luồng video")
+    dur = info["duration"] or 1
+    vw, vh = info["width"], info["height"]
+    out = unique_out(f"{src.stem}_brand", ".mp4")
+    _set(job_id, message="Ghi tiêu đề / logo vào video...")
+
+    ass_path = None
+    try:
+        cmd = ["-i", str(src)]
+        filters = []
+        vin = "[0:v]"
+        if title or sign:
+            ass_path = TMP / f"brand_{job_id}.ass"
+            ass_path.write_text(_title_ass(title, vw, vh, title_dur, sign),
+                                encoding="utf-8")
+            filters.append(f"{vin}subtitles={ass_path.name}[vt]")
+            vin = "[vt]"
+        if logo is not None:
+            cmd += ["-i", str(logo)]
+            logo_w = max(48, int(vw * 0.14))
+            filters.append(f"[1:v]format=rgba,colorchannelmixer=aa={opacity},"
+                           f"scale={logo_w}:-1[lg]")
+            filters.append(f"{vin}[lg]overlay={LOGO_CORNERS[corner]}[vout]")
+            vin = "[vout]"
+        if not filters:
+            raise RuntimeError("Cần ít nhất tiêu đề, chữ ký hoặc logo")
+        # nếu chỉ có subtitles (không logo) thì nhãn cuối là [vt]
+        # audio: copy nếu codec hợp mp4, không thì re-encode aac (webm/opus, pcm...)
+        acopy = (info.get("acodec") or "") in ("aac", "mp3")
+        args = cmd + ["-filter_complex", ";".join(filters),
+                      "-map", vin, "-map", "0:a?",
+                      "-c:v", "libx264", "-crf", "19", "-preset", "medium",
+                      "-pix_fmt", "yuv420p"] + \
+            (["-c:a", "copy"] if acopy else ["-c:a", "aac", "-b:a", "192k"]) + [str(out)]
+        # subtitles= cần cwd chứa file .ass (cwd trick, không dùng os.chdir)
+        run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr),
+                            job_id, cwd=str(TMP))
+        return [out_entry(out)]
+    finally:
+        if ass_path:
+            ass_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- job: audiogram
+def job_audiogram(job_id: str, src: Path, target: str, title: str):
+    """Biến audio (hoặc audio của video) thành video sóng nhạc để đăng MXH."""
+    info = media_info(src)
+    if not info["has_audio"]:
+        raise RuntimeError("Tệp không có âm thanh")
+    dur = info["duration"] or 1
+    w, h = FRAME_SIZES[target]
+    wave_h = int(h * 0.26)
+    out = unique_out(f"{src.stem}_audiogram", ".mp4")
+    _set(job_id, message="Dựng audiogram sóng nhạc...")
+
+    fc = (f"color=c=0x0F0F12:s={w}x{h}:d={dur:.3f}:r=25[bg];"
+          f"[0:a]showwaves=s={w}x{wave_h}:mode=cline:rate=25:colors=0xFFB23F[wv];"
+          f"[bg][wv]overlay=0:{int(h * 0.52)}:shortest=1[v1]")
+    ass_path = None
+    try:
+        vin = "[v1]"
+        if title:
+            ass_path = TMP / f"ag_{job_id}.ass"
+            ass_path.write_text(_title_ass(title, w, h, dur), encoding="utf-8")
+            fc += f";[v1]subtitles={ass_path.name}[vout]"
+            vin = "[vout]"
+        args = ["-i", str(src), "-filter_complex", fc,
+                "-map", vin, "-map", "0:a",
+                "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                "-t", f"{dur:.3f}", str(out)]
+        run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr),
+                            job_id, cwd=str(TMP))
+        return [out_entry(out)]
+    finally:
+        if ass_path:
+            ass_path.unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------- API
 @app.get("/api/health")
 def health():
@@ -1248,7 +1605,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "gpu": gpu_info(),
@@ -1269,12 +1626,18 @@ def health():
             "color": ffmpeg_ok,
             "music": ffmpeg_ok,
             "stabilize": ffmpeg_ok,
+            "merge": ffmpeg_ok,
+            "beatsync": ffmpeg_ok and librosa_available(),
+            "audio_enhance": ffmpeg_ok,
+            "brand": ffmpeg_ok,
+            "audiogram": ffmpeg_ok,
         },
     }
 
 
 ALLOWED_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v",
-               ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+               ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg",
+               ".png", ".jpg", ".jpeg", ".webp"}  # ảnh: logo watermark
 MAX_UPLOAD = 2 * 1024 ** 3  # 2 GB
 
 
@@ -1406,6 +1769,66 @@ def create_job(req: JobRequest):
         return submit_job("music", src.name, job_music, src, music, vol, duck)
     if req.type == "stabilize":
         return submit_job("stabilize", src.name, job_stabilize, src)
+    if req.type == "merge":
+        extra_names = list(p.get("files") or [])
+        if len(extra_names) > 7:
+            raise HTTPException(400, "Tối đa 8 clip mỗi lần ghép — bỏ bớt rồi chạy tiếp")
+        extra = [safe_upload_path(str(n)) for n in extra_names]
+        files = [src] + [f for f in extra if f.is_file()]
+        if len(files) < 2:
+            raise HTTPException(400, "Cần ít nhất 2 clip — bật 'Chọn nhiều' ở kho media")
+        transition = p.get("transition", "fade")
+        if transition not in XFADE_TRANSITIONS:
+            transition = "fade"
+        tdur = min(2.0, max(0.2, float(p.get("duration", 0.6))))
+        target = p.get("target") if p.get("target") in FRAME_SIZES else "169"
+        music = None
+        if p.get("music"):
+            music = safe_upload_path(str(p["music"]))
+            if not music.is_file():
+                raise HTTPException(404, "Không tìm thấy file nhạc")
+        vol = min(1.0, max(0.05, float(p.get("volume", 0.6))))
+        label = f"{src.name} +{len(files) - 1} clip"
+        return submit_job("merge", label, job_merge, files, transition, tdur,
+                          target, music, vol)
+    if req.type == "beatsync":
+        if not librosa_available():
+            raise HTTPException(400, "Chưa cài librosa trên máy chủ")
+        extra = [safe_upload_path(str(n)) for n in (p.get("files") or [])][:5]
+        files = [src] + [f for f in extra if f.is_file()]
+        music = safe_upload_path(str(p.get("music", "")))
+        if not music.is_file():
+            raise HTTPException(404, "Cần chọn file nhạc trong kho media")
+        target = p.get("target") if p.get("target") in FRAME_SIZES else "916"
+        max_seg = min(120, max(10, int(p.get("max_segments", 60))))
+        label = f"{src.name} × nhạc {music.name}"
+        return submit_job("beatsync", label, job_beatsync, files, music, target, max_seg)
+    if req.type == "audio_enhance":
+        denoise = bool(p.get("denoise", True))
+        loudness = bool(p.get("loudness", True))
+        if not denoise and not loudness:
+            loudness = True
+        return submit_job("audio_enhance", src.name, job_audio_enhance,
+                          src, denoise, loudness)
+    if req.type == "brand":
+        title = str(p.get("title") or "")[:120]
+        sign = str(p.get("sign") or "")[:60]
+        logo = None
+        if p.get("logo"):
+            logo = safe_upload_path(str(p["logo"]))
+            if not logo.is_file() or logo.suffix.lower() not in IMAGE_EXT:
+                raise HTTPException(400, "Logo phải là ảnh png/jpg/webp trong kho media")
+        if not title and not sign and logo is None:
+            raise HTTPException(400, "Cần ít nhất tiêu đề, chữ ký hoặc logo")
+        corner = p.get("corner") if p.get("corner") in LOGO_CORNERS else "br"
+        opacity = min(1.0, max(0.1, float(p.get("opacity", 0.7))))
+        title_dur = min(10.0, max(1.0, float(p.get("title_dur", 3.0))))
+        return submit_job("brand", src.name, job_brand, src, title, sign, logo,
+                          corner, opacity, title_dur)
+    if req.type == "audiogram":
+        target = p.get("target") if p.get("target") in FRAME_SIZES else "11"
+        title = str(p.get("title") or "")[:80]
+        return submit_job("audiogram", src.name, job_audiogram, src, target, title)
     raise HTTPException(400, f"Loại job không hỗ trợ: {req.type}")
 
 

@@ -1,6 +1,8 @@
 # 🎬 Local Studio — AI Video Editor chạy 100% trên máy
 
-> v0.4 — Không cloud · Không credit · Không watermark · Footage không bao giờ rời máy bạn.
+> v0.5 — Không cloud · Không credit · Không watermark · Footage không bao giờ rời máy bạn.
+
+**Máy mới clone repo:** chạy `./setup-binaries.sh` một lần để tải engine AI (~350MB), rồi `./start.sh`.
 
 ## Chạy ứng dụng
 
@@ -23,6 +25,11 @@
 | 🎨 6 filter màu | FFmpeg | vivid · warm · cool · B&W · film · sharp |
 | 🎵 Nhạc nền + ducking | FFmpeg sidechain | tự nén nhạc khi có giọng nói |
 | 🧷 Chống rung | FFmpeg deshake | video quay tay |
+| 🎬 Ghép clip + chuyển cảnh | FFmpeg xfade | 2-8 clip · 10 hiệu ứng · thay nhạc nền |
+| 🥁 Cắt theo nhịp nhạc (beat-sync) | librosa | kiểu template CapCut, xoay vòng nhiều clip |
+| 🎚️ Chuẩn hoá âm thanh | FFmpeg | khử ồn + loudnorm -16 LUFS chuẩn MXH |
+| 🏷️ Tiêu đề & Logo watermark | libass + overlay | title fade · chữ ký · PNG 4 góc |
+| 📻 Audiogram sóng nhạc | FFmpeg showwaves | audio/TTS → video đăng MXH |
 | 📤 Xuất preset | FFmpeg | TikTok 9:16 · YouTube · 1:1 · 4:5 · GIF · MP3 |
 | ⚙️ Hàng đợi 40 job + hủy job + batch | ThreadPool | chọn nhiều tệp chạy hàng loạt |
 

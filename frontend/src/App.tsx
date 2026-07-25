@@ -37,10 +37,13 @@ function LoginScreen({ onOk }: { onOk: () => void }) {
 }
 
 type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" | "bg_remove"
-  | "tts" | "reframe" | "speed" | "color" | "music" | "stabilize" | "export";
+  | "tts" | "reframe" | "speed" | "color" | "music" | "stabilize" | "export"
+  | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram";
 
 const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: boolean }[] = [
   { key: "auto_edit", icon: "✨", name: "Tự động dựng (AI 1 chạm)", desc: "cắt lặng → caption → preset · batch", gpu: false },
+  { key: "merge", icon: "🎬", name: "Ghép clip + chuyển cảnh", desc: "xfade 10 hiệu ứng · chọn nhiều clip", gpu: false },
+  { key: "beatsync", icon: "🥁", name: "Cắt theo nhịp nhạc", desc: "beat-sync kiểu CapCut · librosa", gpu: false },
   { key: "transcribe", icon: "💬", name: "Caption tự động", desc: "whisper word-level · .srt/.ass", gpu: false },
   { key: "silence_cut", icon: "✂️", name: "Cắt khoảng lặng", desc: "auto-editor · jump-cut", gpu: false },
   { key: "upscale", icon: "🔍", name: "AI Upscale ×2/×4", desc: "Real-ESRGAN ncnn-vulkan", gpu: true },
@@ -51,6 +54,9 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "speed", icon: "⏩", name: "Tốc độ video", desc: "0.5× – 3× · giữ cao độ âm thanh", gpu: false },
   { key: "color", icon: "🎨", name: "Filter màu", desc: "vivid · warm · film · B&W · sharp", gpu: false },
   { key: "music", icon: "🎵", name: "Nhạc nền + ducking", desc: "tự nén nhạc khi có giọng nói", gpu: false },
+  { key: "audio_enhance", icon: "🎚️", name: "Chuẩn hoá âm thanh", desc: "khử ồn + loudnorm -16 LUFS", gpu: false },
+  { key: "brand", icon: "🏷️", name: "Tiêu đề & Logo", desc: "title mở đầu · chữ ký · watermark PNG", gpu: false },
+  { key: "audiogram", icon: "📻", name: "Audiogram sóng nhạc", desc: "audio/TTS → video đăng MXH", gpu: false },
   { key: "stabilize", icon: "🧷", name: "Chống rung", desc: "deshake · video quay tay", gpu: false },
   { key: "export", icon: "📤", name: "Xuất preset mạng xã hội", desc: "TikTok · YouTube · 4:5 · GIF · MP3", gpu: false },
 ];
@@ -111,6 +117,23 @@ export default function App() {
   const [musicFile, setMusicFile] = useState("");
   const [musicVol, setMusicVol] = useState(0.25);
   const [musicDuck, setMusicDuck] = useState(true);
+  // wave 3 (v0.5)
+  const [mgTrans, setMgTrans] = useState("fade");
+  const [mgDur, setMgDur] = useState(0.6);
+  const [mgTarget, setMgTarget] = useState("169");
+  const [mgMusic, setMgMusic] = useState("");
+  const [bsMusic, setBsMusic] = useState("");
+  const [bsTarget, setBsTarget] = useState("916");
+  const [bsMaxSeg, setBsMaxSeg] = useState(60);
+  const [aeDenoise, setAeDenoise] = useState(true);
+  const [aeLoudness, setAeLoudness] = useState(true);
+  const [brTitle, setBrTitle] = useState("");
+  const [brSign, setBrSign] = useState("");
+  const [brLogo, setBrLogo] = useState("");
+  const [brCorner, setBrCorner] = useState("br");
+  const [brOpacity, setBrOpacity] = useState(0.7);
+  const [agTarget, setAgTarget] = useState("11");
+  const [agTitle, setAgTitle] = useState("");
 
   const refreshMedia = useCallback(async () => {
     try { setMedia(await getMedia()); } catch { /* not up yet */ }
@@ -169,6 +192,19 @@ export default function App() {
     } catch (e) { showToast("❌ " + String(e)); }
   };
 
+  // merge/beatsync: NHIỀU clip vào MỘT job (thứ tự = thứ tự chọn trong batch)
+  const runMulti = async (type: string, params: Record<string, unknown>) => {
+    const sources = batch && batchSel.length > 0 ? batchSel
+      : selected ? [selected.name] : [];
+    if (sources.length === 0) { showToast("⚠️ Hãy chọn video trước — bật 'Chọn nhiều' để lấy nhiều clip"); return; }
+    try {
+      await createJob(type, sources[0], { ...params, files: sources.slice(1) });
+      setJobs(await getJobs());
+      setRightTab("jobs");
+      showToast(`🚀 "${TOOL_NAMES[type]}" (${sources.length} clip) đã vào hàng đợi`);
+    } catch (e) { showToast("❌ " + String(e)); }
+  };
+
   const openPreview = (j: Job, url: string, name: string) => {
     const item = media.find((m) => m.name === j.input) ?? null;
     if (item) setSelected(item);
@@ -177,6 +213,11 @@ export default function App() {
   };
 
   const feats = health?.features ?? {};
+  // mp3 có ảnh bìa nhúng vẫn là audio (vcodec mjpeg/png attached_pic)
+  const COVER_CODECS = ["mjpeg", "png", "bmp", "gif"];
+  const audioFiles = media.filter((m) => m.info.has_audio &&
+    (!m.info.width || COVER_CODECS.includes(m.info.vcodec ?? "")));
+  const imageFiles = media.filter((m) => m.info.width && !m.info.has_audio && m.info.duration < 0.1);
   const running = jobs.filter((j) => j.status === "running" || j.status === "queued").length;
   const doneCount = jobs.filter((j) => j.status === "done").length;
   const gpu = health?.gpu;
@@ -198,7 +239,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v0.4 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v0.5 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -235,7 +276,7 @@ export default function App() {
                 onDrop={(e) => { e.preventDefault(); onFiles(e.dataTransfer.files); }}>
                 {uploading ? "Đang nhập tệp..." : <>⬆️ Kéo-thả video vào đây<br /><small>tệp không được sao chép đi đâu cả</small></>}
               </div>
-              <input ref={fileRef} type="file" accept="video/*,audio/*" multiple hidden
+              <input ref={fileRef} type="file" accept="video/*,audio/*,image/png,image/jpeg,image/webp" multiple hidden
                 onChange={(e) => onFiles(e.target.files)} />
               <div className="mgrid">
                 {media.map((m) => (
@@ -284,7 +325,9 @@ export default function App() {
                      (t.key === "bg_remove" && !feats.bg_remove) ||
                      (t.key === "tts" && !feats.tts) ||
                      (t.key === "auto_edit" && !feats.auto_edit) ||
-                     (["reframe", "speed", "color", "music", "stabilize"].includes(t.key) && !feats.ffmpeg) ||
+                     (t.key === "beatsync" && !feats.beatsync) ||
+                     (["reframe", "speed", "color", "music", "stabilize",
+                       "merge", "audio_enhance", "brand", "audiogram"].includes(t.key) && !feats.ffmpeg) ||
                      (t.key === "export" && !feats.export) ? " disabled" : "")}
                   onClick={() => { setTool(t.key); setRightTab("tool"); }}>
                   <span className="ai-ic">{t.icon}</span>
@@ -659,6 +702,165 @@ export default function App() {
                   <div className="hint">Giảm rung cho video quay tay bằng bộ lọc deshake — chạy nhanh, không cần GPU.</div>
                   <br />
                   <button className="btn pri big" onClick={() => run("stabilize", {})}>▶ Chạy trên máy</button>
+                </>
+              )}
+
+              {tool === "merge" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎬 Bật <b>"Chọn nhiều"</b> ở kho media và tick các clip theo thứ tự muốn ghép
+                    (đang chọn: {batch ? batchSel.length : 0}/8 clip tối đa).
+                  </div>
+                  <div className="field"><label>Hiệu ứng chuyển cảnh</label>
+                    <select value={mgTrans} onChange={(e) => setMgTrans(e.target.value)}>
+                      <option value="fade">Fade (mờ dần)</option>
+                      <option value="dissolve">Dissolve (tan hạt)</option>
+                      <option value="wipeleft">Wipe trái</option>
+                      <option value="wiperight">Wipe phải</option>
+                      <option value="slideleft">Slide trái</option>
+                      <option value="slideright">Slide phải</option>
+                      <option value="circleopen">Mở tròn</option>
+                      <option value="circleclose">Đóng tròn</option>
+                      <option value="pixelize">Pixel hoá</option>
+                      <option value="radial">Xoay radial</option>
+                    </select>
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Độ dài chuyển cảnh</span><b>{mgDur.toFixed(1)}s</b></div>
+                    <input type="range" min={0.2} max={1.5} step={0.1} value={mgDur}
+                      onChange={(e) => setMgDur(parseFloat(e.target.value))} />
+                  </div>
+                  <div className="field"><label>Khung hình</label>
+                    <div className="seg">
+                      <button className={mgTarget === "169" ? "on" : ""} onClick={() => setMgTarget("169")}>16:9</button>
+                      <button className={mgTarget === "916" ? "on" : ""} onClick={() => setMgTarget("916")}>9:16</button>
+                      <button className={mgTarget === "11" ? "on" : ""} onClick={() => setMgTarget("11")}>1:1</button>
+                    </div>
+                  </div>
+                  <div className="field"><label>Nhạc nền (tuỳ chọn — thay âm gốc)</label>
+                    <select value={mgMusic} onChange={(e) => setMgMusic(e.target.value)}>
+                      <option value="">— giữ âm thanh gốc (acrossfade) —</option>
+                      {audioFiles.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                    </select>
+                  </div>
+                  <button className="btn pri big" disabled={!(batch && batchSel.length >= 2)}
+                    onClick={() => runMulti("merge", {
+                      transition: mgTrans, duration: mgDur, target: mgTarget,
+                      music: mgMusic || null,
+                    })}>🎬 Ghép {batch ? batchSel.length : 0} clip</button>
+                </>
+              )}
+
+              {tool === "beatsync" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🥁 AI dò nhịp bài nhạc rồi cắt video đúng nhịp — chọn 1 clip hoặc bật
+                    "Chọn nhiều" để xoay vòng nhiều clip (đang chọn: {batch ? batchSel.length : (selected ? 1 : 0)}).
+                  </div>
+                  <div className="field"><label>Bài nhạc (bắt buộc)</label>
+                    <select value={bsMusic} onChange={(e) => setBsMusic(e.target.value)}>
+                      <option value="">— chọn nhạc trong kho media —</option>
+                      {audioFiles.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                    </select>
+                  </div>
+                  <div className="field"><label>Khung hình</label>
+                    <div className="seg">
+                      <button className={bsTarget === "916" ? "on" : ""} onClick={() => setBsTarget("916")}>9:16</button>
+                      <button className={bsTarget === "169" ? "on" : ""} onClick={() => setBsTarget("169")}>16:9</button>
+                      <button className={bsTarget === "11" ? "on" : ""} onClick={() => setBsTarget("11")}>1:1</button>
+                    </div>
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Số đoạn tối đa</span><b>{bsMaxSeg}</b></div>
+                    <input type="range" min={10} max={120} step={5} value={bsMaxSeg}
+                      onChange={(e) => setBsMaxSeg(parseInt(e.target.value))} />
+                  </div>
+                  <button className="btn pri big" disabled={!bsMusic}
+                    onClick={() => runMulti("beatsync", {
+                      music: bsMusic, target: bsTarget, max_segments: bsMaxSeg,
+                    })}>🥁 Cắt theo nhịp</button>
+                </>
+              )}
+
+              {tool === "audio_enhance" && (
+                <>
+                  <div className="optrow">
+                    <label className="chk"><input type="checkbox" checked={aeDenoise} onChange={(e) => setAeDenoise(e.target.checked)} />Khử ồn nền (afftdn)</label>
+                  </div>
+                  <div className="optrow">
+                    <label className="chk"><input type="checkbox" checked={aeLoudness} onChange={(e) => setAeLoudness(e.target.checked)} />Chuẩn hoá -16 LUFS (chuẩn TikTok/YouTube)</label>
+                  </div>
+                  <div className="hint">Video → giữ nguyên hình, chỉ xử lý tiếng. File audio → xuất mp3 sạch. Chạy batch được.</div>
+                  <br />
+                  <button className="btn pri big" onClick={() => run("audio_enhance", {
+                    denoise: aeDenoise, loudness: aeLoudness,
+                  })}>▶ Xử lý âm thanh</button>
+                </>
+              )}
+
+              {tool === "brand" && (
+                <>
+                  <div className="field"><label>Tiêu đề mở đầu (hiện 3s, fade)</label>
+                    <input className="ttsbox" style={{ height: 34, resize: "none" }} maxLength={120}
+                      value={brTitle} placeholder="VD: 5 mẹo quay video bằng điện thoại"
+                      onChange={(e) => setBrTitle(e.target.value)} />
+                  </div>
+                  <div className="field"><label>Chữ ký nhỏ góc dưới (suốt video)</label>
+                    <input className="ttsbox" style={{ height: 34, resize: "none" }} maxLength={60}
+                      value={brSign} placeholder="VD: @kenhcuakiem"
+                      onChange={(e) => setBrSign(e.target.value)} />
+                  </div>
+                  <div className="field"><label>Logo watermark (ảnh png/jpg trong kho)</label>
+                    <select value={brLogo} onChange={(e) => setBrLogo(e.target.value)}>
+                      <option value="">— không dùng logo —</option>
+                      {imageFiles.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                    </select>
+                  </div>
+                  {brLogo && (
+                    <>
+                      <div className="field"><label>Vị trí logo</label>
+                        <div className="seg">
+                          {[["tl", "↖"], ["tr", "↗"], ["bl", "↙"], ["br", "↘"]].map(([v, l]) => (
+                            <button key={v} className={brCorner === v ? "on" : ""} onClick={() => setBrCorner(v)}>{l}</button>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="field">
+                        <div className="sl-h"><span>Độ đậm logo</span><b>{Math.round(brOpacity * 100)}%</b></div>
+                        <input type="range" min={0.1} max={1} step={0.05} value={brOpacity}
+                          onChange={(e) => setBrOpacity(parseFloat(e.target.value))} />
+                      </div>
+                    </>
+                  )}
+                  <button className="btn pri big" disabled={!brTitle && !brSign && !brLogo}
+                    onClick={() => run("brand", {
+                      title: brTitle, sign: brSign, logo: brLogo || null,
+                      corner: brCorner, opacity: brOpacity,
+                    })}>🏷️ Đóng dấu video</button>
+                </>
+              )}
+
+              {tool === "audiogram" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    📻 Biến file audio (hoặc tiếng của video) thành video sóng nhạc màu thương hiệu —
+                    hợp với TTS, podcast, nhạc.
+                  </div>
+                  <div className="field"><label>Khung hình</label>
+                    <div className="seg">
+                      <button className={agTarget === "11" ? "on" : ""} onClick={() => setAgTarget("11")}>1:1</button>
+                      <button className={agTarget === "916" ? "on" : ""} onClick={() => setAgTarget("916")}>9:16</button>
+                      <button className={agTarget === "169" ? "on" : ""} onClick={() => setAgTarget("169")}>16:9</button>
+                    </div>
+                  </div>
+                  <div className="field"><label>Tiêu đề trên video (tuỳ chọn)</label>
+                    <input className="ttsbox" style={{ height: 34, resize: "none" }} maxLength={80}
+                      value={agTitle} placeholder="VD: Podcast tập 12 — Học AI từ số 0"
+                      onChange={(e) => setAgTitle(e.target.value)} />
+                  </div>
+                  <button className="btn pri big" onClick={() => run("audiogram", {
+                    target: agTarget, title: agTitle,
+                  })}>📻 Tạo audiogram</button>
                 </>
               )}
 
