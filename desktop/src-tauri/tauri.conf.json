@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Local Studio",
+  "version": "0.4.0",
+  "identifier": "vn.localstudio.app",
+  "build": {
+    "frontendDist": "../dist-shell"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Local Studio — AI video editor 100% local",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1080,
+        "minHeight": 700,
+        "url": "http://127.0.0.1:8765"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": ["icons/icon.icns"],
+    "category": "Video"
+  }
+}

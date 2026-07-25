@@ -16,7 +16,7 @@ export type Job = {
   id: string;
   type: string;
   input: string;
-  status: "queued" | "running" | "done" | "error";
+  status: "queued" | "running" | "done" | "error" | "cancelled";
   progress: number;
   message: string;
   outputs: JobOutput[];
@@ -27,7 +27,7 @@ export type Job = {
 export type Health = {
   status: string;
   version: string;
-  gpu: { name: string; vram_total_mb: number } | null;
+  gpu: { name: string; vram_total_mb: number; vram_used_mb?: number; type?: string } | null;
   features: Record<string, boolean>;
 };
 
@@ -91,6 +91,10 @@ export async function createJob(
     throw new Error(e.detail || "Tạo job thất bại");
   }
   return r.json();
+}
+
+export async function cancelJob(id: string): Promise<void> {
+  await fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
 }
 
 export async function openOutputs(): Promise<void> {

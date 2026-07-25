@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  authStatus, createJob, fmtDur, fmtSize, getHealth, getJobs, getMedia,
+  authStatus, cancelJob, createJob, fmtDur, fmtSize, getHealth, getJobs, getMedia,
   login, logout, openOutputs, uploadFile,
   type Health, type Job, type MediaItem,
 } from "./api";
@@ -36,13 +36,23 @@ function LoginScreen({ onOk }: { onOk: () => void }) {
   );
 }
 
-type ToolKey = "transcribe" | "silence_cut" | "upscale" | "export";
+type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" | "bg_remove"
+  | "tts" | "reframe" | "speed" | "color" | "music" | "stabilize" | "export";
 
 const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: boolean }[] = [
+  { key: "auto_edit", icon: "✨", name: "Tự động dựng (AI 1 chạm)", desc: "cắt lặng → caption → preset · batch", gpu: false },
   { key: "transcribe", icon: "💬", name: "Caption tự động", desc: "whisper word-level · .srt/.ass", gpu: false },
   { key: "silence_cut", icon: "✂️", name: "Cắt khoảng lặng", desc: "auto-editor · jump-cut", gpu: false },
   { key: "upscale", icon: "🔍", name: "AI Upscale ×2/×4", desc: "Real-ESRGAN ncnn-vulkan", gpu: true },
-  { key: "export", icon: "📤", name: "Xuất preset mạng xã hội", desc: "TikTok 9:16 · YouTube · 1:1", gpu: false },
+  { key: "rife", icon: "🎞️", name: "Nội suy khung hình", desc: "RIFE · mượt ×2 fps · slow-motion", gpu: true },
+  { key: "bg_remove", icon: "🪄", name: "Tách nền video", desc: "RVM matting · nền màu / trong suốt", gpu: false },
+  { key: "tts", icon: "🗣️", name: "Đọc văn bản (TTS)", desc: "Piper · giọng Việt/Anh · offline", gpu: false },
+  { key: "reframe", icon: "📐", name: "Đổi khung 9:16", desc: "nền mờ kiểu CapCut · crop giữa", gpu: false },
+  { key: "speed", icon: "⏩", name: "Tốc độ video", desc: "0.5× – 3× · giữ cao độ âm thanh", gpu: false },
+  { key: "color", icon: "🎨", name: "Filter màu", desc: "vivid · warm · film · B&W · sharp", gpu: false },
+  { key: "music", icon: "🎵", name: "Nhạc nền + ducking", desc: "tự nén nhạc khi có giọng nói", gpu: false },
+  { key: "stabilize", icon: "🧷", name: "Chống rung", desc: "deshake · video quay tay", gpu: false },
+  { key: "export", icon: "📤", name: "Xuất preset mạng xã hội", desc: "TikTok · YouTube · 4:5 · GIF · MP3", gpu: false },
 ];
 const TOOL_NAMES = Object.fromEntries(TOOLS.map((t) => [t.key, t.name]));
 
@@ -68,6 +78,7 @@ export default function App() {
 
   // caption params
   const [whModel, setWhModel] = useState("base");
+  const [whEngine, setWhEngine] = useState("");
   const [whBurn, setWhBurn] = useState(true);
   const [whLang, setWhLang] = useState("");
   const [whMaxWords, setWhMaxWords] = useState(3);
@@ -82,6 +93,24 @@ export default function App() {
   const [upScale, setUpScale] = useState(2);
   const [upModel, setUpModel] = useState("realesr-animevideov3");
   const [preset, setPreset] = useState("tiktok");
+  const [rifeMode, setRifeMode] = useState<"smooth" | "slowmo">("smooth");
+  const [bgMode, setBgMode] = useState("green");
+  const [ttsText, setTtsText] = useState("");
+  const [ttsVoice, setTtsVoice] = useState("vi");
+  const [ttsSpeed, setTtsSpeed] = useState(1.0);
+  // batch (chọn nhiều tệp chạy hàng loạt)
+  const [batch, setBatch] = useState(false);
+  const [batchSel, setBatchSel] = useState<string[]>([]);
+  // wave 2 (CapCut-style)
+  const [autoCut, setAutoCut] = useState(true);
+  const [autoCaption, setAutoCaption] = useState(true);
+  const [autoPreset, setAutoPreset] = useState("");
+  const [reframeMode, setReframeMode] = useState("blur");
+  const [speedFactor, setSpeedFactor] = useState(2);
+  const [colorName, setColorName] = useState("vivid");
+  const [musicFile, setMusicFile] = useState("");
+  const [musicVol, setMusicVol] = useState(0.25);
+  const [musicDuck, setMusicDuck] = useState(true);
 
   const refreshMedia = useCallback(async () => {
     try { setMedia(await getMedia()); } catch { /* not up yet */ }
@@ -125,12 +154,18 @@ export default function App() {
   };
 
   const run = async (type: string, params: Record<string, unknown>) => {
-    if (!selected) { showToast("⚠️ Hãy chọn một video trong kho media trước"); return; }
+    // TTS không cần tệp nguồn
+    const targets = type === "tts" ? [""]
+      : batch && batchSel.length > 0 ? batchSel
+      : selected ? [selected.name] : [];
+    if (targets.length === 0) { showToast("⚠️ Hãy chọn một video trong kho media trước"); return; }
     try {
-      await createJob(type, selected.name, params);
+      for (const name of targets) await createJob(type, name, params);
       setJobs(await getJobs());
       setRightTab("jobs");
-      showToast(`🚀 "${TOOL_NAMES[type]}" đã vào hàng đợi — chạy trên máy bạn`);
+      showToast(targets.length > 1
+        ? `🚀 ${targets.length} việc "${TOOL_NAMES[type]}" đã vào hàng đợi — cứ để máy chạy`
+        : `🚀 "${TOOL_NAMES[type]}" đã vào hàng đợi — chạy trên máy bạn`);
     } catch (e) { showToast("❌ " + String(e)); }
   };
 
@@ -163,7 +198,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">MVP 0.2 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v0.4 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -188,7 +223,12 @@ export default function App() {
 
           {leftTab === "media" && (
             <div className="lpanel">
-              <div className="lp-title"><span>Trong dự án · {media.length} tệp</span></div>
+              <div className="lp-title"><span>Trong dự án · {media.length} tệp</span>
+                <button className={"batchbtn" + (batch ? " on" : "")}
+                  onClick={() => { setBatch(!batch); setBatchSel([]); }}>
+                  {batch ? `✓ Đã chọn ${batchSel.length}` : "☰ Chọn nhiều"}
+                </button>
+              </div>
               <div className={"dropzone" + (uploading ? " busy" : "")}
                 onClick={() => fileRef.current?.click()}
                 onDragOver={(e) => e.preventDefault()}
@@ -200,12 +240,18 @@ export default function App() {
               <div className="mgrid">
                 {media.map((m) => (
                   <div key={m.name}
-                    className={"mitem" + (selected?.name === m.name ? " sel" : "")}
-                    onClick={() => { setSelected(m); setPreview(null); }}>
+                    className={"mitem" + ((batch ? batchSel.includes(m.name) : selected?.name === m.name) ? " sel" : "")}
+                    onClick={() => {
+                      if (batch) {
+                        setBatchSel((s) => s.includes(m.name) ? s.filter((x) => x !== m.name) : [...s, m.name]);
+                      } else { setSelected(m); setPreview(null); }
+                    }}>
                     <div className="th">
                       <img src={`/api/thumb/${encodeURIComponent(m.name)}`} loading="lazy" alt=""
                         onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }} />
                       <span className="dur">{fmtDur(m.info.duration)}</span>
+                      {batch && <span className={"bsel" + (batchSel.includes(m.name) ? " on" : "")}>
+                        {batchSel.includes(m.name) ? "✓" : ""}</span>}
                     </div>
                     <div className="nm">{m.name}</div>
                   </div>
@@ -220,8 +266,10 @@ export default function App() {
               {gpu && (
                 <div className="hwbox">
                   <div className="hwrow"><span>{gpu.name.replace("NVIDIA GeForce ", "")}</span>
-                    <b>{((gpu as any).vram_used_mb / 1024).toFixed(1)} / {Math.round(gpu.vram_total_mb / 1024)} GB</b></div>
-                  <div className="meter"><i style={{ width: `${vramPct}%` }} /></div>
+                    <b>{gpu.type === "apple"
+                      ? `${Math.round(gpu.vram_total_mb / 1024)} GB RAM hợp nhất`
+                      : `${((gpu as any).vram_used_mb / 1024).toFixed(1)} / ${Math.round(gpu.vram_total_mb / 1024)} GB`}</b></div>
+                  {gpu.type !== "apple" && <div className="meter"><i style={{ width: `${vramPct}%` }} /></div>}
                   <div className="hwrow"><span>Hàng đợi</span><b>{running > 0 ? `${running} việc đang chạy` : "trống"}</b></div>
                 </div>
               )}
@@ -232,6 +280,11 @@ export default function App() {
                     ((t.key === "transcribe" && !feats.transcribe) ||
                      (t.key === "silence_cut" && !feats.silence_cut) ||
                      (t.key === "upscale" && !feats.upscale_fast) ||
+                     (t.key === "rife" && !feats.rife) ||
+                     (t.key === "bg_remove" && !feats.bg_remove) ||
+                     (t.key === "tts" && !feats.tts) ||
+                     (t.key === "auto_edit" && !feats.auto_edit) ||
+                     (["reframe", "speed", "color", "music", "stabilize"].includes(t.key) && !feats.ffmpeg) ||
                      (t.key === "export" && !feats.export) ? " disabled" : "")}
                   onClick={() => { setTool(t.key); setRightTab("tool"); }}>
                   <span className="ai-ic">{t.icon}</span>
@@ -297,17 +350,29 @@ export default function App() {
 
           {rightTab === "tool" && (
             <div className="rbody">
-              <div className="rsec-t">{TOOL_NAMES[tool]} — {selected ? selected.name : "chưa chọn tệp"}</div>
+              <div className="rsec-t">{TOOL_NAMES[tool]} — {
+                tool === "tts" ? "không cần tệp nguồn"
+                : batch && batchSel.length > 0 ? `${batchSel.length} tệp (hàng loạt)`
+                : selected ? selected.name : "chưa chọn tệp"}</div>
 
               {tool === "transcribe" && (
                 <>
                   <div className="field"><label>Model Whisper</label>
                     <div className="seg">
-                      {["tiny", "base", "small"].map((m) => (
+                      {["tiny", "base", "small", "medium"].map((m) => (
                         <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
                       ))}
                     </div>
                   </div>
+                  {feats.whisper_mlx && (
+                    <div className="field"><label>Engine</label>
+                      <div className="seg">
+                        <button className={whEngine === "" ? "on" : ""} onClick={() => setWhEngine("")}>Tự chọn</button>
+                        <button className={whEngine === "mlx" ? "on" : ""} onClick={() => setWhEngine("mlx")}>⚡ Metal (MLX)</button>
+                        <button className={whEngine === "faster" ? "on" : ""} onClick={() => setWhEngine("faster")}>CPU int8</button>
+                      </div>
+                    </div>
+                  )}
                   <div className="field"><label>Ngôn ngữ</label>
                     <div className="seg">
                       <button className={whLang === "" ? "on" : ""} onClick={() => setWhLang("")}>Tự nhận</button>
@@ -362,10 +427,72 @@ export default function App() {
                     <label className="chk"><input type="checkbox" checked={whBurn} onChange={(e) => setWhBurn(e.target.checked)} />Burn vào video</label>
                   </div>
                   <button className="btn pri big" onClick={() => run("transcribe", {
-                    model: whModel, burn: whBurn, language: whLang || null,
+                    model: whModel, engine: whEngine || null, burn: whBurn, language: whLang || null,
                     max_words: whMaxWords, font: whFont, effect: whEffect,
                     size: whSize, position: whPos, uppercase: whUpper,
                   })}>▶ Chạy trên máy</button>
+                </>
+              )}
+
+              {tool === "rife" && (
+                <>
+                  <div className="field"><label>Chế độ</label>
+                    <div className="seg">
+                      <button className={rifeMode === "smooth" ? "on" : ""} onClick={() => setRifeMode("smooth")}>Mượt ×2 fps</button>
+                      <button className={rifeMode === "slowmo" ? "on" : ""} onClick={() => setRifeMode("slowmo")}>Slow-motion ×2</button>
+                    </div>
+                  </div>
+                  <div className="hint">
+                    {rifeMode === "smooth"
+                      ? "Giữ nguyên tốc độ, nhân đôi số khung hình — 30fps thành 60fps, chuyển động mượt hẳn."
+                      : "Giữ nguyên fps, video dài gấp đôi — quay chậm mềm mại; âm thanh tự giãn 0.5×."}
+                  </div>
+                  <br />
+                  <button className="btn pri big" onClick={() => run("rife", { mode: rifeMode })}>▶ Chạy trên máy</button>
+                </>
+              )}
+
+              {tool === "bg_remove" && (
+                <>
+                  <div className="field"><label>Nền thay thế</label>
+                    <div className="seg">
+                      {[["green", "Xanh key"], ["black", "Đen"], ["white", "Trắng"], ["alpha", "Trong suốt"]].map(([v, l]) => (
+                        <button key={v} className={bgMode === v ? "on" : ""} onClick={() => setBgMode(v)}>{l}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="hint">
+                    {bgMode === "alpha"
+                      ? "Xuất .webm kênh alpha (VP9) — kéo thẳng vào phần mềm dựng, nền trong suốt. Mã hoá chậm hơn mp4."
+                      : "Nền xanh lá để key tiếp trong app dựng; đen/trắng dùng ngay. AI matting theo dõi cả tóc và biên mềm."}
+                  </div>
+                  <br />
+                  <button className="btn pri big" onClick={() => run("bg_remove", { bg: bgMode })}>▶ Chạy trên máy</button>
+                </>
+              )}
+
+              {tool === "tts" && (
+                <>
+                  <div className="field"><label>Văn bản cần đọc · {ttsText.length}/5000</label>
+                    <textarea className="ttsbox" rows={7} maxLength={5000} value={ttsText}
+                      placeholder="Nhập nội dung, Piper sẽ đọc thành file âm thanh — 100% trên máy..."
+                      onChange={(e) => setTtsText(e.target.value)} />
+                  </div>
+                  <div className="field"><label>Giọng đọc</label>
+                    <div className="seg">
+                      <button className={ttsVoice === "vi" ? "on" : ""} onClick={() => setTtsVoice("vi")}>🇻🇳 Tiếng Việt</button>
+                      <button className={ttsVoice === "en" ? "on" : ""} onClick={() => setTtsVoice("en")}>🇺🇸 English</button>
+                    </div>
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Tốc độ đọc</span><b>{ttsSpeed.toFixed(1)}×</b></div>
+                    <input type="range" min={0.6} max={1.5} step={0.1} value={ttsSpeed}
+                      onChange={(e) => setTtsSpeed(parseFloat(e.target.value))} />
+                  </div>
+                  <button className="btn pri big" disabled={!ttsText.trim()}
+                    onClick={() => run("tts", { text: ttsText, voice: ttsVoice, speed: ttsSpeed })}>
+                    ▶ Tạo giọng đọc (.wav + .mp3)
+                  </button>
                 </>
               )}
 
@@ -414,12 +541,136 @@ export default function App() {
                 </>
               )}
 
+              {tool === "auto_edit" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    ✨ AI tự dựng trọn gói: cắt khoảng lặng → caption karaoke → xuất preset.
+                    Bật "Chọn nhiều" ở kho media để chạy hàng loạt qua đêm.
+                  </div>
+                  <div className="optrow">
+                    <label className="chk"><input type="checkbox" checked={autoCut} onChange={(e) => setAutoCut(e.target.checked)} />Cắt khoảng lặng</label>
+                    <label className="chk"><input type="checkbox" checked={autoCaption} onChange={(e) => setAutoCaption(e.target.checked)} />Caption karaoke</label>
+                  </div>
+                  <div className="field"><label>Bước cuối</label>
+                    <select value={autoPreset} onChange={(e) => setAutoPreset(e.target.value)}>
+                      <option value="">Giữ khung gốc</option>
+                      <option value="reframe916">Dọc 9:16 nền mờ (CapCut)</option>
+                      <option value="tiktok">TikTok 9:16 viền đen</option>
+                      <option value="youtube">YouTube 1080p</option>
+                      <option value="square">Vuông 1:1</option>
+                      <option value="reels45">Feed 4:5</option>
+                    </select>
+                  </div>
+                  <div className="field"><label>Model Whisper</label>
+                    <div className="seg">
+                      {["tiny", "base", "small"].map((m) => (
+                        <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <br />
+                  <button className="btn pri big" disabled={!autoCut && !autoCaption && !autoPreset}
+                    onClick={() => run("auto_edit", {
+                      cut: autoCut, caption: autoCaption, preset: autoPreset || null,
+                      margin, model: whModel, effect: whEffect, max_words: whMaxWords,
+                      font: whFont, size: whSize, position: whPos, uppercase: whUpper,
+                    })}>✨ Dựng tự động</button>
+                </>
+              )}
+
+              {tool === "reframe" && (
+                <>
+                  <div className="field"><label>Kiểu khung dọc</label>
+                    <div className="seg">
+                      <button className={reframeMode === "blur" ? "on" : ""} onClick={() => setReframeMode("blur")}>Nền mờ</button>
+                      <button className={reframeMode === "crop" ? "on" : ""} onClick={() => setReframeMode("crop")}>Cắt giữa</button>
+                    </div>
+                  </div>
+                  <div className="hint">
+                    {reframeMode === "blur"
+                      ? "Video nằm giữa, nền là chính nó phóng to làm mờ — đúng kiểu CapCut khi đăng video ngang lên TikTok."
+                      : "Phóng to tràn khung 1080×1920 rồi cắt phần giữa — hợp cảnh quay chủ thể ở giữa."}
+                  </div>
+                  <br />
+                  <button className="btn pri big" onClick={() => run("reframe", { mode: reframeMode })}>▶ Chạy trên máy</button>
+                </>
+              )}
+
+              {tool === "speed" && (
+                <>
+                  <div className="field"><label>Hệ số tốc độ</label>
+                    <div className="seg">
+                      {[0.5, 0.75, 1.25, 1.5, 2, 3].map((f) => (
+                        <button key={f} className={speedFactor === f ? "on" : ""} onClick={() => setSpeedFactor(f)}>×{f}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="hint">Âm thanh đổi tốc độ nhưng giữ nguyên cao độ (không bị chipmunk).</div>
+                  <br />
+                  <button className="btn pri big" onClick={() => run("speed", { factor: speedFactor })}>▶ Chạy trên máy</button>
+                </>
+              )}
+
+              {tool === "color" && (
+                <>
+                  <div className="field"><label>Chọn filter</label>
+                    <div className="fgrid">
+                      {[["vivid", "🌈 Rực rỡ"], ["warm", "🌅 Ấm áp"], ["cool", "❄️ Lạnh"],
+                        ["bw", "⬛ Đen trắng"], ["film", "🎞️ Film cổ điển"], ["sharp", "🔪 Nét căng"]].map(([v, l]) => (
+                        <button key={v} className={"fcard" + (colorName === v ? " on" : "")} onClick={() => setColorName(v)}>{l}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <br />
+                  <button className="btn pri big" onClick={() => run("color", { filter: colorName })}>▶ Chạy trên máy</button>
+                </>
+              )}
+
+              {tool === "music" && (
+                <>
+                  <div className="field"><label>Nhạc nền (tệp audio trong kho media)</label>
+                    <select value={musicFile} onChange={(e) => setMusicFile(e.target.value)}>
+                      <option value="">— chọn tệp nhạc —</option>
+                      {media.filter((m) => !m.info.width).map((m) => (
+                        <option key={m.name} value={m.name}>{m.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  {media.filter((m) => !m.info.width).length === 0 &&
+                    <div className="hint">Chưa có tệp nhạc — kéo thả file .mp3/.wav vào kho media trước.</div>}
+                  <div className="field">
+                    <div className="sl-h"><span>Âm lượng nhạc</span><b>{Math.round(musicVol * 100)}%</b></div>
+                    <input type="range" min={0.05} max={1} step={0.05} value={musicVol}
+                      onChange={(e) => setMusicVol(parseFloat(e.target.value))} />
+                  </div>
+                  <div className="optrow">
+                    <label className="chk"><input type="checkbox" checked={musicDuck} onChange={(e) => setMusicDuck(e.target.checked)} />
+                      Ducking — tự nén nhạc khi có giọng nói</label>
+                  </div>
+                  <button className="btn pri big" disabled={!musicFile}
+                    onClick={() => run("music", { music: musicFile, volume: musicVol, duck: musicDuck })}>
+                    ▶ Trộn nhạc nền
+                  </button>
+                </>
+              )}
+
+              {tool === "stabilize" && (
+                <>
+                  <div className="hint">Giảm rung cho video quay tay bằng bộ lọc deshake — chạy nhanh, không cần GPU.</div>
+                  <br />
+                  <button className="btn pri big" onClick={() => run("stabilize", {})}>▶ Chạy trên máy</button>
+                </>
+              )}
+
               {tool === "export" && (
                 <>
                   <div className="pcards">
                     {[["tiktok", "TikTok/Reels", "1080×1920", 18, 30],
                       ["youtube", "YouTube", "1920×1080", 40, 22],
-                      ["square", "Instagram", "1080×1080", 26, 26]].map(([k, n, m, w, h]) => (
+                      ["square", "Instagram", "1080×1080", 26, 26],
+                      ["reels45", "Feed 4:5", "1080×1350", 24, 30],
+                      ["gif", "GIF 480p", "chia sẻ nhanh", 30, 17],
+                      ["mp3", "MP3 320k", "chỉ âm thanh", 30, 10]].map(([k, n, m, w, h]) => (
                       <button key={k as string} className={"pcard" + (preset === k ? " on" : "")}
                         onClick={() => setPreset(k as string)}>
                         <div className="pr"><i style={{ width: w as number, height: h as number }} /></div>
@@ -447,7 +698,12 @@ export default function App() {
                       {j.status === "running" && "ĐANG CHẠY"}
                       {j.status === "done" && "✓ XONG"}
                       {j.status === "error" && "✗ LỖI"}
+                      {j.status === "cancelled" && "⊘ ĐÃ HỦY"}
                     </span>
+                    {(j.status === "queued" || j.status === "running") && (
+                      <button className="jcancel" title="Hủy việc này"
+                        onClick={async () => { await cancelJob(j.id); setJobs(await getJobs()); }}>✕</button>
+                    )}
                   </div>
                   <div className="jinput">{j.input}</div>
                   {j.status === "running" && (
@@ -480,7 +736,9 @@ export default function App() {
       <footer className="status">
         <span className={running > 0 ? "amb" : "ok"}>{running > 0 ? `▶ ĐANG XỬ LÝ (${running})` : "✓ SẴN SÀNG"}</span>
         <span className="sp" />
-        {gpu && <span>GPU <b className="amb">{gpu.name.replace("NVIDIA GeForce ", "")}</b> · VRAM {((gpu as any).vram_used_mb / 1024).toFixed(1)}/{Math.round(gpu.vram_total_mb / 1024)} GB</span>}
+        {gpu && <span>GPU <b className="amb">{gpu.name.replace("NVIDIA GeForce ", "")}</b>{gpu.type === "apple"
+          ? ` · ${Math.round(gpu.vram_total_mb / 1024)} GB hợp nhất`
+          : ` · VRAM ${((gpu as any).vram_used_mb / 1024).toFixed(1)}/${Math.round(gpu.vram_total_mb / 1024)} GB`}</span>}
         <span className="sp" />
         <span>{media.length} tệp · {doneCount} việc xong</span>
         <span className="sp" />

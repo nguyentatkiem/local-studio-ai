@@ -8,3 +8,5 @@ __pycache__/
 .DS_Store
 backend/auth_config.json
 backend/ADMIN-PASSWORD.txt
+desktop/node_modules/
+desktop/src-tauri/target/

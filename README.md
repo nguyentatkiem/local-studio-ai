@@ -1,27 +1,38 @@
 # 🎬 Local Studio — AI Video Editor chạy 100% trên máy
 
-> MVP 0.1 — Không cloud · Không credit · Không watermark · Footage không bao giờ rời máy bạn.
+> v0.4 — Không cloud · Không credit · Không watermark · Footage không bao giờ rời máy bạn.
 
 ## Chạy ứng dụng
 
-**Nháy đúp `start.bat`** → trình duyệt tự mở `http://127.0.0.1:8765`.
+- **Windows**: nháy đúp `start.bat` → trình duyệt tự mở `http://127.0.0.1:8765`
+- **macOS/Linux**: chạy `./start.sh` (hoặc mở **Local Studio.app** trong /Applications — tự khởi động backend)
 
-## Tính năng MVP
+## Tính năng v0.4
 
 | Tính năng | Engine | Ghi chú |
 |---|---|---|
-| 📝 Caption tự động (+ burn-in, xuất .srt/.txt) | faster-whisper (CPU int8) | Model tiny/base/small, tự nhận diện ngôn ngữ |
+| ✨ Tự động dựng AI 1 chạm | pipeline | cắt lặng → caption karaoke → preset/9:16 · chạy batch qua đêm |
+| 📝 Caption tự động (+ burn-in, .srt/.ass/.txt) | faster-whisper CPU · **MLX GPU Metal (Mac)** | tiny/base/small/medium, karaoke/6 hiệu ứng |
 | ✂️ Cắt khoảng lặng / jump-cut | auto-editor | Chỉnh biên an toàn (margin) |
 | 🔍 AI Upscale ×2/×3/×4 | Real-ESRGAN ncnn-vulkan (**GPU**) | Chế độ "Nhanh" (lanczos) cho video dài |
-| 📤 Xuất preset TikTok 9:16 / YouTube / vuông | FFmpeg | Không watermark |
-| ⚙️ Hàng đợi job nền | ThreadPool | Xếp nhiều job, chạy tuần tự 2 luồng |
+| 🎞️ Nội suy khung hình ×2 / slow-motion | RIFE ncnn-vulkan (**GPU**) | 30→60fps hoặc quay chậm 2× |
+| 🪄 Tách nền video | RVM (ONNX CoreML/CPU) | nền xanh/đen/trắng + webm alpha trong suốt |
+| 🗣️ Đọc văn bản TTS offline | Piper | giọng Việt + Anh, tốc độ 0.6–1.5×, wav+mp3 |
+| 📐 Đổi khung 9:16 kiểu CapCut | FFmpeg | nền chính video làm mờ hoặc crop giữa |
+| ⏩ Tốc độ 0.5–3× | FFmpeg | giữ cao độ âm thanh (atempo) |
+| 🎨 6 filter màu | FFmpeg | vivid · warm · cool · B&W · film · sharp |
+| 🎵 Nhạc nền + ducking | FFmpeg sidechain | tự nén nhạc khi có giọng nói |
+| 🧷 Chống rung | FFmpeg deshake | video quay tay |
+| 📤 Xuất preset | FFmpeg | TikTok 9:16 · YouTube · 1:1 · 4:5 · GIF · MP3 |
+| ⚙️ Hàng đợi 40 job + hủy job + batch | ThreadPool | chọn nhiều tệp chạy hàng loạt |
 
 ## Kiến trúc
 
 ```
 frontend/   React + Vite (build sẵn vào frontend/dist, backend serve luôn)
 backend/    FastAPI (main.py) + venv riêng — cổng 8765, chỉ bind 127.0.0.1
-binaries/   realesrgan-ncnn-vulkan (GPU Vulkan)
+binaries/   realesrgan · rife · rvm (onnx) · piper/voices · ffmpeg static (libass)
+desktop/    Tauri v2 shell → Local Studio.app (tự spawn backend)
 workspace/  uploads / outputs / tmp
 samples/    sample.mp4 — video test có giọng nói + khoảng lặng
 ```

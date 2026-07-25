@@ -214,3 +214,21 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;bac
 .toast{background:var(--p3);border:1px solid var(--line2);border-radius:9px;padding:11px 14px;min-width:250px;max-width:360px;
   box-shadow:0 12px 34px rgba(0,0,0,.5);animation:slidein .22s ease both;font-size:12.5px}
 @keyframes slidein{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}
+
+/* ============ v0.4: batch, TTS, cancel ============ */
+.batchbtn{margin-left:auto;font-size:11px;color:var(--dim);border:1px solid var(--line2);border-radius:6px;padding:3px 9px;transition:.12s}
+.batchbtn:hover{color:var(--ink);background:var(--p3)}
+.batchbtn.on{color:var(--amber);border-color:rgba(255,178,63,.45);background:var(--amberg)}
+.bsel{position:absolute;top:6px;left:6px;width:18px;height:18px;border-radius:5px;border:1.5px solid rgba(255,255,255,.65);background:rgba(0,0,0,.45);display:grid;place-items:center;font-size:11px;font-weight:700;color:#1A1204}
+.bsel.on{background:var(--amber);border-color:var(--amber)}
+.ttsbox{width:100%;resize:vertical;background:var(--p2);border:1px solid var(--line2);border-radius:8px;color:var(--ink);font-family:var(--ui);font-size:13px;line-height:1.5;padding:10px}
+.ttsbox:focus{outline:2px solid var(--amber);outline-offset:0}
+.jcancel{margin-left:8px;width:20px;height:20px;border-radius:5px;color:var(--dim);border:1px solid var(--line2);display:grid;place-items:center;font-size:11px;line-height:1}
+.jcancel:hover{color:var(--warn);border-color:rgba(255,107,87,.5);background:rgba(255,107,87,.08)}
+.jstatus.cancelled{color:var(--faint)}
+.job.cancelled{opacity:.55}
+/* wave 2: filter cards */
+.fgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.fcard{padding:12px 10px;border-radius:8px;border:1px solid var(--line2);background:var(--p2);font-size:12.5px;text-align:left;transition:.12s}
+.fcard:hover{background:var(--p3)}
+.fcard.on{border-color:var(--amber);background:var(--amberg);color:var(--amber);font-weight:600}
