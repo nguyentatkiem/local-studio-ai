@@ -408,7 +408,8 @@ def _job_wrapper(job_id: str, fn, *args):
         if job_id in CANCEL_REQUESTED:
             _set(job_id, status="cancelled", finished=time.time(), message="Đã hủy")
         else:
-            _set(job_id, status="error", error=str(e)[-1000:], finished=time.time())
+            _set(job_id, status="error", error=str(e)[-1000:], finished=time.time(),
+                 message=("Lỗi: " + str(e))[:160])
     finally:
         CANCEL_REQUESTED.discard(job_id)
         with JOBS_LOCK:
@@ -1583,6 +1584,481 @@ def job_audiogram(job_id: str, src: Path, target: str, title: str):
             ass_path.unlink(missing_ok=True)
 
 
+# ================================================================ wave 4 (v0.6) — LLM local + face AI
+LLM_REPO = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+YUNET_ONNX = BINARIES / "yunet" / "face_detection_yunet_2023mar.onnx"
+
+_llm_cache = None
+_llm_lock = threading.Lock()
+
+
+def llm_available() -> bool:
+    if not IS_MAC:
+        return False
+    try:
+        import mlx_lm  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def llm_generate(prompt: str, max_tokens: int = 1500, job_id: str = None) -> str:
+    """Sinh văn bản bằng Qwen3 4B 4-bit qua MLX — nạp model 1 lần, khoá tuần tự.
+    Trong lúc chờ khoá vẫn phản hồi lệnh hủy job."""
+    global _llm_cache
+    from mlx_lm import load, generate
+    while not _llm_lock.acquire(timeout=1.0):
+        if job_id and job_id in CANCEL_REQUESTED:
+            raise JobCancelled()
+    try:
+        if job_id and job_id in CANCEL_REQUESTED:
+            raise JobCancelled()
+        if _llm_cache is None:
+            _llm_cache = load(LLM_REPO)
+        model, tokenizer = _llm_cache
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True, tokenize=False)
+        out = generate(model, tokenizer, prompt=text,
+                       max_tokens=max_tokens, verbose=False)
+        try:  # trả lại RAM buffer KV cho hệ (giữ weights)
+            import mlx.core as mx
+            mx.clear_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+    finally:
+        _llm_lock.release()
+
+
+def _extract_json(text: str):
+    """Lấy khối JSON đầu tiên trong output LLM — quét cân bằng ngoặc (không dùng
+    regex tham lam vì lời dẫn/chú thích quanh JSON hay chứa ngoặc lạc)."""
+    text = re.sub(r"```(?:json)?", "", text)
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch not in "[{":
+            i += 1
+            continue
+        depth, in_str, esc = 0, False, False
+        for j in range(i, len(text)):
+            c = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c in "[{":
+                depth += 1
+            elif c in "]}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[i:j + 1])
+                    except json.JSONDecodeError:
+                        break  # khối này hỏng — thử khối bắt đầu muộn hơn
+        i += 1
+    raise ValueError("LLM không trả về JSON hợp lệ")
+
+
+def cv2_available() -> bool:
+    try:
+        import cv2  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _transcript_lines(seg_list) -> list:
+    return [f"[{s.start:.1f}-{s.end:.1f}] {s.text.strip()}"
+            for s in seg_list if s.text.strip()]
+
+
+# ---------------------------------------------------------------- job: AI highlights → shorts
+class _ShiftSeg:
+    """Segment con trong cửa sổ highlight, timestamps dời về 0 để burn caption."""
+    __slots__ = ("text", "start", "end", "words")
+
+    def __init__(self, text, start, end, words):
+        self.text, self.start, self.end, self.words = text, start, end, words
+
+
+class _ShiftWord:
+    __slots__ = ("word", "start", "end")
+
+    def __init__(self, word, start, end):
+        self.word, self.start, self.end = word, start, end
+
+
+def _window_segments(seg_list, t0: float, t1: float):
+    """Lọc các từ trong [t0,t1] từ transcript gốc, dời mốc thời gian về 0."""
+    out = []
+    for s in seg_list:
+        if s.end < t0 or s.start > t1:
+            continue
+        words = [_ShiftWord(w.word, max(0.0, w.start - t0), max(0.05, w.end - t0))
+                 for w in (getattr(s, "words", None) or [])
+                 if not (w.end < t0 or w.start > t1)]
+        if words or (s.start >= t0 and s.end <= t1):
+            out.append(_ShiftSeg(s.text, max(0.0, s.start - t0),
+                                 max(0.1, min(s.end, t1) - t0), words))
+    return out
+
+
+def _pick_highlights(lines: list, dur: float, count: int,
+                     smin: float, smax: float, job_id: str = None) -> list:
+    """LLM chọn các khoảnh khắc đáng làm shorts. Transcript dài thì chia phần."""
+    def ask(sub_lines, n):
+        prompt = (
+            "Bạn là biên tập viên video ngắn chuyên nghiệp. Dưới đây là transcript "
+            "có mốc thời gian (giây) của một video dài.\n\n"
+            + "\n".join(sub_lines) +
+            f"\n\nChọn {n} khoảnh khắc HAY NHẤT để cắt thành video ngắn đăng "
+            f"TikTok/Shorts: ưu tiên đoạn có hook mạnh, thông tin trọn vẹn, gây tò mò. "
+            f"Mỗi đoạn dài {smin:.0f}-{smax:.0f} giây, KHÔNG chồng lấn nhau, "
+            f"start/end phải nằm trong transcript.\n"
+            'Trả về DUY NHẤT mảng JSON, không giải thích: '
+            '[{"start": <giây>, "end": <giây>, "title": "<tiêu đề ngắn hấp dẫn>", '
+            '"hook": "<1 câu vì sao đoạn này hay>"}]'
+        )
+        try:
+            data = _extract_json(llm_generate(prompt, max_tokens=1200, job_id=job_id))
+            return [c for c in data if isinstance(c, dict)] if isinstance(data, list) else []
+        except (ValueError, json.JSONDecodeError):
+            return []
+
+    # transcript quá dài → chọn sơ bộ theo từng phần rồi chung kết
+    CHUNK = 11000
+    text_all = "\n".join(lines)
+    if len(text_all) <= CHUNK:
+        cands = ask(lines, count)
+    else:
+        cands = []
+        parts, part, size = [], [], 0
+        for ln in lines:
+            part.append(ln)
+            size += len(ln)
+            if size >= CHUNK:
+                parts.append(part)
+                part, size = [], 0
+        if part:
+            parts.append(part)
+        parts = parts[:8]  # chặn trần số lượt gọi LLM với video rất dài
+        for pt in parts:
+            if job_id:
+                _cancel_point(job_id)
+            cands += ask(pt, max(2, count // 2 + 1))
+        if len(cands) > count:
+            brief = [f'{i}: [{c.get("start")}-{c.get("end")}] '
+                     f'{c.get("title", "")} — {c.get("hook", "")}'
+                     for i, c in enumerate(cands)]
+            prompt = ("Các đoạn ứng viên cho video ngắn:\n" + "\n".join(brief) +
+                      f"\n\nChọn {count} đoạn hay nhất, đa dạng chủ đề. "
+                      'Trả về DUY NHẤT mảng JSON các chỉ số: [0, 3, ...]')
+            try:
+                idx = _extract_json(llm_generate(prompt, max_tokens=200, job_id=job_id))
+                sel = []
+                for i in (idx if isinstance(idx, list) else []):
+                    try:
+                        sel.append(cands[int(i)])
+                    except (ValueError, TypeError, IndexError):
+                        continue
+                cands = sel or cands[:count]  # LLM trả rác → giữ ứng viên đầu
+            except (ValueError, json.JSONDecodeError):
+                cands = cands[:count]
+
+    # validate: ép số, clamp vào video, đúng độ dài, bỏ chồng lấn
+    picked = []
+    for c in cands:
+        if not isinstance(c, dict):
+            continue
+        try:
+            s, e = float(c["start"]), float(c["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if e <= s or e - s < smin * 0.5:  # LLM chọn đoạn rác quá ngắn — bỏ TRƯỚC khi clamp
+            continue
+        s = max(0.0, min(s, dur - smin))
+        e = min(dur, max(e, s + smin))
+        if e - s > smax:
+            e = s + smax
+        if e - s < smin - 0.5:
+            continue
+        if any(not (e <= q["start"] or s >= q["end"]) for q in picked):
+            continue
+        picked.append({"start": round(s, 2), "end": round(e, 2),
+                       "title": str(c.get("title", ""))[:80],
+                       "hook": str(c.get("hook", ""))[:160]})
+        if len(picked) >= count:
+            break
+    picked.sort(key=lambda x: x["start"])
+    return picked
+
+
+REFRAME916_FC = ("[0:v]split[a][b];"
+                 "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
+                 "crop=1080:1920,boxblur=24:6[bg];"
+                 "[b]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
+                 "[bg][fg]overlay=(W-w)/2:(H-h)/2[rf]")
+
+
+def job_highlights(job_id: str, src: Path, p: dict):
+    """AI tìm khoảnh khắc hay trong video dài → tự cắt thành shorts hoàn chỉnh
+    (caption karaoke + khung dọc 9:16 nền mờ) — kiểu Opus Clip nhưng 100% local."""
+    count = min(6, max(1, int(p.get("count", 3))))
+    smin = min(60.0, max(5.0, float(p.get("min_dur", 15))))
+    smax = min(120.0, max(smin + 5, float(p.get("max_dur", 60))))
+    make = bool(p.get("make_shorts", True))
+    info = media_info(src)
+    dur = info["duration"] or 1
+    if dur < smin * 1.5:
+        raise RuntimeError(f"Video quá ngắn ({dur:.0f}s) — cần dài hơn {smin * 1.5:.0f}s")
+
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    language = p.get("language") if p.get("language") in ("vi", "en") else None
+    seg_list, _lines, lang = _speech_recognize(
+        job_id, src, model_size, language, p.get("engine"), dur, 3, 45)
+    lines = _transcript_lines(seg_list)
+    if not lines:
+        raise RuntimeError("Video không có lời thoại — AI highlights cần giọng nói")
+    _cancel_point(job_id)
+
+    _set(job_id, progress=48, message="AI (Qwen3 local) đang chọn khoảnh khắc hay...")
+    picked = _pick_highlights(lines, dur, count, smin, smax, job_id)
+    if not picked:
+        raise RuntimeError("AI không chọn được đoạn phù hợp — thử giảm độ dài tối thiểu")
+    _cancel_point(job_id)
+
+    outputs = []
+    tmp_ass = []
+    try:
+        for i, hl in enumerate(picked):
+            _cancel_point(job_id)
+            t0, t1 = hl["start"], hl["end"]
+            d = t1 - t0
+            _set(job_id, progress=62 + i / len(picked) * 33,
+                 message=f"Dựng short {i + 1}/{len(picked)}: {hl['title'][:40]}")
+            safe_title = re.sub(r"[^\w\-. ]+", "", hl["title"])[:40].strip() or f"doan{i + 1}"
+            out = unique_out(f"{src.stem}_short{i + 1}_{safe_title}", ".mp4")
+            if make:
+                wsegs = _window_segments(seg_list, t0, t1)
+                chunks = chunk_words(wsegs, int(p.get("max_words", 3)),
+                                     bool(p.get("uppercase", False)))
+                fc = REFRAME916_FC
+                vout = "[rf]"
+                cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                       "-ss", f"{t0:.2f}", "-t", f"{d:.2f}", "-i", str(src)]
+                if chunks:
+                    ass = TMP / f"hl_{job_id}_{i}.ass"
+                    font = p.get("font") if p.get("font") in SUB_FONTS else "Arial"
+                    ass.write_text(build_ass(chunks, 1080, 1920, font,
+                                             p.get("size", "M"),
+                                             p.get("effect", "karaoke"),
+                                             p.get("position", "bottom")),
+                                   encoding="utf-8")
+                    tmp_ass.append(ass)
+                    fc += f";[rf]subtitles={ass.name}[vout]"
+                    vout = "[vout]"
+                cmd += ["-filter_complex", fc, "-map", vout, "-map", "0:a?",
+                        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(out)]
+                r = _run_tracked(job_id, cmd, cwd=str(TMP))
+            else:
+                cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                       "-ss", f"{t0:.2f}", "-t", f"{d:.2f}", "-i", str(src),
+                       "-c:v", "libx264", "-crf", "19", "-preset", "medium",
+                       "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(out)]
+                r = _run_tracked(job_id, cmd)
+            if r.returncode != 0:
+                raise RuntimeError(f"Cắt short {i + 1} thất bại: {r.stderr_text[-300:]}")
+            outputs.append(out_entry(out))
+
+        def mmss(t):
+            return f"{int(t // 60):02d}:{int(t % 60):02d}"
+        note = unique_out(f"{src.stem}_highlights", ".txt")
+        note.write_text("\n".join(
+            f"{i + 1}. [{mmss(h['start'])}–{mmss(h['end'])}] {h['title']}\n   → {h['hook']}"
+            for i, h in enumerate(picked)) + "\n", encoding="utf-8")
+        outputs.append(out_entry(note))
+        _set(job_id, message=f"Xong — {len(picked)} shorts (ngôn ngữ: {lang})")
+        return outputs
+    finally:
+        for a in tmp_ass:
+            a.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- job: AI content writer
+def job_content(job_id: str, src: Path, p: dict):
+    """LLM local viết tiêu đề/mô tả/hashtags/chapters từ transcript video."""
+    platform = p.get("platform") if p.get("platform") in ("tiktok", "youtube") else "youtube"
+    info = media_info(src)
+    dur = info["duration"] or 1
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    language = p.get("language") if p.get("language") in ("vi", "en") else None
+    seg_list, _l, lang = _speech_recognize(
+        job_id, src, model_size, language, p.get("engine"), dur, 3, 60)
+    lines = _transcript_lines(seg_list)
+    if not lines:
+        raise RuntimeError("Video không có lời thoại để viết nội dung")
+    _cancel_point(job_id)
+
+    text_all = "\n".join(lines)
+    if len(text_all) > 15000:  # transcript rất dài → giữ đầu + cuối
+        text_all = text_all[:9000] + "\n[...phần giữa lược bớt...]\n" + text_all[-5000:]
+
+    _set(job_id, progress=65, message="AI (Qwen3 local) đang viết nội dung...")
+    chapters_req = ("\n5. CHAPTERS: các mốc chương dạng 'mm:ss Tên phần' (dựa mốc giây "
+                    "trong transcript, chương đầu là 00:00)") if dur > 120 else ""
+    prompt = (
+        f"Bạn là chuyên gia nội dung {'TikTok/Shorts' if platform == 'tiktok' else 'YouTube'} "
+        f"người Việt. Transcript video ({dur:.0f}s, ngôn ngữ {lang}):\n\n{text_all}\n\n"
+        "Viết bằng tiếng Việt, định dạng Markdown với đúng các mục:\n"
+        "1. TIÊU ĐỀ: 3 phương án tiêu đề giật hook (mỗi cái ≤70 ký tự)\n"
+        "2. HOOK MỞ ĐẦU: 1-2 câu thoại nên nói trong 3 giây đầu\n"
+        "3. MÔ TẢ: đoạn mô tả chuẩn SEO (2-4 câu + CTA)\n"
+        "4. HASHTAGS: 8-12 hashtag phù hợp" + chapters_req
+    )
+    content = llm_generate(prompt, max_tokens=1600, job_id=job_id)
+    _cancel_point(job_id)
+    out = unique_out(f"{src.stem}_content", ".md")
+    out.write_text(f"# Nội dung cho: {src.name} ({platform})\n\n{content}\n",
+                   encoding="utf-8")
+    _set(job_id, message=f"Xong — tiêu đề/mô tả/hashtags{' /chapters' if chapters_req else ''}")
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: face blur
+def job_face_blur(job_id: str, src: Path, mode: str, strength: float):
+    """Tự phát hiện & làm mờ mọi khuôn mặt (YuNet ONNX) — che mặt học sinh,
+    người qua đường... trước khi đăng video."""
+    import cv2
+    import numpy as np
+
+    if not YUNET_ONNX.exists():
+        raise RuntimeError("Chưa có model YuNet trong binaries/yunet")
+    info = media_info(src)
+    w, h = info["width"], info["height"]
+    if not w or not h:
+        raise RuntimeError("Tệp không có luồng video")
+    fps = info["fps"] or 30
+    dur = info["duration"] or 1
+    total = max(1, int(dur * fps))
+
+    # detect ở bản thu nhỏ ~640px cho nhanh, scale box ngược lại
+    dw = min(640, w)
+    dh = max(1, int(h * dw / w))
+    det = cv2.FaceDetectorYN.create(str(YUNET_ONNX), "", (dw, dh), 0.6, 0.3, 500)
+    sx, sy = w / dw, h / dh
+
+    out = unique_out(f"{src.stem}_facemask", ".mp4")
+    dec_log = TMP / f"fbdec_{job_id}.log"
+    dec_ef = open(dec_log, "wb")
+    dec = subprocess.Popen(
+        [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+         "-i", str(src), "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=dec_ef,
+    )
+    enc_cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+               "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
+               "-r", str(fps), "-i", "pipe:0"]
+    if info["has_audio"]:
+        enc_cmd += ["-i", str(src), "-map", "0:v", "-map", "1:a",
+                    "-c:a", "aac", "-shortest"]
+    # ép kích thước chẵn (x264 yuv420p đòi chẵn — video crop lẻ pixel sẽ chết encoder)
+    enc_cmd += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-c:v", "libx264", "-crf", "19",
+                "-preset", "veryfast" if w * h > 1920 * 1080 else "medium",
+                "-pix_fmt", "yuv420p", str(out)]
+    enc_log = TMP / f"fb_{job_id}.log"
+    enc_ef = open(enc_log, "wb")
+    enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE,
+                           stdout=subprocess.DEVNULL, stderr=enc_ef)
+    _track_proc(job_id, enc)
+
+    frame_bytes = w * h * 3
+    active = []  # [x1,y1,x2,y2,ttl] — giữ box 6 frame chống nhấp nháy
+    i = faces_total = 0
+    try:
+        while True:
+            if job_id in CANCEL_REQUESTED:
+                dec.kill()
+                enc.kill()
+                raise JobCancelled()
+            buf = dec.stdout.read(frame_bytes)
+            if not buf or len(buf) < frame_bytes:
+                break
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3).copy()
+            small = cv2.resize(frame, (dw, dh))
+            _ok, faces = det.detect(small)
+            for b in active:
+                b[4] -= 1
+            active = [b for b in active if b[4] > 0]
+            if faces is not None:
+                for f in faces:
+                    x, y, fw, fh = f[0] * sx, f[1] * sy, f[2] * sx, f[3] * sy
+                    ex, ey = fw * 0.15, fh * 0.2  # nới box che cả tóc/cằm
+                    x1 = int(max(0, x - ex))
+                    y1 = int(max(0, y - ey))
+                    x2 = int(min(w, x + fw + ex))
+                    y2 = int(min(h, y + fh + ey))
+                    if x2 > x1 and y2 > y1:
+                        # bỏ box cũ trùng vị trí (tâm nằm trong box mới) — chống tích luỹ
+                        active = [b for b in active
+                                  if not (x1 <= (b[0] + b[2]) // 2 <= x2
+                                          and y1 <= (b[1] + b[3]) // 2 <= y2)]
+                        active.append([x1, y1, x2, y2, 6])
+                        faces_total += 1
+            for x1, y1, x2, y2, _t in active:
+                roi = frame[y1:y2, x1:x2]
+                if roi.size == 0:
+                    continue
+                if mode == "pixelate":
+                    bw = max(3, int((x2 - x1) / (10 * strength)))
+                    bh = max(3, int((y2 - y1) / (10 * strength)))
+                    roi_s = cv2.resize(roi, (bw, bh), interpolation=cv2.INTER_LINEAR)
+                    frame[y1:y2, x1:x2] = cv2.resize(
+                        roi_s, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST)
+                else:
+                    sigma = max(6.0, (x2 - x1) / 8.0 * strength)
+                    frame[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (0, 0), sigma)
+            try:
+                enc.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                break  # encoder chết — đọc enc_log bên dưới để báo lỗi thật
+            i += 1
+            if i % 15 == 0:
+                _set(job_id, progress=min(99, i / total * 100),
+                     message=f"Che mặt: {i}/{total} khung hình · {faces_total} lượt phát hiện")
+    finally:
+        dec.stdout.close()
+        dec.wait()
+        dec_ef.close()
+        if enc.stdin:
+            try:
+                enc.stdin.close()
+            except BrokenPipeError:
+                pass
+        enc.wait()
+        enc_ef.close()
+    _cancel_point(job_id)
+    if enc.returncode != 0 or not out.exists():
+        err = enc_log.read_text(encoding="utf-8", errors="replace") if enc_log.exists() else ""
+        raise RuntimeError(f"Encode failed: {err[-500:]}")
+    if dec.returncode != 0 and i < total * 0.9:  # decode đứt giữa chừng ≠ EOF bình thường
+        err = dec_log.read_text(encoding="utf-8", errors="replace") if dec_log.exists() else ""
+        raise RuntimeError(f"Decode failed ở khung {i}/{total}: {err[-400:]}")
+    enc_log.unlink(missing_ok=True)
+    dec_log.unlink(missing_ok=True)
+    _set(job_id, message=f"Xong — {faces_total} lượt phát hiện mặt trên {i} khung hình")
+    return [out_entry(out)]
+
+
 # ---------------------------------------------------------------- API
 @app.get("/api/health")
 def health():
@@ -1605,7 +2081,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "gpu": gpu_info(),
@@ -1631,6 +2107,10 @@ def health():
             "audio_enhance": ffmpeg_ok,
             "brand": ffmpeg_ok,
             "audiogram": ffmpeg_ok,
+            "llm": llm_available(),
+            "highlights": llm_available() and whisper_ok and ffmpeg_ok,
+            "content": llm_available() and whisper_ok,
+            "face_blur": cv2_available() and YUNET_ONNX.exists() and ffmpeg_ok,
         },
     }
 
@@ -1829,6 +2309,20 @@ def create_job(req: JobRequest):
         target = p.get("target") if p.get("target") in FRAME_SIZES else "11"
         title = str(p.get("title") or "")[:80]
         return submit_job("audiogram", src.name, job_audiogram, src, target, title)
+    if req.type == "highlights":
+        if not llm_available():
+            raise HTTPException(400, "Chưa cài mlx-lm (LLM local) trên máy chủ")
+        return submit_job("highlights", src.name, job_highlights, src, dict(p))
+    if req.type == "content":
+        if not llm_available():
+            raise HTTPException(400, "Chưa cài mlx-lm (LLM local) trên máy chủ")
+        return submit_job("content", src.name, job_content, src, dict(p))
+    if req.type == "face_blur":
+        mode = p.get("mode", "blur")
+        if mode not in ("blur", "pixelate"):
+            mode = "blur"
+        strength = min(2.0, max(0.5, float(p.get("strength", 1.0))))
+        return submit_job("face_blur", src.name, job_face_blur, src, mode, strength)
     raise HTTPException(400, f"Loại job không hỗ trợ: {req.type}")
 
 

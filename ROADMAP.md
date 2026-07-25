@@ -56,6 +56,19 @@
   240s, cancel points; brand/audio_enhance tự re-encode khi codec không hợp mp4 (webm VP9/Opus);
   merge chặn >8 clip có báo lỗi, sửa clamp tdur clip ngắn; UI nhận mp3 có ảnh bìa + upload ảnh logo
 
+## ✅ ĐÃ XONG — v0.6 (build 2026-07-25 tối, wave 4 "AI LLM local")
+
+- [x] 🧠 Hạ tầng LLM local: **Qwen3-4B-Instruct-2507 4-bit qua MLX** (~2.3GB, GPU Metal M4) —
+  `llm_generate()` nạp 1 lần, khoá tuần tự; tự tải về cache HuggingFace lần đầu
+- [x] 🎯 **AI cắt Shorts từ video dài** (`highlights`): Whisper transcript → LLM chấm điểm chọn
+  khoảnh khắc (transcript dài tự chia phần + vòng chung kết) → cắt + reframe 9:16 nền mờ +
+  caption karaoke tái dùng word-timestamps (không transcribe lại) + file .txt tóm tắt các đoạn
+  — thay thế Opus Clip (~$29/tháng) bằng bản 100% local
+- [x] 📝 **AI viết nội dung** (`content`): 3 tiêu đề hook, câu mở đầu, mô tả SEO, hashtags,
+  chapters theo timestamp (video >2 phút) — xuất .md, chọn nền tảng YouTube/TikTok
+- [x] 🫥 **Làm mờ mặt tự động** (`face_blur`): YuNet ONNX (232KB) phát hiện mặt mỗi khung ở bản
+  thu nhỏ 640px, giữ box 6 khung chống nhấp nháy, blur Gaussian hoặc pixelate, nới box che tóc/cằm
+
 ## TIẾP THEO (đề xuất)
 
 ### GĐ 6 — SAM 2 track đối tượng (đã đánh giá khả thi 2026-07-25)

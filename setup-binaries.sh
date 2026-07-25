@@ -53,6 +53,13 @@ for V in "vi/vi_VN/vais1000/medium/vi_VN-vais1000-medium" "en/en_US/lessac/mediu
 done
 cd ../..
 
+# 6. YuNet face detection (mọi hệ)
+if [ ! -f yunet/face_detection_yunet_2023mar.onnx ]; then
+  echo "==> YuNet (che mặt)"
+  mkdir -p yunet && dl yunet/face_detection_yunet_2023mar.onnx "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+fi
+
 echo "==> Xong. Chạy ./start.sh để khởi động."
+echo "    (Model LLM Qwen3 4B ~2.3GB sẽ tự tải về cache HuggingFace ở lần dùng AI đầu tiên)"
 # Windows: tải bản windows của realesrgan/rife từ cùng trang GitHub releases,
 # ffmpeg full từ gyan.dev (bản có libass), đặt vào binaries/ cùng cấu trúc thư mục.

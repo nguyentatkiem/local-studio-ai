@@ -38,9 +38,11 @@ function LoginScreen({ onOk }: { onOk: () => void }) {
 
 type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" | "bg_remove"
   | "tts" | "reframe" | "speed" | "color" | "music" | "stabilize" | "export"
-  | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram";
+  | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
+  | "highlights" | "face_blur" | "content";
 
 const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: boolean }[] = [
+  { key: "highlights", icon: "🎯", name: "AI cắt Shorts từ video dài", desc: "LLM local chọn khoảnh khắc → shorts 9:16", gpu: true },
   { key: "auto_edit", icon: "✨", name: "Tự động dựng (AI 1 chạm)", desc: "cắt lặng → caption → preset · batch", gpu: false },
   { key: "merge", icon: "🎬", name: "Ghép clip + chuyển cảnh", desc: "xfade 10 hiệu ứng · chọn nhiều clip", gpu: false },
   { key: "beatsync", icon: "🥁", name: "Cắt theo nhịp nhạc", desc: "beat-sync kiểu CapCut · librosa", gpu: false },
@@ -54,6 +56,8 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "speed", icon: "⏩", name: "Tốc độ video", desc: "0.5× – 3× · giữ cao độ âm thanh", gpu: false },
   { key: "color", icon: "🎨", name: "Filter màu", desc: "vivid · warm · film · B&W · sharp", gpu: false },
   { key: "music", icon: "🎵", name: "Nhạc nền + ducking", desc: "tự nén nhạc khi có giọng nói", gpu: false },
+  { key: "face_blur", icon: "🫥", name: "Làm mờ mặt tự động", desc: "YuNet AI · che mặt học sinh/người lạ", gpu: false },
+  { key: "content", icon: "📝", name: "AI viết nội dung", desc: "tiêu đề · mô tả · hashtags · chapters", gpu: true },
   { key: "audio_enhance", icon: "🎚️", name: "Chuẩn hoá âm thanh", desc: "khử ồn + loudnorm -16 LUFS", gpu: false },
   { key: "brand", icon: "🏷️", name: "Tiêu đề & Logo", desc: "title mở đầu · chữ ký · watermark PNG", gpu: false },
   { key: "audiogram", icon: "📻", name: "Audiogram sóng nhạc", desc: "audio/TTS → video đăng MXH", gpu: false },
@@ -134,6 +138,14 @@ export default function App() {
   const [brOpacity, setBrOpacity] = useState(0.7);
   const [agTarget, setAgTarget] = useState("11");
   const [agTitle, setAgTitle] = useState("");
+  // wave 4 (v0.6) — AI
+  const [hlCount, setHlCount] = useState(3);
+  const [hlMin, setHlMin] = useState(15);
+  const [hlMax, setHlMax] = useState(60);
+  const [hlMake, setHlMake] = useState(true);
+  const [fbMode, setFbMode] = useState("blur");
+  const [fbStrength, setFbStrength] = useState(1.0);
+  const [ctPlatform, setCtPlatform] = useState("youtube");
 
   const refreshMedia = useCallback(async () => {
     try { setMedia(await getMedia()); } catch { /* not up yet */ }
@@ -239,7 +251,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v0.5 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v0.6 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -326,6 +338,9 @@ export default function App() {
                      (t.key === "tts" && !feats.tts) ||
                      (t.key === "auto_edit" && !feats.auto_edit) ||
                      (t.key === "beatsync" && !feats.beatsync) ||
+                     (t.key === "highlights" && !feats.highlights) ||
+                     (t.key === "content" && !feats.content) ||
+                     (t.key === "face_blur" && !feats.face_blur) ||
                      (["reframe", "speed", "color", "music", "stabilize",
                        "merge", "audio_enhance", "brand", "audiogram"].includes(t.key) && !feats.ffmpeg) ||
                      (t.key === "export" && !feats.export) ? " disabled" : "")}
@@ -581,6 +596,94 @@ export default function App() {
                   <button className="btn pri big" onClick={() => run("upscale", { mode: upMode, scale: upScale, model: upModel })}>
                     ▶ Chạy trên máy
                   </button>
+                </>
+              )}
+
+              {tool === "highlights" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎯 AI nghe toàn bộ video (bài giảng, podcast, vlog dài...), tự chọn
+                    khoảnh khắc hay nhất rồi dựng thành shorts 9:16 kèm caption karaoke —
+                    100% trên máy, không gửi dữ liệu đi đâu.
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Số shorts muốn tạo</span><b>{hlCount}</b></div>
+                    <input type="range" min={1} max={6} step={1} value={hlCount}
+                      onChange={(e) => setHlCount(parseInt(e.target.value))} />
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Độ dài mỗi short</span><b>{hlMin}–{hlMax}s</b></div>
+                    <div className="seg">
+                      {[[10, 30, "Ngắn 10-30s"], [15, 60, "Vừa 15-60s"], [30, 90, "Dài 30-90s"]].map(([a, b, l]) => (
+                        <button key={l as string} className={hlMin === a && hlMax === b ? "on" : ""}
+                          onClick={() => { setHlMin(a as number); setHlMax(b as number); }}>{l}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="field"><label>Model Whisper</label>
+                    <div className="seg">
+                      {["tiny", "base", "small"].map((m) => (
+                        <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="optrow">
+                    <label className="chk"><input type="checkbox" checked={hlMake} onChange={(e) => setHlMake(e.target.checked)} />
+                      Dựng hoàn chỉnh (9:16 nền mờ + caption karaoke)</label>
+                  </div>
+                  <button className="btn pri big" onClick={() => run("highlights", {
+                    count: hlCount, min_dur: hlMin, max_dur: hlMax, make_shorts: hlMake,
+                    model: whModel, effect: whEffect, max_words: whMaxWords,
+                    font: whFont, size: whSize, position: whPos,
+                  })}>🎯 AI cắt shorts</button>
+                </>
+              )}
+
+              {tool === "face_blur" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🫥 AI phát hiện mọi khuôn mặt trong video và che tự động — hợp che mặt
+                    học sinh, người qua đường trước khi đăng công khai.
+                  </div>
+                  <div className="field"><label>Kiểu che</label>
+                    <div className="seg">
+                      <button className={fbMode === "blur" ? "on" : ""} onClick={() => setFbMode("blur")}>Làm mờ (blur)</button>
+                      <button className={fbMode === "pixelate" ? "on" : ""} onClick={() => setFbMode("pixelate")}>Ô vuông (pixel)</button>
+                    </div>
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Độ mạnh</span><b>{fbStrength.toFixed(1)}×</b></div>
+                    <input type="range" min={0.5} max={2} step={0.1} value={fbStrength}
+                      onChange={(e) => setFbStrength(parseFloat(e.target.value))} />
+                  </div>
+                  <button className="btn pri big" onClick={() => run("face_blur", {
+                    mode: fbMode, strength: fbStrength,
+                  })}>🫥 Che mặt tự động</button>
+                </>
+              )}
+
+              {tool === "content" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    📝 AI nghe video rồi viết sẵn: 3 tiêu đề giật hook, câu mở đầu,
+                    mô tả SEO, hashtags, chapters — xuất file .md tải về.
+                  </div>
+                  <div className="field"><label>Nền tảng</label>
+                    <div className="seg">
+                      <button className={ctPlatform === "youtube" ? "on" : ""} onClick={() => setCtPlatform("youtube")}>YouTube</button>
+                      <button className={ctPlatform === "tiktok" ? "on" : ""} onClick={() => setCtPlatform("tiktok")}>TikTok/Shorts</button>
+                    </div>
+                  </div>
+                  <div className="field"><label>Model Whisper</label>
+                    <div className="seg">
+                      {["tiny", "base", "small"].map((m) => (
+                        <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <button className="btn pri big" onClick={() => run("content", {
+                    platform: ctPlatform, model: whModel,
+                  })}>📝 AI viết nội dung</button>
                 </>
               )}
 
