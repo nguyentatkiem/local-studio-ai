@@ -95,6 +95,16 @@
   (level 1-4 + bộ phận cho level 3, ord tự tính, rubric mặc định) — hai dự án gặp nhau. Test: đẩy PASS,
   bản ghi đúng schema. `_push_to_ailms` dùng ? placeholder (không SQL injection), whitelist department/level.
 
+## ✅ ĐÃ XONG — v0.9 (wave 7 "Ghép B-roll tự động từ Pexels")
+
+- [x] 🎞️ **B-roll tự động** (`broll`): video người nói → transcript → AI (Qwen/Claude) chọn N đoạn +
+  từ khoá tiếng Anh → tải clip stock hợp nội dung từ **Pexels API** → ffmpeg overlay đè lên video
+  đúng cửa sổ thời gian (giữ nguyên tiếng gốc), kèm .txt liệt kê cảnh đã chèn
+- [x] Loader `backend/.env` (KEY=VALUE, setdefault) cho `PEXELS_API_KEY` + `LS_CLAUDE_MODEL`; `.env.example`
+  mẫu; `.env` đã gitignore. Chỉ từ khoá tìm kiếm gửi ra Pexels — video gốc vẫn ở máy.
+- [x] Kiểm chứng pipeline ffmpeg bằng clip stock giả (xanh lá đặc + seek chính xác): B-roll hiện
+  đúng cửa sổ [3-5s] rồi trả về gốc — overlay setpts+enable chuẩn. Từ khoá AI KHÔNG vào filter (chống injection).
+
 ## TIẾP THEO (đề xuất)
 
 ### GĐ 6 — SAM 2 track đối tượng (đã đánh giá khả thi 2026-07-25)

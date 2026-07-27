@@ -37,6 +37,15 @@ FRONTEND_DIST = ROOT / "frontend" / "dist"
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 
+# nạp backend/.env (KEY=VALUE) vào môi trường — nơi để PEXELS_API_KEY, LS_CLAUDE_MODEL...
+_ENV_FILE = BACKEND_DIR / ".env"
+if _ENV_FILE.exists():
+    for _ln in _ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+        _ln = _ln.strip()
+        if _ln and not _ln.startswith("#") and "=" in _ln:
+            _k, _v = _ln.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+
 
 def _ncnn_bin(folder: str, name: str) -> Path:
     """Đường dẫn binary ncnn theo hệ điều hành (.exe chỉ có trên Windows)."""
@@ -2009,6 +2018,197 @@ def job_content(job_id: str, src: Path, p: dict):
     return [out_entry(out)]
 
 
+# ---------------------------------------------------------------- job: B-roll tự động (Pexels)
+def pexels_key() -> str:
+    return os.environ.get("PEXELS_API_KEY", "").strip()
+
+
+def pexels_available() -> bool:
+    return bool(pexels_key())
+
+
+def _pexels_search_download(query: str, orientation: str, want_dur: float,
+                            dest: Path) -> bool:
+    """Tìm 1 clip stock hợp từ khoá trên Pexels rồi tải về dest. True nếu ok."""
+    import httpx
+    headers = {"Authorization": pexels_key()}
+    params = {"query": query, "per_page": 8, "orientation": orientation}
+    try:
+        r = httpx.get("https://api.pexels.com/videos/search", headers=headers,
+                      params=params, timeout=25)
+        if r.status_code != 200:
+            return False
+        vids = r.json().get("videos", [])
+    except (httpx.HTTPError, ValueError):
+        return False
+    if not vids:
+        return False
+    # ưu tiên clip đủ dài, chọn file .mp4 độ phân giải vừa (~720-1080 chiều dài)
+    vids.sort(key=lambda v: abs((v.get("duration") or 0) - max(want_dur, 4)))
+    for v in vids:
+        files = [f for f in v.get("video_files", [])
+                 if f.get("file_type") == "video/mp4" and f.get("link")]
+        if not files:
+            continue
+        files.sort(key=lambda f: abs((f.get("height") or 0) - 1080))
+        link = files[0]["link"]
+        try:
+            with httpx.stream("GET", link, timeout=60, follow_redirects=True) as resp:
+                if resp.status_code != 200:
+                    continue
+                with open(dest, "wb") as fh:
+                    for chunk in resp.iter_bytes(1 << 16):
+                        fh.write(chunk)
+            if dest.exists() and dest.stat().st_size > 10000:
+                return True
+        except (httpx.HTTPError, OSError):
+            continue
+    return False
+
+
+def _pick_broll_cues(lines: list, dur: float, count: int,
+                     job_id: str, engine: str) -> list:
+    """AI đọc transcript → chọn các đoạn nên chèn B-roll + từ khoá tìm (tiếng Anh
+    để Pexels ra kết quả tốt)."""
+    text = "\n".join(lines)
+    if len(text) > (120000 if engine == "claude" else 11000):
+        text = text[:(120000 if engine == "claude" else 11000)]
+    prompt = (
+        "Bạn là biên tập video. Dưới đây là transcript có mốc thời gian (giây) "
+        "của một video người nói.\n\n" + text +
+        f"\n\nChọn {count} đoạn nên chèn B-roll (cảnh minh hoạ) đè lên. Mỗi đoạn "
+        "dài 2-5 giây, KHÔNG chồng lấn, nằm trong video. Từ khoá tìm cảnh phải "
+        "bằng TIẾNG ANH, cụ thể, hợp nội dung đang nói (vd 'city traffic aerial', "
+        "'person typing laptop').\n"
+        'Trả về DUY NHẤT mảng JSON: [{"start": <giây>, "end": <giây>, '
+        '"query": "<từ khoá tiếng Anh>"}]'
+    )
+    try:
+        data = _extract_json(llm_generate(prompt, max_tokens=1000,
+                                          job_id=job_id, engine=engine))
+    except (ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    cues = []
+    for c in data:
+        if not isinstance(c, dict):
+            continue
+        try:
+            s, e = float(c["start"]), float(c["end"])
+            q = str(c.get("query") or "").strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        q = re.sub(r"[^\w\s\-]", " ", q).strip()  # chỉ giữ chữ/số/space/gạch (từ khoá tìm)
+        q = re.sub(r"\s+", " ", q)
+        if not q or e <= s:
+            continue
+        s = max(0.0, min(s, dur - 1.5))
+        e = min(dur, min(e, s + 6.0))
+        if e - s < 1.5:
+            continue
+        if any(not (e <= x["end"] or s >= x["start"]) for x in cues):
+            continue
+        cues.append({"start": round(s, 2), "end": round(e, 2), "query": q[:80]})
+        if len(cues) >= count:
+            break
+    cues.sort(key=lambda x: x["start"])
+    return cues
+
+
+def job_broll(job_id: str, src: Path, p: dict):
+    """AI đọc lời thoại → chọn đoạn + từ khoá → tải cảnh stock từ Pexels → chèn
+    B-roll đè lên video (giữ nguyên tiếng gốc)."""
+    if not pexels_available():
+        raise RuntimeError("Chưa có PEXELS_API_KEY (thêm vào backend/.env)")
+    info = media_info(src)
+    w, h = info["width"], info["height"]
+    if not w or not h:
+        raise RuntimeError("Tệp không có luồng video")
+    dur = info["duration"] or 1
+    fps = info["fps"] or 30
+    orient = "landscape" if w > h * 1.2 else "portrait" if h > w * 1.2 else "square"
+    count = min(6, max(1, _safe_int(p.get("count"), 3)))
+
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    language = p.get("language") if p.get("language") in ("vi", "en") else None
+    seg_list, _l, _lang = _speech_recognize(
+        job_id, src, model_size, language, p.get("engine"), dur, 3, 40)
+    lines = _transcript_lines(seg_list)
+    if not lines:
+        raise RuntimeError("Video không có lời thoại — B-roll cần biết đang nói gì")
+    _cancel_point(job_id)
+
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+    if not llm_available() and claude_available():
+        ai = "claude"
+    _set(job_id, progress=44, message="AI chọn đoạn chèn B-roll + từ khoá...")
+    cues = _pick_broll_cues(lines, dur, count, job_id, ai)
+    if not cues:
+        raise RuntimeError("AI không chọn được đoạn B-roll phù hợp")
+    _cancel_point(job_id)
+
+    tmp = []
+    try:
+        clips = []  # (cue, normalized_path)
+        for i, cue in enumerate(cues):
+            _cancel_point(job_id)
+            _set(job_id, progress=48 + i / len(cues) * 34,
+                 message=f"Tải cảnh {i + 1}/{len(cues)}: {cue['query']}")
+            raw = TMP / f"br_raw_{job_id}_{i}.mp4"
+            tmp.append(raw)  # thêm TRƯỚC khi tải để finally dọn cả file tải hỏng dở
+            if not _pexels_search_download(cue["query"], orient, cue["end"] - cue["start"], raw):
+                continue  # không tìm được cảnh này → bỏ qua, không làm hỏng cả job
+            norm = TMP / f"br_norm_{job_id}_{i}.mp4"
+            tmp.append(norm)
+            seg_dur = cue["end"] - cue["start"]
+            # phủ khung, cắt/lặp đúng độ dài đoạn, khớp fps, bỏ tiếng
+            r = _run_tracked(job_id, [
+                FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                "-stream_loop", "-1", "-i", str(raw), "-t", f"{seg_dur:.3f}",
+                "-an", "-vf",
+                f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+                f"crop={w}:{h},fps={fps},setsar=1",
+                "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+                "-pix_fmt", "yuv420p", str(norm)])
+            if r.returncode != 0 or not norm.exists():
+                continue
+            clips.append((cue, norm))
+
+        if not clips:
+            raise RuntimeError("Không tải được cảnh B-roll nào từ Pexels (thử từ khoá/khác)")
+
+        _set(job_id, progress=84, message=f"Chèn {len(clips)} đoạn B-roll vào video...")
+        out = unique_out(f"{src.stem}_broll", ".mp4")
+        cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src)]
+        for _c, np_ in clips:
+            cmd += ["-i", str(np_)]
+        # dời PTS mỗi B-roll về đúng mốc đoạn rồi overlay có enable theo thời gian
+        parts, prev = [], "[0:v]"
+        for i, (cue, _np) in enumerate(clips):
+            lab = f"[v{i + 1}]" if i < len(clips) - 1 else "[vout]"
+            parts.append(f"[{i + 1}:v]setpts=PTS-STARTPTS+{cue['start']:.3f}/TB[b{i}]")
+            parts.append(f"{prev}[b{i}]overlay=enable='between(t,{cue['start']:.3f},"
+                         f"{cue['end']:.3f})'{lab}")
+            prev = lab
+        fc = ";".join(parts)
+        cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
+                "-c:v", "libx264", "-crf", "19", "-preset", "medium",
+                "-pix_fmt", "yuv420p", "-c:a", "copy", str(out)]
+        r = _run_tracked(job_id, cmd)
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Chèn B-roll thất bại: {r.stderr_text[-400:]}")
+        note = unique_out(f"{src.stem}_broll", ".txt")
+        note.write_text("\n".join(
+            f"[{c['start']:.1f}-{c['end']:.1f}s] {c['query']}" for c, _ in clips) + "\n",
+            encoding="utf-8")
+        _set(job_id, message=f"Xong — chèn {len(clips)} đoạn B-roll từ Pexels")
+        return [out_entry(out), out_entry(note)]
+    finally:
+        for t in tmp:
+            t.unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------- job: lesson (bài giảng → giáo án + quiz)
 AILMS_DB = Path.home() / "ai-lms" / "data" / "lms.db"
 AILMS_DEPARTMENTS = {"Marketing", "Sales", "Kế toán - Tài chính", "Nhân sự",
@@ -2274,7 +2474,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "0.8.0",
+        "version": "0.9.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "gpu": gpu_info(),
@@ -2308,6 +2508,8 @@ def health():
             "face_blur": cv2_available() and YUNET_ONNX.exists() and ffmpeg_ok,
             "lesson": (llm_available() or claude_available()) and whisper_ok,
             "ailms": ailms_available(),
+            "broll": pexels_available() and (llm_available() or claude_available())
+            and whisper_ok and ffmpeg_ok,
         },
     }
 
@@ -2524,6 +2726,12 @@ def create_job(req: JobRequest):
         if not llm_available() and not claude_available():
             raise HTTPException(400, "Cần mlx-lm (LLM local) hoặc Claude CLI trên máy chủ")
         return submit_job("lesson", src.name, job_lesson, src, dict(p))
+    if req.type == "broll":
+        if not pexels_available():
+            raise HTTPException(400, "Chưa có PEXELS_API_KEY — thêm vào backend/.env rồi khởi động lại")
+        if not llm_available() and not claude_available():
+            raise HTTPException(400, "Cần mlx-lm hoặc Claude CLI để chọn cảnh B-roll")
+        return submit_job("broll", src.name, job_broll, src, dict(p))
     raise HTTPException(400, f"Loại job không hỗ trợ: {req.type}")
 
 
@@ -2532,7 +2740,7 @@ DIRECTOR_ALLOWED_TYPES = {
     "transcribe", "silence_cut", "upscale", "export", "rife", "bg_remove",
     "auto_edit", "reframe", "speed", "color", "music", "stabilize", "merge",
     "beatsync", "audio_enhance", "brand", "audiogram", "highlights", "content",
-    "face_blur", "tts", "lesson",
+    "face_blur", "tts", "lesson", "broll",
 }
 
 DIRECTOR_CATALOG = """\
@@ -2557,6 +2765,7 @@ DIRECTOR_CATALOG = """\
 - content: AI viết tiêu đề/mô tả/hashtags. params: platform(tiktok/youtube), ai(local/claude)
 - face_blur: che mặt tự động. params: mode(blur/pixelate), strength(0.5-2)
 - lesson: bài giảng → giáo án + câu hỏi quiz (.md). params: quiz(số câu 3-15), push_lms(bool đẩy sang AI-LMS), level(1-4), department, ai(local/claude)
+- broll: tự chèn B-roll (cảnh minh hoạ) tải từ Pexels đè lên video người nói. params: count(1-6 số đoạn), ai(local/claude)
 - tts: đọc văn bản (KHÔNG cần file). params: text(chuỗi), voice(vi/en), speed(0.6-1.5)"""
 
 

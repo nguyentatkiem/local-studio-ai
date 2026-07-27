@@ -39,11 +39,12 @@ function LoginScreen({ onOk }: { onOk: () => void }) {
 type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" | "bg_remove"
   | "tts" | "reframe" | "speed" | "color" | "music" | "stabilize" | "export"
   | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
-  | "highlights" | "face_blur" | "content" | "director" | "lesson";
+  | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll";
 
 const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: boolean }[] = [
   { key: "director", icon: "🎬", name: "Đạo diễn AI (Claude)", desc: "ra lệnh bằng lời — Claude tự xếp job", gpu: false },
   { key: "highlights", icon: "🎯", name: "AI cắt Shorts từ video dài", desc: "AI chọn khoảnh khắc → shorts 9:16", gpu: true },
+  { key: "broll", icon: "🎞️", name: "Ghép B-roll tự động (Pexels)", desc: "AI tải cảnh minh hoạ chèn theo lời nói", gpu: false },
   { key: "auto_edit", icon: "✨", name: "Tự động dựng (AI 1 chạm)", desc: "cắt lặng → caption → preset · batch", gpu: false },
   { key: "merge", icon: "🎬", name: "Ghép clip + chuyển cảnh", desc: "xfade 10 hiệu ứng · chọn nhiều clip", gpu: false },
   { key: "beatsync", icon: "🥁", name: "Cắt theo nhịp nhạc", desc: "beat-sync kiểu CapCut · librosa", gpu: false },
@@ -140,6 +141,8 @@ export default function App() {
   const [brOpacity, setBrOpacity] = useState(0.7);
   const [agTarget, setAgTarget] = useState("11");
   const [agTitle, setAgTitle] = useState("");
+  // wave 7 (v0.9) — b-roll
+  const [brCount, setBrCount] = useState(3);
   // wave 6 (v0.8) — giáo án
   const [lsQuiz, setLsQuiz] = useState(5);
   const [lsPush, setLsPush] = useState(false);
@@ -286,7 +289,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v0.8 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v0.9 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -720,6 +723,42 @@ export default function App() {
                     quiz: lsQuiz, model: whModel, ai: aiEngine,
                     push_lms: lsPush, level: lsLevel, department: lsLevel === 3 ? lsDept : null,
                   })}>📚 Soạn giáo án</button>
+                </>
+              )}
+
+              {tool === "broll" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎞️ AI nghe video, tự chọn đoạn nên chèn cảnh minh hoạ rồi tải clip
+                    stock hợp nội dung từ Pexels đè lên — giữ nguyên tiếng gốc. Hợp video
+                    người nói (talking head).
+                  </div>
+                  {!feats.broll && (
+                    <div className="hint" style={{ borderColor: "rgba(255,107,87,.4)", color: "var(--warn)" }}>
+                      ⚠ Cần Pexels API key (miễn phí tại pexels.com/api). Tạo file
+                      <code> backend/.env</code> với dòng <code>PEXELS_API_KEY=...</code> rồi
+                      khởi động lại server.
+                    </div>
+                  )}
+                  <div className="field">
+                    <div className="sl-h"><span>Số đoạn B-roll</span><b>{brCount}</b></div>
+                    <input type="range" min={1} max={6} step={1} value={brCount}
+                      onChange={(e) => setBrCount(parseInt(e.target.value))} />
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI (chọn đoạn + từ khoá)</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <div className="hint">Từ khoá tìm cảnh do AI đặt bằng tiếng Anh (Pexels ra kết quả tốt hơn). Chỉ từ khoá được gửi ra ngoài — video gốc vẫn ở máy.</div>
+                  <br />
+                  <button className="btn pri big" disabled={!feats.broll}
+                    onClick={() => run("broll", { count: brCount, model: whModel, ai: aiEngine })}>
+                    🎞️ Ghép B-roll tự động
+                  </button>
                 </>
               )}
 

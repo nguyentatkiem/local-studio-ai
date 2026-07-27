@@ -1,6 +1,6 @@
 # 🎬 Local Studio — AI Video Editor chạy 100% trên máy
 
-> v0.8 — Không cloud · Không credit · Không watermark · Footage không bao giờ rời máy bạn.
+> v0.9 — Không cloud · Không credit · Không watermark · Footage không bao giờ rời máy bạn.
 
 **Máy mới clone repo:** chạy `./setup-binaries.sh` một lần để tải engine AI (~350MB), rồi `./start.sh`.
 
@@ -13,12 +13,13 @@
 vào `backend/auth_config.json` rồi khởi động lại. Muốn bật lại: xoá file đó — mật khẩu mới
 sẽ được sinh vào `backend/ADMIN-PASSWORD.txt`.
 
-## Tính năng v0.8
+## Tính năng v0.9
 
 | Tính năng | Engine | Ghi chú |
 |---|---|---|
 | 🎬 Đạo diễn AI | Claude (gói sub, qua CLI) | ra lệnh bằng lời → tự lập kế hoạch & xếp job, backend validate |
 | 🎯 AI cắt Shorts từ video dài | Whisper + Qwen3 4B / Claude | LLM chọn khoảnh khắc → shorts 9:16 + caption, kiểu Opus Clip |
+| 🎞️ Ghép B-roll tự động | Whisper + AI + Pexels API | AI chọn đoạn+từ khoá → tải cảnh stock chèn theo lời nói (cần key) |
 | 📝 AI viết nội dung | Qwen3 4B local / Claude sub | 3 tiêu đề hook · mô tả SEO · hashtags · chapters |
 | 📚 Bài giảng → Giáo án + Quiz | Whisper + Qwen/Claude | soạn giáo án + câu hỏi, đẩy thẳng vào AI-LMS |
 | 🫥 Làm mờ mặt tự động | YuNet ONNX | blur/pixelate mọi khuôn mặt, chống nhấp nháy |
