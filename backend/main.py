@@ -5,6 +5,7 @@ Local Studio - Backend AI service
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -189,7 +190,7 @@ def safe_upload_path(name: str) -> Path:
     p = UPLOADS / name
     try:
         ok = p.resolve().parent == UPLOADS.resolve()
-    except OSError:
+    except (OSError, ValueError):  # ValueError: tên chứa null-byte
         ok = False
     if not ok:
         raise HTTPException(400, "Tên tệp không hợp lệ")
@@ -334,6 +335,9 @@ def srt_ts(sec: float) -> str:
 # ---------------------------------------------------------------- whisper (lazy)
 _whisper_models: dict = {}
 _whisper_lock = threading.Lock()
+# tuần tự hoá inference Whisper: nhiều luồng (workers 2-4) chạy model cùng lúc dễ OOM
+# bộ nhớ hợp nhất trên máy Apple Silicon. Chỉ 1 phiên nhận dạng chạy tại một thời điểm.
+_ASR_SEM = threading.Semaphore(1)
 
 
 def get_whisper(size: str):
@@ -413,7 +417,7 @@ def set_worker_limit(n: int) -> int:
     return WORKER_LIMIT
 
 
-JOB_PROCS: dict = {}           # job_id -> subprocess đang chạy (để kill khi hủy)
+JOB_PROCS: dict = {}           # job_id -> [subprocess...] đang/đã chạy (để kill khi hủy)
 CANCEL_REQUESTED: set = set()  # job_id đã yêu cầu hủy
 
 
@@ -427,8 +431,9 @@ def _cancel_point(job_id: str):
 
 
 def _track_proc(job_id: str, proc):
+    # danh sách vì 1 job có thể chạy nhiều proc song song (vd bg_remove: decoder + encoder)
     with JOBS_LOCK:
-        JOB_PROCS[job_id] = proc
+        JOB_PROCS.setdefault(job_id, []).append(proc)
 
 
 def _run_tracked(job_id: str, cmd, **kw):
@@ -641,62 +646,66 @@ def _speech_recognize(job_id: str, src: Path, model_size: str, language,
                       engine, dur: float, lo: float = 0, hi: float = 90):
     """Chạy Whisper (MLX Metal hoặc faster-whisper CPU) → (seg_list, lines, lang).
     Tiến trình được ánh xạ vào khoảng [lo, hi]."""
+    # chỉ chấp nhận mlx/faster; giá trị khác (vd aiEngine "local"/"claude") → tự chọn
+    if engine not in ("mlx", "faster"):
+        engine = None
     engine = engine or ("mlx" if mlx_whisper_available() else "faster")
     if engine == "mlx" and not mlx_whisper_available():
         engine = "faster"
 
-    if engine == "mlx":
-        _set(job_id, progress=lo,
-             message=f"Whisper MLX trên GPU Metal (model {model_size})...")
-        import mlx_whisper
-        repo = MLX_WHISPER_REPOS[model_size]
-        # resolve cache-only (KHÔNG đụng Hub) → chạy offline được với model đã tải
-        path = _mlx_local_dir(repo)
-        if path is None:
-            # chưa cache → thử tải (nếu có mạng); offline thì fallback model đã có
-            try:
+    with _ASR_SEM:  # 1 phiên nhận dạng tại một thời điểm → tránh OOM khi nhiều luồng
+        if engine == "mlx":
+            _set(job_id, progress=lo,
+                 message=f"Whisper MLX trên GPU Metal (model {model_size})...")
+            import mlx_whisper
+            repo = MLX_WHISPER_REPOS[model_size]
+            # resolve cache-only (KHÔNG đụng Hub) → chạy offline được với model đã tải
+            path = _mlx_local_dir(repo)
+            if path is None:
+                # chưa cache → thử tải (nếu có mạng); offline thì fallback model đã có
+                try:
+                    res = mlx_whisper.transcribe(
+                        str(src), path_or_hf_repo=repo, language=language,
+                        word_timestamps=True, verbose=None)
+                except Exception:  # noqa: BLE001 - mạng lỗi/không có → dùng model cache
+                    m2, d2 = _best_cached_mlx(model_size)
+                    if not d2:
+                        raise RuntimeError(
+                            "Model Whisper chưa tải và máy đang offline. Kết nối mạng "
+                            "một lần để tải model (hoặc chạy setup-binaries), rồi thử lại.")
+                    _set(job_id, message=f"Model {model_size} chưa sẵn offline → dùng {m2} (đã cache)")
+                    path = d2
+                    res = None
+                else:
+                    path = "__done__"
+            if path not in (None, "__done__"):
                 res = mlx_whisper.transcribe(
-                    str(src), path_or_hf_repo=repo, language=language,
+                    str(src), path_or_hf_repo=path, language=language,
                     word_timestamps=True, verbose=None)
-            except Exception:  # noqa: BLE001 - mạng lỗi/không có → dùng model cache
-                m2, d2 = _best_cached_mlx(model_size)
-                if not d2:
-                    raise RuntimeError(
-                        "Model Whisper chưa tải và máy đang offline. Kết nối mạng "
-                        "một lần để tải model (hoặc chạy setup-binaries), rồi thử lại.")
-                _set(job_id, message=f"Model {model_size} chưa sẵn offline → dùng {m2} (đã cache)")
-                path = d2
-                res = None
-            else:
-                path = "__done__"
-        if path not in (None, "__done__"):
-            res = mlx_whisper.transcribe(
-                str(src), path_or_hf_repo=path, language=language,
-                word_timestamps=True, verbose=None)
-        _cancel_point(job_id)
-        seg_list = [_MlxSeg(s) for s in res["segments"]]
-        lines = [s.text.strip() for s in seg_list]
-        lang = res.get("language", "?")
-        _set(job_id, progress=hi)
-    else:
-        _set(job_id, progress=lo, message=f"Đang nạp model Whisper ({model_size})...")
-        model = get_whisper(model_size)
-
-        _set(job_id, message="Đang nhận dạng giọng nói (word-level)...")
-        segments, tr_info = model.transcribe(
-            str(src), language=language, vad_filter=True, beam_size=5,
-            word_timestamps=True,
-        )
-
-        seg_list = []
-        lines = []
-        for seg in segments:  # generator -> chạy thật ở đây
             _cancel_point(job_id)
-            seg_list.append(seg)
-            lines.append(seg.text.strip())
-            _set(job_id, progress=lo + min(hi - lo, seg.end / dur * (hi - lo)),
-                 message=f"Nghe: {seg.text.strip()[:60]}")
-        lang = getattr(tr_info, "language", "?")
+            seg_list = [_MlxSeg(s) for s in res["segments"]]
+            lines = [s.text.strip() for s in seg_list]
+            lang = res.get("language", "?")
+            _set(job_id, progress=hi)
+        else:
+            _set(job_id, progress=lo, message=f"Đang nạp model Whisper ({model_size})...")
+            model = get_whisper(model_size)
+
+            _set(job_id, message="Đang nhận dạng giọng nói (word-level)...")
+            segments, tr_info = model.transcribe(
+                str(src), language=language, vad_filter=True, beam_size=5,
+                word_timestamps=True,
+            )
+
+            seg_list = []
+            lines = []
+            for seg in segments:  # generator -> chạy thật ở đây
+                _cancel_point(job_id)
+                seg_list.append(seg)
+                lines.append(seg.text.strip())
+                _set(job_id, progress=lo + min(hi - lo, seg.end / dur * (hi - lo)),
+                     message=f"Nghe: {seg.text.strip()[:60]}")
+            lang = getattr(tr_info, "language", "?")
     return seg_list, lines, lang
 
 
@@ -705,7 +714,7 @@ def job_transcribe(job_id: str, src: Path, p: dict):
     model_size = p.get("model", "base")
     language = p.get("language") or None
     burn = bool(p.get("burn", True))
-    max_words = int(p.get("max_words", 0))
+    max_words = _safe_int(p.get("max_words"), 0)
     font = p.get("font", "Arial")
     if font not in SUB_FONTS:
         font = "Arial"
@@ -749,7 +758,7 @@ def job_transcribe(job_id: str, src: Path, p: dict):
         cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
                "-i", str(src), "-vf", f"subtitles={ass_path.name}",
                "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-               "-c:a", "copy", str(burned)]
+               "-c:a", "aac", "-b:a", "192k", str(burned)]
         r = _run_tracked(job_id, cmd, cwd=str(OUTPUTS))
         if r.returncode != 0:
             raise RuntimeError(f"Burn subtitle failed: {r.stderr_text[-500:]}")
@@ -789,7 +798,7 @@ def job_upscale(job_id: str, src: Path, mode: str, scale: int, model: str):
         args = ["-i", str(src),
                 "-vf", f"scale=iw*{scale}:ih*{scale}:flags=lanczos",
                 "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-                "-pix_fmt", "yuv420p", "-c:a", "copy", str(out)]
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(out)]
         run_ffmpeg_progress(args, dur, lambda p: _set(job_id, progress=p), job_id)
         return [out_entry(out)]
 
@@ -826,10 +835,11 @@ def job_upscale(job_id: str, src: Path, mode: str, scale: int, model: str):
                      message=f"AI upscale: {done}/{total} khung hình")
                 time.sleep(1.5)
             _cancel_point(job_id)
-        if proc.returncode != 0:
-            err = err_log.read_text(encoding="utf-8", errors="replace") if err_log.exists() else ""
+        rc = proc.returncode
+        err = err_log.read_text(encoding="utf-8", errors="replace") if rc != 0 and err_log.exists() else ""
+        err_log.unlink(missing_ok=True)  # luôn dọn log dù thành công hay lỗi
+        if rc != 0:
             raise RuntimeError(f"Real-ESRGAN failed: {err[-500:]}")
-        err_log.unlink(missing_ok=True)
 
         _set(job_id, progress=92, message="Ghép video + âm thanh...")
         out = unique_out(f"{src.stem}_ai_x{scale}", ".mp4")
@@ -938,10 +948,11 @@ def job_rife(job_id: str, src: Path, mode: str):
                      message=f"RIFE: {done}/{total_out} khung hình")
                 time.sleep(1.5)
             _cancel_point(job_id)
-        if proc.returncode != 0:
-            err = err_log.read_text(encoding="utf-8", errors="replace") if err_log.exists() else ""
+        rc = proc.returncode
+        err = err_log.read_text(encoding="utf-8", errors="replace") if rc != 0 and err_log.exists() else ""
+        err_log.unlink(missing_ok=True)  # luôn dọn log dù thành công hay lỗi
+        if rc != 0:
             raise RuntimeError(f"RIFE failed: {err[-500:]}")
-        err_log.unlink(missing_ok=True)
 
         _set(job_id, progress=88, message="Ghép video + âm thanh...")
         if mode == "slowmo":
@@ -1001,6 +1012,10 @@ def job_bg_remove(job_id: str, src: Path, bg: str):
          "-i", str(src), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
+    _track_proc(job_id, dec)  # để hủy job giết được cả decoder
+    # CHỈ ép kích thước chẵn khi nguồn LẺ (x264/vp9 yuv(a)420p đòi chẵn). Với nguồn chẵn
+    # (đa số) KHÔNG thêm scale — vì scale làm rớt kênh alpha (yuva420p → yuv420p).
+    odd = bool(w % 2 or h % 2)
     if bg == "alpha":
         out = unique_out(f"{src.stem}_alpha", ".webm")
         enc_cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
@@ -1008,6 +1023,9 @@ def job_bg_remove(job_id: str, src: Path, bg: str):
                    "-r", str(fps), "-i", "pipe:0"]
         if info["has_audio"]:
             enc_cmd += ["-i", str(src), "-map", "0:v", "-map", "1:a", "-c:a", "libopus"]
+        # nếu lẻ: scale chẵn nhưng ép lại format=yuva420p để GIỮ alpha
+        if odd:
+            enc_cmd += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuva420p"]
         enc_cmd += ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-crf", "28",
                     "-b:v", "0", "-row-mt", "1", str(out)]
         channels = 4
@@ -1019,6 +1037,8 @@ def job_bg_remove(job_id: str, src: Path, bg: str):
         if info["has_audio"]:
             enc_cmd += ["-i", str(src), "-map", "0:v", "-map", "1:a",
                         "-c:a", "aac", "-shortest"]
+        if odd:
+            enc_cmd += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
         enc_cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "medium",
                     "-pix_fmt", "yuv420p", str(out)]
         channels = 3
@@ -1055,11 +1075,14 @@ def job_bg_remove(job_id: str, src: Path, bg: str):
                 rgba = np.empty((h, w, 4), dtype=np.uint8)
                 rgba[..., :3] = (fgr[0].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
                 rgba[..., 3] = (pha[0, 0] * 255).clip(0, 255).astype(np.uint8)
-                enc.stdin.write(rgba.tobytes())
+                payload = rgba.tobytes()
             else:
                 com = fgr[0] * pha[0] + bg_arr * (1 - pha[0])
-                enc.stdin.write((com.transpose(1, 2, 0) * 255)
-                                .clip(0, 255).astype(np.uint8).tobytes())
+                payload = (com.transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8).tobytes()
+            try:
+                enc.stdin.write(payload)
+            except BrokenPipeError:
+                break  # encoder chết (vd kích thước lỗi) — đọc enc_log bên dưới để báo lỗi thật
             i += 1
             if i % 10 == 0:
                 _set(job_id, progress=min(99, i / total * 100),
@@ -1075,10 +1098,11 @@ def job_bg_remove(job_id: str, src: Path, bg: str):
         enc.wait()
         enc_ef.close()
     _cancel_point(job_id)
-    if enc.returncode != 0 or not out.exists():
-        err = enc_log.read_text(encoding="utf-8", errors="replace") if enc_log.exists() else ""
+    ok = enc.returncode == 0 and out.exists()
+    err = "" if ok or not enc_log.exists() else enc_log.read_text(encoding="utf-8", errors="replace")
+    enc_log.unlink(missing_ok=True)  # luôn dọn log dù thành công hay lỗi
+    if not ok:
         raise RuntimeError(f"Encode failed: {err[-500:]}")
-    enc_log.unlink(missing_ok=True)
     return [out_entry(out)]
 
 
@@ -1158,7 +1182,7 @@ def job_auto_edit(job_id: str, src: Path, p: dict):
             language = p.get("language") if p.get("language") in ("vi", "en") else None
             seg_list, _lines, _lang = _speech_recognize(
                 job_id, cur, model_size, language, p.get("engine"), dur, 30, 70)
-            chunks = chunk_words(seg_list, int(p.get("max_words", 3)),
+            chunks = chunk_words(seg_list, _safe_int(p.get("max_words"), 3),
                                  bool(p.get("uppercase", False)))
             if chunks:
                 font = p.get("font") if p.get("font") in SUB_FONTS else "Arial"
@@ -1173,7 +1197,7 @@ def job_auto_edit(job_id: str, src: Path, p: dict):
                 cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
                        "-i", str(cur), "-vf", f"subtitles={ass_path.name}",
                        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-                       "-c:a", "copy", str(burned)]
+                       "-c:a", "aac", "-b:a", "192k", str(burned)]
                 r = _run_tracked(job_id, cmd, cwd=str(TMP))
                 if r.returncode != 0:
                     raise RuntimeError(f"Burn subtitle failed: {r.stderr_text[-500:]}")
@@ -1205,9 +1229,14 @@ def job_auto_edit(job_id: str, src: Path, p: dict):
                     "-c:a", "aac", "-b:a", "192k", str(out)]
             run_ffmpeg_progress(args, dur, prog, job_id)
         else:
+            # copy nếu codec đã hợp mp4, ngược lại (webm/opus...) re-encode để không vỡ container
+            ci = media_info(cur)
+            vcopy = (ci.get("vcodec") or "") in ("h264", "hevc", "mpeg4", "av1")
+            vopts = ["-c:v", "copy"] if vcopy else \
+                ["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p"]
             r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner",
-                                      "-loglevel", "error", "-i", str(cur),
-                                      "-c", "copy", str(out)])
+                                      "-loglevel", "error", "-i", str(cur)]
+                             + vopts + ["-c:a", "aac", "-b:a", "192k", str(out)])
             if r.returncode != 0:
                 raise RuntimeError(f"Finalize failed: {r.stderr_text[-400:]}")
         steps = [s for s, on in (("cắt lặng", do_cut), ("caption", do_caption),
@@ -1295,7 +1324,8 @@ def job_color(job_id: str, src: Path, name: str):
     out = unique_out(f"{src.stem}_{name}", ".mp4")
     _set(job_id, message=f"Áp filter màu '{label}'...")
     args = ["-i", str(src), "-vf", vf, "-c:v", "libx264", "-crf", "19",
-            "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "copy", str(out)]
+            "-preset", "medium", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", str(out)]
     run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
     return [out_entry(out)]
 
@@ -1315,9 +1345,13 @@ def job_music(job_id: str, src: Path, music: Path, vol: float, duck: bool):
               "[0:a][m]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[aout]")
     else:
         fc = f"[1:a]volume={vol}[aout]"
+    # video copy nếu codec hợp mp4; vp8/vp9/khác → re-encode x264
+    vcopy = (info.get("vcodec") or "") in ("h264", "hevc", "mpeg4", "av1")
+    vopts = ["-c:v", "copy"] if vcopy else \
+        ["-c:v", "libx264", "-crf", "19", "-preset", "medium", "-pix_fmt", "yuv420p"]
     args = ["-i", str(src), "-stream_loop", "-1", "-i", str(music),
-            "-filter_complex", fc, "-map", "0:v", "-map", "[aout]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(out)]
+            "-filter_complex", fc, "-map", "0:v", "-map", "[aout]"] + vopts + \
+           ["-c:a", "aac", "-b:a", "192k", "-shortest", str(out)]
     run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
     return [out_entry(out)]
 
@@ -1329,7 +1363,7 @@ def job_stabilize(job_id: str, src: Path):
     _set(job_id, message="Chống rung (deshake)...")
     args = ["-i", str(src), "-vf", "deshake=rx=32:ry=32:edge=mirror",
             "-c:v", "libx264", "-crf", "19", "-preset", "medium",
-            "-pix_fmt", "yuv420p", "-c:a", "copy", str(out)]
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(out)]
     run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
     return [out_entry(out)]
 
@@ -2009,7 +2043,7 @@ def job_highlights(job_id: str, src: Path, p: dict):
             out = unique_out(f"{src.stem}_short{i + 1}_{safe_title}", ".mp4")
             if make:
                 wsegs = _window_segments(seg_list, t0, t1)
-                chunks = chunk_words(wsegs, int(p.get("max_words", 3)),
+                chunks = chunk_words(wsegs, _safe_int(p.get("max_words"), 3),
                                      bool(p.get("uppercase", False)))
                 fc = REFRAME916_FC
                 vout = "[rf]"
@@ -2272,7 +2306,7 @@ def job_broll(job_id: str, src: Path, p: dict):
         fc = ";".join(parts)
         cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
                 "-c:v", "libx264", "-crf", "19", "-preset", "medium",
-                "-pix_fmt", "yuv420p", "-c:a", "copy", str(out)]
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(out)]
         r = _run_tracked(job_id, cmd)
         if r.returncode != 0 or not out.exists():
             raise RuntimeError(f"Chèn B-roll thất bại: {r.stderr_text[-400:]}")
@@ -2294,17 +2328,21 @@ AILMS_DEPARTMENTS = {"Marketing", "Sales", "Kế toán - Tài chính", "Nhân s�
 
 
 def _safe_int(v, default: int) -> int:
-    """Ép về int an toàn — null/chuỗi lạ/float đều không làm sập job."""
+    """Ép về int an toàn — null/chuỗi lạ/inf/nan đều không làm sập job."""
     try:
-        return int(v)
-    except (TypeError, ValueError):
+        f = float(v)
+        if not math.isfinite(f):
+            return default
+        return int(f)
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
 def _safe_float(v, default: float) -> float:
     try:
-        return float(v)
-    except (TypeError, ValueError):
+        f = float(v)
+        return f if math.isfinite(f) else default
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -2712,6 +2750,8 @@ def job_viral_caption(job_id: str, src: Path, p: dict):
     common_v = ["-c:v", "libx264", "-crf", "18", "-preset", "slow",
                 "-pix_fmt", "yuv420p", "-colorspace", "bt709",
                 "-color_primaries", "bt709", "-color_trc", "bt709"]
+    # ép 48kHz stereo → khớp end card (anullsrc 48k/stereo) cho concat -c copy không lệch
+    common_a = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
     if music is not None and info["has_audio"]:
         # nhạc nền + ducking -18dB khi có tiếng nói, nhả 400ms
         fc = (f"[0:v]{subs}[v];"
@@ -2723,48 +2763,49 @@ def job_viral_caption(job_id: str, src: Path, p: dict):
               "alimiter=limit=0.82[a]")  # chừa headroom cho AAC → ≤ -1 dBTP
         args = ["-i", str(src), "-stream_loop", "-1", "-i", str(music),
                 "-filter_complex", fc, "-map", "[v]", "-map", "[a]",
-                "-shortest"] + common_v + ["-c:a", "aac", "-b:a", "192k", str(out)]
+                "-shortest"] + common_v + common_a + [str(out)]
     elif music is not None:
         # video KHÔNG có tiếng nhưng người dùng thêm nhạc → dùng nhạc làm audio
         args = ["-i", str(src), "-stream_loop", "-1", "-i", str(music),
                 "-vf", subs, "-map", "0:v", "-map", "1:a", "-shortest"] \
-            + common_v + ["-c:a", "aac", "-b:a", "192k", str(out)]
+            + common_v + common_a + [str(out)]
     else:
         args = ["-i", str(src), "-vf", subs]
         if info["has_audio"]:
             args += ["-af", voice_af]
-        args += common_v + ["-c:a", "aac", "-b:a", "192k", str(out)]
+        args += common_v + common_a + [str(out)]
     run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=58 + pr * 0.30),
                         job_id)
 
     outputs = [out, ass_path, srt_path]
     if endcard is not None:
         _set(job_id, progress=92, message="Nối end card...")
-        ec_dur = min(10.0, max(1.0, float(p.get("endcard_dur", 3.0))))
+        ec_dur = min(10.0, max(1.0, _safe_float(p.get("endcard_dur"), 3.0)))
         ec_clip = TMP / f"vc_ec_{job_id}.mp4"
-        r = _run_tracked(job_id, [
-            FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
-            "-loop", "1", "-i", str(endcard),
-            "-f", "lavfi", "-t", f"{ec_dur:.2f}", "-i", "anullsrc=r=48000:cl=stereo",
-            "-t", f"{ec_dur:.2f}", "-vf",
-            f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={info['fps'] or 30},setsar=1",
-            "-map", "0:v", "-map", "1:a"] + common_v + [
-            "-c:a", "aac", "-b:a", "192k", str(ec_clip)])
-        if r.returncode == 0 and ec_clip.exists():
-            lst = TMP / f"vc_cat_{job_id}.txt"
-            lst.write_text(f"file '{out.as_posix()}'\nfile '{ec_clip.as_posix()}'\n",
-                           encoding="utf-8")
-            final = unique_out(f"{src.stem}_viral_end", ".mp4")
-            r2 = _run_tracked(job_id, [
+        lst = TMP / f"vc_cat_{job_id}.txt"
+        try:
+            r = _run_tracked(job_id, [
                 FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
-                "-f", "concat", "-safe", "0", "-i", str(lst),
-                "-c", "copy", str(final)])
+                "-loop", "1", "-i", str(endcard),
+                "-f", "lavfi", "-t", f"{ec_dur:.2f}", "-i", "anullsrc=r=48000:cl=stereo",
+                "-t", f"{ec_dur:.2f}", "-vf",
+                f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={info['fps'] or 30},setsar=1",
+                "-map", "0:v", "-map", "1:a"] + common_v + common_a + [str(ec_clip)])
+            if r.returncode == 0 and ec_clip.exists():
+                lst.write_text(f"file '{out.as_posix()}'\nfile '{ec_clip.as_posix()}'\n",
+                               encoding="utf-8")
+                final = unique_out(f"{src.stem}_viral_end", ".mp4")
+                r2 = _run_tracked(job_id, [
+                    FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "concat", "-safe", "0", "-i", str(lst),
+                    "-c", "copy", str(final)])
+                if r2.returncode == 0 and final.exists():
+                    out.unlink(missing_ok=True)
+                    outputs[0] = final
+        finally:  # dọn file tạm dù lỗi/hủy giữa chừng
             lst.unlink(missing_ok=True)
             ec_clip.unlink(missing_ok=True)
-            if r2.returncode == 0 and final.exists():
-                out.unlink(missing_ok=True)
-                outputs[0] = final
     _set(job_id, message=f"Xong — {len(clusters)} cụm phụ đề viral (burn + .ass + .srt)")
     return [out_entry(x) for x in outputs]
 
@@ -2800,6 +2841,7 @@ def job_face_blur(job_id: str, src: Path, mode: str, strength: float):
          "-i", str(src), "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
         stdout=subprocess.PIPE, stderr=dec_ef,
     )
+    _track_proc(job_id, dec)  # để hủy job giết được cả decoder
     enc_cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
                "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
                "-r", str(fps), "-i", "pipe:0"]
@@ -2883,14 +2925,16 @@ def job_face_blur(job_id: str, src: Path, mode: str, strength: float):
         enc.wait()
         enc_ef.close()
     _cancel_point(job_id)
-    if enc.returncode != 0 or not out.exists():
-        err = enc_log.read_text(encoding="utf-8", errors="replace") if enc_log.exists() else ""
-        raise RuntimeError(f"Encode failed: {err[-500:]}")
-    if dec.returncode != 0 and i < total * 0.9:  # decode đứt giữa chừng ≠ EOF bình thường
-        err = dec_log.read_text(encoding="utf-8", errors="replace") if dec_log.exists() else ""
-        raise RuntimeError(f"Decode failed ở khung {i}/{total}: {err[-400:]}")
-    enc_log.unlink(missing_ok=True)
+    enc_ok = enc.returncode == 0 and out.exists()
+    dec_bad = dec.returncode != 0 and i < total * 0.9  # decode đứt giữa chừng ≠ EOF bình thường
+    enc_err = "" if enc_ok or not enc_log.exists() else enc_log.read_text(encoding="utf-8", errors="replace")
+    dec_err = dec_log.read_text(encoding="utf-8", errors="replace") if dec_bad and dec_log.exists() else ""
+    enc_log.unlink(missing_ok=True)  # luôn dọn log dù thành công hay lỗi
     dec_log.unlink(missing_ok=True)
+    if not enc_ok:
+        raise RuntimeError(f"Encode failed: {enc_err[-500:]}")
+    if dec_bad:
+        raise RuntimeError(f"Decode failed ở khung {i}/{total}: {dec_err[-400:]}")
     _set(job_id, message=f"Xong — {faces_total} lượt phát hiện mặt trên {i} khung hình")
     return [out_entry(out)]
 
@@ -3059,8 +3103,10 @@ def _run_step(job_id: str, jtype: str, src: Path, p: dict) -> Path:
                          min(1.0, max(0.1, _safe_float(p.get("opacity"), 0.7))),
                          min(10.0, max(1.0, _safe_float(p.get("title_dur"), 3.0))))
     elif jtype == "reframe916" or jtype == "export":
+        # trong chuỗi chỉ nhận preset VIDEO (gif/mp3 không phải video → không nối tiếp được)
         preset = p.get("preset", "tiktok")
-        outs = job_export(job_id, src, preset if preset in PRESETS else "tiktok")
+        outs = job_export(job_id, src,
+                          preset if preset in ("tiktok", "youtube", "square", "reels45") else "tiktok")
     elif jtype == "transcribe":
         pr = dict(p)
         pr["burn"] = True  # trong chuỗi phải cháy vào hình mới nối tiếp được
@@ -3112,7 +3158,9 @@ def job_pipeline(job_id: str, src: Path, p: dict):
             produced.extend(outs)  # gồm cả file phụ của bước trung gian
             cur = primary
         # đổi tên file cuối cho dễ nhận, dọn TẤT CẢ file khác (cả phụ)
-        final = unique_out(f"{src.stem}_chuoi{n}", ".mp4")
+        # giữ đuôi thật của file cuối (vd bg_remove alpha → .webm) thay vì ép .mp4
+        ext = cur.suffix if cur.suffix.lower() in (".mp4", ".mov", ".webm") else ".mp4"
+        final = unique_out(f"{src.stem}_chuoi{n}", ext)
         try:
             cur.rename(final)
         except OSError:
@@ -3565,9 +3613,13 @@ def cancel_job(job_id: str):
     if job["status"] == "running":
         CANCEL_REQUESTED.add(job_id)
         with JOBS_LOCK:
-            proc = JOB_PROCS.get(job_id)
-        if proc and proc.poll() is None:
-            proc.kill()
+            procs = list(JOB_PROCS.get(job_id, []))
+        for proc in procs:  # giết mọi proc còn sống của job (decoder + encoder...)
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
         _set(job_id, message="Đang hủy...")
     return JOBS[job_id]
 

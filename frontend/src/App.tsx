@@ -343,7 +343,8 @@ export default function App() {
     if (!selected) { showToast("⚠️ Chọn video trước"); return; }
     setVcBusy(true); setVcClusters(null);
     try {
-      const job = await viralAnalyze(selected.name, vcModel, aiEngine);
+      // engine ASR để auto (mlx/faster) — KHÔNG truyền aiEngine (local/claude) vào ô Whisper
+      const job = await viralAnalyze(selected.name, vcModel, "");
       let done: Job | undefined;
       for (let i = 0; i < 200; i++) {
         await new Promise((r) => setTimeout(r, 1500));
@@ -369,7 +370,9 @@ export default function App() {
       params.clusters = vcClusters.map((c) => ({
         start: c.start, end: c.end, text: c.text,
         // giữ word timestamps để karaoke; nếu text bị sửa khác thì bỏ words (dùng text thô)
-        words: c.text === c.words.map((w) => w.t).join(" ") ? c.words : undefined,
+        // chuẩn hoá xuống dòng→cách vì cụm 2 dòng nối bằng "\n" nhưng words nối bằng " "
+        words: c.text.replace(/\n/g, " ") === c.words.map((w) => w.t).join(" ")
+          ? c.words : undefined,
       }));
     }
     try {
@@ -391,7 +394,13 @@ export default function App() {
     };
     v.addEventListener("timeupdate", onT);
     return () => v.removeEventListener("timeupdate", onT);
-  }, [tool, vcClusters]);
+  }, [tool, vcClusters, stageSrc]);
+
+  // seed kích thước khung từ video đang chọn → "1 chạm" (không analyze) tính cỡ chữ đúng
+  useEffect(() => {
+    if (selected?.info.width && selected.info.height)
+      setVcDim({ w: selected.info.width, h: selected.info.height });
+  }, [selected]);
 
   // merge/beatsync: NHIỀU clip vào MỘT job (thứ tự = thứ tự chọn trong batch)
   const runMulti = async (type: string, params: Record<string, unknown>) => {
@@ -848,8 +857,9 @@ export default function App() {
                                 </select>
                               )}
                               {st.type === "export" && (
+                                // trong chuỗi chỉ cho preset video (gif/mp3 không phải video → gãy bước sau)
                                 <select value={String(st.params.preset)} onChange={(e) => setStepParam(i, "preset", e.target.value)}>
-                                  {["tiktok", "youtube", "square", "reels45", "gif", "mp3"].map((f) => <option key={f} value={f}>{f}</option>)}
+                                  {["tiktok", "youtube", "square", "reels45"].map((f) => <option key={f} value={f}>{f}</option>)}
                                 </select>
                               )}
                               {st.type === "reframe" && (
