@@ -39,9 +39,29 @@ function LoginScreen({ onOk }: { onOk: () => void }) {
 type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" | "bg_remove"
   | "tts" | "reframe" | "speed" | "color" | "music" | "stabilize" | "export"
   | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
-  | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll" | "viral";
+  | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll" | "viral"
+  | "pipeline";
+
+// Các bước có thể xếp vào Chuỗi tự động (nối tiếp output→input)
+type PipeStep = { type: string; params: Record<string, unknown> };
+const PIPE_PALETTE: { type: string; label: string; def: Record<string, unknown> }[] = [
+  { type: "silence_cut", label: "✂️ Cắt lặng", def: { margin: 0.2 } },
+  { type: "speed", label: "⏩ Tốc độ", def: { factor: 1.5 } },
+  { type: "color", label: "🎨 Filter màu", def: { filter: "vivid" } },
+  { type: "stabilize", label: "🧷 Chống rung", def: {} },
+  { type: "reframe", label: "📐 Khung 9:16", def: { mode: "blur" } },
+  { type: "rife", label: "🎞️ Nội suy mượt", def: { mode: "smooth" } },
+  { type: "upscale", label: "🔍 Upscale", def: { mode: "fast", scale: 2 } },
+  { type: "bg_remove", label: "🪄 Tách nền", def: { bg: "green" } },
+  { type: "audio_enhance", label: "🎚️ Chuẩn âm", def: { denoise: true, loudness: true } },
+  { type: "face_blur", label: "🫥 Che mặt", def: { mode: "blur", strength: 1 } },
+  { type: "transcribe", label: "💬 Caption", def: { model: "base", effect: "karaoke", burn: true } },
+  { type: "viral_caption", label: "🔥 Phụ đề Viral", def: { model: "large-v3-turbo" } },
+  { type: "export", label: "📤 Xuất preset", def: { preset: "tiktok" } },
+];
 
 const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: boolean }[] = [
+  { key: "pipeline", icon: "🔗", name: "Chuỗi tự động (nối nhiều bước)", desc: "xếp nhiều tính năng chạy nối tiếp trên 1 video", gpu: false },
   { key: "viral", icon: "🔥", name: "Phụ đề Viral 1 chạm", desc: "nhận dạng → tách cụm → cháy preset viral + chuẩn âm", gpu: true },
   { key: "director", icon: "🎬", name: "Đạo diễn AI (Claude)", desc: "ra lệnh bằng lời — Claude tự xếp job", gpu: false },
   { key: "highlights", icon: "🎯", name: "AI cắt Shorts từ video dài", desc: "AI chọn khoảnh khắc → shorts 9:16", gpu: true },
@@ -153,6 +173,9 @@ export default function App() {
   const [brOpacity, setBrOpacity] = useState(0.7);
   const [agTarget, setAgTarget] = useState("11");
   const [agTitle, setAgTitle] = useState("");
+  // wave 9 (v1.1) — Chuỗi tự động + số luồng
+  const [pipe, setPipe] = useState<PipeStep[]>([]);
+  const [workers, setWorkers] = useState(2);
   // wave 8 (v1.0) — Phụ đề Viral
   const [vcModel, setVcModel] = useState("large-v3-turbo");
   const [vcKeyword, setVcKeyword] = useState(true);
@@ -267,6 +290,39 @@ export default function App() {
     } finally {
       setDirBusy(false);
     }
+  };
+
+  // đồng bộ số luồng từ health
+  useEffect(() => { if (health?.workers) setWorkers(health.workers); }, [health?.workers]);
+  const changeWorkers = async (n: number) => {
+    setWorkers(n);
+    try {
+      await fetch("/api/workers", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workers: n }),
+      });
+    } catch { /* ignore */ }
+  };
+
+  // Chuỗi tự động: thêm/xoá/đổi chỗ/đổi tham số bước, rồi chạy 1 job nối tiếp
+  const addStep = (type: string) => {
+    const d = PIPE_PALETTE.find((x) => x.type === type);
+    if (d) setPipe((s) => [...s, { type, params: { ...d.def } }]);
+  };
+  const moveStep = (i: number, dir: -1 | 1) => setPipe((s) => {
+    const j = i + dir; if (j < 0 || j >= s.length) return s;
+    const a = [...s];[a[i], a[j]] = [a[j], a[i]]; return a;
+  });
+  const setStepParam = (i: number, k: string, v: unknown) =>
+    setPipe((s) => s.map((st, j) => j === i ? { ...st, params: { ...st.params, [k]: v } } : st));
+  const runPipeline = async () => {
+    if (!selected) { showToast("⚠️ Chọn video trước"); return; }
+    if (pipe.length === 0) { showToast("⚠️ Thêm ít nhất 1 bước"); return; }
+    try {
+      await createJob("pipeline", selected.name, { steps: pipe });
+      setJobs(await getJobs()); setRightTab("jobs");
+      showToast(`🔗 Chuỗi ${pipe.length} bước đã vào hàng đợi`);
+    } catch (e) { showToast("❌ " + String(e)); }
   };
 
   // Phụ đề Viral: gói tham số preset
@@ -384,7 +440,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v1.0 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v1.1 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -457,6 +513,11 @@ export default function App() {
                       : `${((gpu as any).vram_used_mb / 1024).toFixed(1)} / ${Math.round(gpu.vram_total_mb / 1024)} GB`}</b></div>
                   {gpu.type !== "apple" && <div className="meter"><i style={{ width: `${vramPct}%` }} /></div>}
                   <div className="hwrow"><span>Hàng đợi</span><b>{running > 0 ? `${running} việc đang chạy` : "trống"}</b></div>
+                  <div className="hwrow" style={{ marginTop: 4 }}>
+                    <span>Số luồng song song</span>
+                    <div className="seg sm">{[1, 2, 3, 4].map((n) => (
+                      <button key={n} className={workers === n ? "on" : ""} onClick={() => changeWorkers(n)}>{n}</button>))}</div>
+                  </div>
                 </div>
               )}
               <div className="lp-title">Bấm để mở tuỳ chọn · chạy trên máy</div>
@@ -477,6 +538,7 @@ export default function App() {
                      (t.key === "director" && !feats.director) ||
                      (t.key === "lesson" && !feats.lesson) ||
                      (t.key === "viral" && !feats.viral_caption) ||
+                     (t.key === "pipeline" && !feats.export) ||
                      (["reframe", "speed", "color", "music", "stabilize",
                        "merge", "audio_enhance", "brand", "audiogram"].includes(t.key) && !feats.ffmpeg) ||
                      (t.key === "export" && !feats.export) ? " disabled" : "")}
@@ -743,6 +805,78 @@ export default function App() {
                   <button className="btn pri big" onClick={() => run("upscale", { mode: upMode, scale: upScale, model: upModel })}>
                     ▶ Chạy trên máy
                   </button>
+                </>
+              )}
+
+              {tool === "pipeline" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🔗 Xếp nhiều tính năng theo thứ tự — chạy nối tiếp trên 1 video (kết quả
+                    mỗi bước tự làm đầu vào bước sau), gộp thành 1 việc. Không cần tải lên tải xuống.
+                  </div>
+                  <div className="lp-title">Thêm bước vào chuỗi</div>
+                  <div className="pipepalette">
+                    {PIPE_PALETTE.map((s) => (
+                      <button key={s.type} className="pipeadd" onClick={() => addStep(s.type)}>+ {s.label}</button>
+                    ))}
+                  </div>
+                  {pipe.length === 0 ? (
+                    <div className="nores" style={{ marginTop: 10 }}>Chưa có bước nào. Bấm thêm ở trên.</div>
+                  ) : (
+                    <div className="pipelist">
+                      {pipe.map((st, i) => {
+                        const meta = PIPE_PALETTE.find((x) => x.type === st.type);
+                        return (
+                          <div key={i} className="pipestep">
+                            <span className="pipenum">{i + 1}</span>
+                            <div className="pipebody">
+                              <div className="pipehead">
+                                <b>{meta?.label || st.type}</b>
+                                <div className="pipebtns">
+                                  <button onClick={() => moveStep(i, -1)} disabled={i === 0}>↑</button>
+                                  <button onClick={() => moveStep(i, 1)} disabled={i === pipe.length - 1}>↓</button>
+                                  <button className="pipedel" onClick={() => setPipe((s) => s.filter((_, j) => j !== i))}>✕</button>
+                                </div>
+                              </div>
+                              {st.type === "speed" && (
+                                <div className="seg sm">{[0.5, 1.25, 1.5, 2, 3].map((f) => (
+                                  <button key={f} className={st.params.factor === f ? "on" : ""} onClick={() => setStepParam(i, "factor", f)}>×{f}</button>))}</div>
+                              )}
+                              {st.type === "color" && (
+                                <select value={String(st.params.filter)} onChange={(e) => setStepParam(i, "filter", e.target.value)}>
+                                  {["vivid", "warm", "cool", "bw", "film", "sharp"].map((f) => <option key={f} value={f}>{f}</option>)}
+                                </select>
+                              )}
+                              {st.type === "export" && (
+                                <select value={String(st.params.preset)} onChange={(e) => setStepParam(i, "preset", e.target.value)}>
+                                  {["tiktok", "youtube", "square", "reels45", "gif", "mp3"].map((f) => <option key={f} value={f}>{f}</option>)}
+                                </select>
+                              )}
+                              {st.type === "reframe" && (
+                                <div className="seg sm"><button className={st.params.mode === "blur" ? "on" : ""} onClick={() => setStepParam(i, "mode", "blur")}>nền mờ</button><button className={st.params.mode === "crop" ? "on" : ""} onClick={() => setStepParam(i, "mode", "crop")}>cắt giữa</button></div>
+                              )}
+                              {st.type === "upscale" && (
+                                <div className="seg sm">{[2, 3, 4].map((s) => (<button key={s} className={st.params.scale === s ? "on" : ""} onClick={() => setStepParam(i, "scale", s)}>×{s}</button>))}</div>
+                              )}
+                              {st.type === "face_blur" && (
+                                <div className="seg sm"><button className={st.params.mode === "blur" ? "on" : ""} onClick={() => setStepParam(i, "mode", "blur")}>mờ</button><button className={st.params.mode === "pixelate" ? "on" : ""} onClick={() => setStepParam(i, "mode", "pixelate")}>ô vuông</button></div>
+                              )}
+                              {st.type === "bg_remove" && (
+                                <select value={String(st.params.bg)} onChange={(e) => setStepParam(i, "bg", e.target.value)}>
+                                  {["green", "black", "white", "alpha"].map((f) => <option key={f} value={f}>{f}</option>)}
+                                </select>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  <button className="btn pri big" style={{ marginTop: 10 }} disabled={!selected || pipe.length === 0}
+                    onClick={runPipeline}>🔗 Chạy chuỗi {pipe.length} bước</button>
+                  {pipe.length > 0 && (
+                    <button className="btn" style={{ marginTop: 6 }} onClick={() => setPipe([])}>Xoá hết</button>
+                  )}
                 </>
               )}
 

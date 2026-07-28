@@ -395,6 +395,23 @@ class _MlxSeg:
 JOBS: dict = {}
 JOBS_LOCK = threading.Lock()
 EXECUTOR = ThreadPoolExecutor(max_workers=2)
+WORKER_LIMIT = 2               # số job chạy song song (1-4, chỉnh được lúc chạy)
+_EXEC_LOCK = threading.Lock()  # bảo vệ swap EXECUTOR ↔ submit (khỏi submit-sau-shutdown)
+
+
+def set_worker_limit(n: int) -> int:
+    """Đổi số luồng chạy song song. Job đang chạy trên executor cũ vẫn xong."""
+    global EXECUTOR, WORKER_LIMIT
+    n = min(4, max(1, int(n)))
+    old = None
+    with _EXEC_LOCK:
+        if n != WORKER_LIMIT:
+            old, EXECUTOR = EXECUTOR, ThreadPoolExecutor(max_workers=n)
+            WORKER_LIMIT = n
+    if old is not None:  # shutdown ngoài lock (job đã enqueue vẫn chạy hết)
+        old.shutdown(wait=False)
+    return WORKER_LIMIT
+
 
 JOB_PROCS: dict = {}           # job_id -> subprocess đang chạy (để kill khi hủy)
 CANCEL_REQUESTED: set = set()  # job_id đã yêu cầu hủy
@@ -465,7 +482,8 @@ def submit_job(jtype: str, input_name: str, fn, *args) -> dict:
     }
     with JOBS_LOCK:
         JOBS[job_id] = job
-    EXECUTOR.submit(_job_wrapper, job_id, fn, *args)
+    with _EXEC_LOCK:  # submit trong lock → executor không bị swap+shutdown giữa chừng
+        EXECUTOR.submit(_job_wrapper, job_id, fn, *args)
     return job
 
 
@@ -600,6 +618,25 @@ def build_ass(chunks, w: int, h: int, font: str, size_key: str,
     return head + "\n".join(lines) + "\n"
 
 
+def _mlx_local_dir(repo: str):
+    """Thư mục snapshot cache-only (không đụng mạng) nếu model MLX đã tải, else None."""
+    from huggingface_hub import snapshot_download
+    try:
+        return snapshot_download(repo, local_files_only=True)
+    except Exception:  # noqa: BLE001 - chưa cache
+        return None
+
+
+def _best_cached_mlx(prefer: str):
+    """Model MLX đã cache tốt nhất (ưu tiên yêu cầu, rồi lớn→nhỏ) → (tên, dir)."""
+    order = ["large-v3-turbo", "large-v3", "medium", "small", "base", "tiny"]
+    for m in [prefer] + [x for x in order if x != prefer]:
+        d = _mlx_local_dir(MLX_WHISPER_REPOS[m]) if m in MLX_WHISPER_REPOS else None
+        if d:
+            return m, d
+    return None, None
+
+
 def _speech_recognize(job_id: str, src: Path, model_size: str, language,
                       engine, dur: float, lo: float = 0, hi: float = 90):
     """Chạy Whisper (MLX Metal hoặc faster-whisper CPU) → (seg_list, lines, lang).
@@ -612,10 +649,30 @@ def _speech_recognize(job_id: str, src: Path, model_size: str, language,
         _set(job_id, progress=lo,
              message=f"Whisper MLX trên GPU Metal (model {model_size})...")
         import mlx_whisper
-        res = mlx_whisper.transcribe(
-            str(src), path_or_hf_repo=MLX_WHISPER_REPOS[model_size],
-            language=language, word_timestamps=True, verbose=None,
-        )
+        repo = MLX_WHISPER_REPOS[model_size]
+        # resolve cache-only (KHÔNG đụng Hub) → chạy offline được với model đã tải
+        path = _mlx_local_dir(repo)
+        if path is None:
+            # chưa cache → thử tải (nếu có mạng); offline thì fallback model đã có
+            try:
+                res = mlx_whisper.transcribe(
+                    str(src), path_or_hf_repo=repo, language=language,
+                    word_timestamps=True, verbose=None)
+            except Exception:  # noqa: BLE001 - mạng lỗi/không có → dùng model cache
+                m2, d2 = _best_cached_mlx(model_size)
+                if not d2:
+                    raise RuntimeError(
+                        "Model Whisper chưa tải và máy đang offline. Kết nối mạng "
+                        "một lần để tải model (hoặc chạy setup-binaries), rồi thử lại.")
+                _set(job_id, message=f"Model {model_size} chưa sẵn offline → dùng {m2} (đã cache)")
+                path = d2
+                res = None
+            else:
+                path = "__done__"
+        if path not in (None, "__done__"):
+            res = mlx_whisper.transcribe(
+                str(src), path_or_hf_repo=path, language=language,
+                word_timestamps=True, verbose=None)
         _cancel_point(job_id)
         seg_list = [_MlxSeg(s) for s in res["segments"]]
         lines = [s.text.strip() for s in seg_list]
@@ -2860,9 +2917,10 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
+        "workers": WORKER_LIMIT,
         "gpu": gpu_info(),
         "features": {
             "ffmpeg": ffmpeg_ok,
@@ -2949,6 +3007,136 @@ class JobRequest(BaseModel):
 MAX_PENDING_JOBS = 40  # đủ cho batch "render qua đêm"
 WHISPER_MODELS = {"tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"}
 ESRGAN_MODELS = {"realesr-animevideov3", "realesrgan-x4plus"}
+
+
+# ================================================================ Chuỗi tự động (Pipeline)
+# Các bước có thể nối chuỗi (video → video). Mỗi mục: nhãn + hàm chạy 1 bước.
+def _step_outputs(outs, jtype):
+    """Trả (file video chính, [tất cả file bước tạo ra]) — để nối tiếp + dọn rác."""
+    allp = [OUTPUTS / o["name"] for o in outs]
+    primary = next((p for p in allp
+                    if p.name.lower().endswith((".mp4", ".mov", ".webm"))), None)
+    if primary is None:
+        raise RuntimeError(f"Bước '{jtype}' không tạo video để nối tiếp")
+    return primary, allp
+
+
+def _run_step(job_id: str, jtype: str, src: Path, p: dict) -> Path:
+    """Chạy 1 bước trong chuỗi (đồng bộ, cùng luồng) → trả file video kết quả."""
+    p = p or {}
+    if jtype == "silence_cut":
+        outs = job_silence_cut(job_id, src, min(2.0, max(0.0, _safe_float(p.get("margin"), 0.2))))
+    elif jtype == "speed":
+        outs = job_speed(job_id, src, min(4.0, max(0.25, _safe_float(p.get("factor"), 2.0))))
+    elif jtype == "color":
+        outs = job_color(job_id, src, p.get("filter") if p.get("filter") in COLOR_FILTERS else "vivid")
+    elif jtype == "stabilize":
+        outs = job_stabilize(job_id, src)
+    elif jtype == "reframe":
+        outs = job_reframe(job_id, src, p.get("mode") if p.get("mode") in ("blur", "crop") else "blur")
+    elif jtype == "rife":
+        outs = job_rife(job_id, src, p.get("mode") if p.get("mode") in ("smooth", "slowmo") else "smooth")
+    elif jtype == "upscale":
+        mode = p.get("mode") if p.get("mode") in ("ai", "fast") else "fast"
+        scale = _safe_int(p.get("scale"), 2)
+        model = p.get("model") if p.get("model") in ESRGAN_MODELS else "realesr-animevideov3"
+        outs = job_upscale(job_id, src, mode, scale if scale in (2, 3, 4) else 2, model)
+    elif jtype == "bg_remove":
+        outs = job_bg_remove(job_id, src, p.get("bg") if p.get("bg") in ("green", "black", "white", "alpha") else "green")
+    elif jtype == "audio_enhance":
+        outs = job_audio_enhance(job_id, src, bool(p.get("denoise", True)), bool(p.get("loudness", True)))
+    elif jtype == "face_blur":
+        outs = job_face_blur(job_id, src, p.get("mode") if p.get("mode") in ("blur", "pixelate") else "blur",
+                             min(2.0, max(0.5, _safe_float(p.get("strength"), 1.0))))
+    elif jtype == "brand":
+        logo = None
+        if p.get("logo"):
+            lp = safe_upload_path(str(p["logo"]))
+            if lp.is_file() and lp.suffix.lower() in IMAGE_EXT:
+                logo = lp
+        outs = job_brand(job_id, src, str(p.get("title") or "")[:120], str(p.get("sign") or "")[:60],
+                         logo, p.get("corner") if p.get("corner") in LOGO_CORNERS else "br",
+                         min(1.0, max(0.1, _safe_float(p.get("opacity"), 0.7))),
+                         min(10.0, max(1.0, _safe_float(p.get("title_dur"), 3.0))))
+    elif jtype == "reframe916" or jtype == "export":
+        preset = p.get("preset", "tiktok")
+        outs = job_export(job_id, src, preset if preset in PRESETS else "tiktok")
+    elif jtype == "transcribe":
+        pr = dict(p)
+        pr["burn"] = True  # trong chuỗi phải cháy vào hình mới nối tiếp được
+        if pr.get("model") not in WHISPER_MODELS:
+            pr["model"] = "base"
+        outs = job_transcribe(job_id, src, pr)
+    elif jtype == "viral_caption":
+        outs = job_viral_caption(job_id, src, dict(p))
+    elif jtype == "broll":
+        if not pexels_available():
+            raise RuntimeError("B-roll cần PEXELS_API_KEY")
+        outs = job_broll(job_id, src, dict(p))
+    elif jtype == "music":
+        mp = safe_upload_path(str(p.get("music", "")))
+        if not mp.is_file():
+            raise RuntimeError("Bước nhạc nền thiếu file nhạc")
+        outs = job_music(job_id, src, mp, min(1.0, max(0.05, _safe_float(p.get("volume"), 0.25))),
+                         bool(p.get("duck", True)))
+    else:
+        raise RuntimeError(f"Bước không nối chuỗi được: {jtype}")
+    return _step_outputs(outs, jtype)
+
+
+PIPELINE_STEP_TYPES = {
+    "silence_cut", "speed", "color", "stabilize", "reframe", "rife", "upscale",
+    "bg_remove", "audio_enhance", "face_blur", "brand", "export", "transcribe",
+    "viral_caption", "broll", "music",
+}
+
+
+def job_pipeline(job_id: str, src: Path, p: dict):
+    """Chạy chuỗi bước nối tiếp: output mỗi bước làm input bước sau. 1 job."""
+    steps = p.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise RuntimeError("Chuỗi trống — thêm ít nhất 1 bước")
+    steps = steps[:12]
+    cur = src
+    produced = []  # MỌI file các bước tạo ra (mp4 + phụ .ass/.srt/.txt) — để dọn
+    n = len(steps)
+    try:
+        for i, st in enumerate(steps):
+            _cancel_point(job_id)
+            jtype = (st or {}).get("type")
+            params = (st or {}).get("params") or {}
+            label = STEP_LABELS.get(jtype, jtype)
+            _set(job_id, progress=int(i / n * 100),
+                 message=f"Bước {i + 1}/{n}: {label}")
+            primary, outs = _run_step(job_id, jtype, cur, params)
+            produced.extend(outs)  # gồm cả file phụ của bước trung gian
+            cur = primary
+        # đổi tên file cuối cho dễ nhận, dọn TẤT CẢ file khác (cả phụ)
+        final = unique_out(f"{src.stem}_chuoi{n}", ".mp4")
+        try:
+            cur.rename(final)
+        except OSError:
+            shutil.copy(cur, final)
+        for f in produced:
+            if f != final:
+                f.unlink(missing_ok=True)
+        _set(job_id, message=f"Xong — chuỗi {n} bước: "
+             + " → ".join(STEP_LABELS.get((s or {}).get("type"), (s or {}).get("type")) for s in steps))
+        return [out_entry(final)]
+    except BaseException:  # hủy/lỗi: dọn sạch mọi file đã tạo (chưa có file cuối)
+        for f in produced:
+            f.unlink(missing_ok=True)
+        raise
+
+
+STEP_LABELS = {
+    "silence_cut": "cắt lặng", "speed": "tốc độ", "color": "filter màu",
+    "stabilize": "chống rung", "reframe": "khung 9:16", "rife": "nội suy",
+    "upscale": "upscale", "bg_remove": "tách nền", "audio_enhance": "chuẩn âm",
+    "face_blur": "che mặt", "brand": "logo/tiêu đề", "export": "xuất preset",
+    "transcribe": "caption", "viral_caption": "phụ đề viral", "broll": "B-roll",
+    "music": "nhạc nền",
+}
 
 
 @app.post("/api/jobs")
@@ -3123,6 +3311,20 @@ def create_job(req: JobRequest):
         if not (whisper_available_any()):
             raise HTTPException(400, "Cần whisper (faster/MLX) để nhận dạng lời nói")
         return submit_job("viral_caption", src.name, job_viral_caption, src, dict(p))
+    if req.type == "pipeline":
+        steps = p.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise HTTPException(400, "Chuỗi trống — thêm ít nhất 1 bước")
+        for st in steps[:12]:
+            if not isinstance(st, dict) or st.get("type") not in PIPELINE_STEP_TYPES:
+                raise HTTPException(400, f"Bước không nối chuỗi được: {(st or {}).get('type')}")
+            t = st["type"]
+            if t == "broll" and not pexels_available():
+                raise HTTPException(400, "Bước B-roll cần PEXELS_API_KEY (thêm vào backend/.env)")
+            if t in ("viral_caption", "transcribe") and not whisper_available_any():
+                raise HTTPException(400, f"Bước {t} cần whisper trên máy chủ")
+        label = " → ".join(STEP_LABELS.get(s["type"], s["type"]) for s in steps[:12])
+        return submit_job("pipeline", f"{src.name} [{label}]", job_pipeline, src, dict(p))
     raise HTTPException(400, f"Loại job không hỗ trợ: {req.type}")
 
 
@@ -3131,7 +3333,7 @@ DIRECTOR_ALLOWED_TYPES = {
     "transcribe", "silence_cut", "upscale", "export", "rife", "bg_remove",
     "auto_edit", "reframe", "speed", "color", "music", "stabilize", "merge",
     "beatsync", "audio_enhance", "brand", "audiogram", "highlights", "content",
-    "face_blur", "tts", "lesson", "broll",
+    "face_blur", "tts", "lesson", "broll", "viral_caption", "pipeline",
 }
 
 DIRECTOR_CATALOG = """\
@@ -3157,7 +3359,8 @@ DIRECTOR_CATALOG = """\
 - face_blur: che mặt tự động. params: mode(blur/pixelate), strength(0.5-2)
 - lesson: bài giảng → giáo án + câu hỏi quiz (.md). params: quiz(số câu 3-15), push_lms(bool đẩy sang AI-LMS), level(1-4), department, ai(local/claude)
 - broll: tự chèn B-roll (cảnh minh hoạ) tải từ Pexels đè lên video người nói. params: count(1-6 số đoạn), ai(local/claude)
-- tts: đọc văn bản (KHÔNG cần file). params: text(chuỗi), voice(vi/en), speed(0.6-1.5)"""
+- tts: đọc văn bản (KHÔNG cần file). params: text(chuỗi), voice(vi/en), speed(0.6-1.5)
+- pipeline: CHUỖI NỐI TIẾP nhiều bước trên 1 video (output bước này làm input bước sau). DÙNG KHI người dùng muốn "A rồi B rồi C" trên CÙNG video. params: steps=[{"type":"<loại>","params":{...}}, ...]. Loại nối được: silence_cut, speed, color, stabilize, reframe, rife, upscale, bg_remove, audio_enhance, face_blur, brand, export, transcribe, viral_caption, broll, music. VD "cắt lặng rồi tăng tốc rồi xuất tiktok" → 1 action pipeline steps=[{type:silence_cut},{type:speed,params:{factor:1.5}},{type:export,params:{preset:tiktok}}]"""
 
 
 class DirectorReq(BaseModel):
@@ -3338,6 +3541,16 @@ def viral_preset_save(req: ViralPresetReq):
     (VIRAL_PRESETS_DIR / f"{name}.json").write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return data
+
+
+class WorkersReq(BaseModel):
+    workers: int
+
+
+@app.post("/api/workers")
+def set_workers(req: WorkersReq):
+    """Chỉnh số job chạy song song (1-4)."""
+    return {"workers": set_worker_limit(req.workers)}
 
 
 @app.post("/api/jobs/{job_id}/cancel")

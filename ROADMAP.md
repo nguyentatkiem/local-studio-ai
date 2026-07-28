@@ -119,6 +119,18 @@ Pipeline 7 bước đúng spec khách — toàn bộ offline trên GPU M4:
 - [x] Verify thật: font đóng gói được libass dùng (fontselect → BeVietnamPro-Bold), giữ fps/bt709, TP -1.5 dBTP sau AAC, logic cụm/ngắt dòng unit test PASS
 - [~] **Còn lại (sprint sau)**: timeline kéo-cắt NLE + track phụ đề pixel-perfect với preview libass-wasm (hiện dùng overlay CSS xấp xỉ + editor danh sách cụm)
 
+## ✅ ĐÃ XONG — v1.1 (wave 9 "Chuỗi tự động + chỉnh luồng + fix offline")
+
+- [x] 🔗 **Chuỗi tự động (Pipeline)** (`pipeline`): xếp nhiều tính năng theo thứ tự, chạy nối tiếp trên 1 video
+  (output mỗi bước tự làm input bước sau) trong 1 job; tự dọn file trung gian. 16 loại bước nối được
+  (cắt lặng/tốc độ/màu/upscale/phụ đề viral/caption/B-roll/xuất...). UI kéo xếp bước + đổi chỗ/xoá.
+- [x] 🎬 **Đạo diễn AI nối chuỗi bằng lời**: "cắt lặng rồi tăng tốc rồi xuất tiktok" → Claude tự sinh 1 action pipeline
+  (không phải job rời). Test thật PASS: ra 1 job `[cắt lặng → tốc độ → xuất preset]`.
+- [x] ⚙️ **Chỉnh số luồng song song 1-4** (`/api/workers`, slider trong tab Công cụ AI) — tạo executor mới, job cũ vẫn xong.
+- [x] 🔧 **Fix lỗi offline Whisper**: model đã cache vẫn bị "check Hub" → offline DNS fail. Nay resolve local dir
+  (`snapshot_download local_files_only`) truyền thẳng cho mlx_whisper → **không đụng mạng**; model chưa cache + offline
+  → tự fallback model đã có (với thông báo rõ). Áp dụng cho mọi tính năng dùng whisper.
+
 ## TIẾP THEO (đề xuất)
 
 ### GĐ 6 — SAM 2 track đối tượng (đã đánh giá khả thi 2026-07-25)

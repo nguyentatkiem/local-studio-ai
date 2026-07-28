@@ -27,6 +27,7 @@ export type Job = {
 export type Health = {
   status: string;
   version: string;
+  workers?: number;
   gpu: { name: string; vram_total_mb: number; vram_used_mb?: number; type?: string } | null;
   features: Record<string, boolean>;
 };
