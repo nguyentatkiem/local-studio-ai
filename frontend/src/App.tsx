@@ -394,7 +394,9 @@ export default function App() {
     };
     v.addEventListener("timeupdate", onT);
     return () => v.removeEventListener("timeupdate", onT);
-  }, [tool, vcClusters, stageSrc]);
+    // KHÔNG đưa stageSrc vào deps: nó khai báo bằng const bên dưới → đọc ở đây gây
+    // TDZ ReferenceError làm React sập trắng/đen màn hình. Chỉ cần tool + vcClusters.
+  }, [tool, vcClusters]);
 
   // seed kích thước khung từ video đang chọn → "1 chạm" (không analyze) tính cỡ chữ đúng
   useEffect(() => {
