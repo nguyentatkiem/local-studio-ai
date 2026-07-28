@@ -59,7 +59,16 @@ if [ ! -f yunet/face_detection_yunet_2023mar.onnx ]; then
   mkdir -p yunet && dl yunet/face_detection_yunet_2023mar.onnx "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 fi
 
+# 7. Font Be Vietnam Pro (Phụ đề Viral — đóng gói cho libass, OFL, mọi hệ)
+mkdir -p fonts
+for W in Bold ExtraBold; do
+  if [ ! -f "fonts/BeVietnamPro-$W.ttf" ]; then
+    echo "==> Font Be Vietnam Pro $W"
+    dl "fonts/BeVietnamPro-$W.ttf" "https://github.com/google/fonts/raw/main/ofl/bevietnampro/BeVietnamPro-$W.ttf"
+  fi
+done
+
 echo "==> Xong. Chạy ./start.sh để khởi động."
-echo "    (Model LLM Qwen3 4B ~2.3GB sẽ tự tải về cache HuggingFace ở lần dùng AI đầu tiên)"
+echo "    (Model LLM Qwen3 4B ~2.3GB + Whisper large-v3 ~1.6GB tự tải về cache HuggingFace ở lần dùng đầu)"
 # Windows: tải bản windows của realesrgan/rife từ cùng trang GitHub releases,
 # ffmpeg full từ gyan.dev (bản có libass), đặt vào binaries/ cùng cấu trúc thư mục.

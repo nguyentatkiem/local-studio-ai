@@ -105,6 +105,20 @@
 - [x] Kiểm chứng pipeline ffmpeg bằng clip stock giả (xanh lá đặc + seek chính xác): B-roll hiện
   đúng cửa sổ [3-5s] rồi trả về gốc — overlay setpts+enable chuẩn. Từ khoá AI KHÔNG vào filter (chống injection).
 
+## ✅ ĐÃ XONG — v1.0 (wave 8 "Phụ đề Viral 1 chạm")
+
+Pipeline 7 bước đúng spec khách — toàn bộ offline trên GPU M4:
+- [x] B1 nhận dạng cấp từ: Whisper **large-v3 / large-v3-turbo (MLX Metal)**, mặc định tiếng Việt, word timestamps
+- [x] B2 tách cụm: ≤2 dòng, ≤28 ký tự/dòng, 1.2-3.0s; ưu tiên cắt dấu câu > lặng >250ms > ký tự; không tách rời từ
+- [x] B3 ngắt dòng: cân bằng ≤1.2× (lệch ≤20%), không để giới từ/liên từ lẻ cuối dòng 1 (từ điển VN)
+- [x] B4 preset "Viral Trắng Viền Đen": font **Be Vietnam Pro Bold đóng gói** (libass fontsdir, không phụ thuộc hệ thống), cỡ 4.6%H, viền 0.7%W, lề 15%H, giữ chữ thường; tô từ khoá vàng #FFD400 (AI/thủ công, tùy chọn) + karaoke \kf từng từ
+- [x] B5 audio: highpass+afftdn+acompressor 3:1/-18dB+loudnorm -14 LUFS, **alimiter chặn đỉnh ≤ -1 dBTP** (chừa headroom AAC); duck nhạc nền -18dB nhả 400ms qua sidechaincompress
+- [x] B6 end card ảnh tĩnh cuối 3s (tùy chọn); B7 render libass, H.264 CRF18 preset slow, AAC 192k, giữ fps + BT.709
+- [x] Xuất **mp4 (burn) + .ass + .srt** riêng để chỉnh tay
+- [x] Endpoint `/api/viral/analyze` (phân tích cụm) + editor sửa text từng cụm + **overlay preview tức thì** trong player (CSS cqh khớp %H, tô từ khoá); 3 thanh trượt cỡ/viền/vị trí; lưu/xuất preset json
+- [x] Verify thật: font đóng gói được libass dùng (fontselect → BeVietnamPro-Bold), giữ fps/bt709, TP -1.5 dBTP sau AAC, logic cụm/ngắt dòng unit test PASS
+- [~] **Còn lại (sprint sau)**: timeline kéo-cắt NLE + track phụ đề pixel-perfect với preview libass-wasm (hiện dùng overlay CSS xấp xỉ + editor danh sách cụm)
+
 ## TIẾP THEO (đề xuất)
 
 ### GĐ 6 — SAM 2 track đối tượng (đã đánh giá khả thi 2026-07-25)

@@ -112,6 +112,28 @@ export async function resetDirector(): Promise<void> {
   await fetch("/api/director/reset", { method: "POST" });
 }
 
+export type ViralCluster = {
+  start: number; end: number; text: string;
+  words: { t: string; s: number; e: number }[];
+};
+
+export async function viralAnalyze(file: string, model: string, engine: string): Promise<Job> {
+  const r = await fetch("/api/viral/analyze", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file, model, language: "vi", engine }),
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(e.detail || "Phân tích thất bại");
+  }
+  return (await r.json()).job;
+}
+
+export async function fetchCuesJson(url: string): Promise<{ w: number; h: number; clusters: ViralCluster[] }> {
+  const r = await fetch(url);
+  return r.json();
+}
+
 export async function cancelJob(id: string): Promise<void> {
   await fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
 }

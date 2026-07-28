@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  askDirector, authStatus, cancelJob, createJob, fmtDur, fmtSize, getHealth, getJobs,
-  getMedia, login, logout, openOutputs, resetDirector, uploadFile,
-  type Health, type Job, type MediaItem,
+  askDirector, authStatus, cancelJob, createJob, fetchCuesJson, fmtDur, fmtSize,
+  getHealth, getJobs, getMedia, login, logout, openOutputs, resetDirector,
+  uploadFile, viralAnalyze, type Health, type Job, type MediaItem, type ViralCluster,
 } from "./api";
 
 function LoginScreen({ onOk }: { onOk: () => void }) {
@@ -39,9 +39,10 @@ function LoginScreen({ onOk }: { onOk: () => void }) {
 type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" | "bg_remove"
   | "tts" | "reframe" | "speed" | "color" | "music" | "stabilize" | "export"
   | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
-  | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll";
+  | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll" | "viral";
 
 const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: boolean }[] = [
+  { key: "viral", icon: "🔥", name: "Phụ đề Viral 1 chạm", desc: "nhận dạng → tách cụm → cháy preset viral + chuẩn âm", gpu: true },
   { key: "director", icon: "🎬", name: "Đạo diễn AI (Claude)", desc: "ra lệnh bằng lời — Claude tự xếp job", gpu: false },
   { key: "highlights", icon: "🎯", name: "AI cắt Shorts từ video dài", desc: "AI chọn khoảnh khắc → shorts 9:16", gpu: true },
   { key: "broll", icon: "🎞️", name: "Ghép B-roll tự động (Pexels)", desc: "AI tải cảnh minh hoạ chèn theo lời nói", gpu: false },
@@ -71,6 +72,17 @@ const TOOL_NAMES = Object.fromEntries(TOOLS.map((t) => [t.key, t.name]));
 
 const FONTS = ["Arial", "Arial Black", "Impact", "Segoe UI", "Verdana", "Tahoma",
   "Georgia", "Times New Roman", "Comic Sans MS", "Consolas", "Bahnschrift"];
+
+// overlay preview: tô vàng từ khoá (khớp preset — approximate so với bản cháy libass)
+function renderVcLine(line: string, kwOn: boolean, kwCsv: string) {
+  if (!kwOn) return line;
+  const set = new Set(kwCsv.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean));
+  return line.split(" ").map((w, i) => {
+    const clean = w.replace(/[.,!?…;:"'()]/g, "").toLowerCase();
+    const hot = (set.size ? set.has(clean) : false) || /\d/.test(clean);
+    return <span key={i} style={hot ? { color: "#FFD400" } : undefined}>{w}{" "}</span>;
+  });
+}
 
 type Preview = { input: string; url: string; name: string };
 
@@ -141,6 +153,21 @@ export default function App() {
   const [brOpacity, setBrOpacity] = useState(0.7);
   const [agTarget, setAgTarget] = useState("11");
   const [agTitle, setAgTitle] = useState("");
+  // wave 8 (v1.0) — Phụ đề Viral
+  const [vcModel, setVcModel] = useState("large-v3-turbo");
+  const [vcKeyword, setVcKeyword] = useState(true);
+  const [vcKeywords, setVcKeywords] = useState("");
+  const [vcKaraoke, setVcKaraoke] = useState(true);
+  const [vcFont, setVcFont] = useState(4.6);       // % chiều cao
+  const [vcOutline, setVcOutline] = useState(0.7); // % chiều rộng
+  const [vcPos, setVcPos] = useState(15);          // % từ đáy
+  const [vcEndcard, setVcEndcard] = useState("");
+  const [vcMusic, setVcMusic] = useState("");
+  const [vcClusters, setVcClusters] = useState<ViralCluster[] | null>(null);
+  const [vcDim, setVcDim] = useState<{ w: number; h: number }>({ w: 1080, h: 1920 });
+  const [vcBusy, setVcBusy] = useState(false);
+  const [vcNowText, setVcNowText] = useState("");  // overlay preview
+  const vidElRef = useRef<HTMLVideoElement | null>(null);
   // wave 7 (v0.9) — b-roll
   const [brCount, setBrCount] = useState(3);
   // wave 6 (v0.8) — giáo án
@@ -242,6 +269,74 @@ export default function App() {
     }
   };
 
+  // Phụ đề Viral: gói tham số preset
+  const vcParams = () => ({
+    model: vcModel, language: "vi", ai: aiEngine,
+    keyword: vcKeyword,
+    keywords: vcKeyword && vcKeywords.trim()
+      ? vcKeywords.split(",").map((s) => s.trim()).filter(Boolean) : [],
+    karaoke: vcKaraoke,
+    fontsize: Math.round(vcDim.h * vcFont / 100),
+    outline: Math.round(vcDim.w * vcOutline / 100 * 10) / 10,
+    marginV: Math.round(vcDim.h * vcPos / 100),
+    endcard: vcEndcard || null, music: vcMusic || null,
+  });
+
+  // phân tích cụm để chỉnh tay (poll job xong rồi tải json cụm)
+  const analyzeViral = async () => {
+    if (!selected) { showToast("⚠️ Chọn video trước"); return; }
+    setVcBusy(true); setVcClusters(null);
+    try {
+      const job = await viralAnalyze(selected.name, vcModel, aiEngine);
+      let done: Job | undefined;
+      for (let i = 0; i < 200; i++) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const js = await getJobs();
+        const j = js.find((x) => x.id === job.id);
+        if (j && (j.status === "done" || j.status === "error")) { done = j; break; }
+      }
+      if (!done || done.status !== "done") throw new Error(done?.error || "phân tích lỗi");
+      const jsonOut = done.outputs.find((o) => o.name.endsWith(".json"));
+      if (!jsonOut) throw new Error("không có dữ liệu cụm");
+      const data = await fetchCuesJson(jsonOut.url);
+      setVcDim({ w: data.w || 1080, h: data.h || 1920 });
+      setVcClusters(data.clusters);
+      showToast(`✅ ${data.clusters.length} cụm — sửa text rồi Cháy phụ đề`);
+    } catch (e) { showToast("❌ " + String((e as Error).message)); }
+    finally { setVcBusy(false); }
+  };
+
+  const renderViral = async (withEdits: boolean) => {
+    if (!selected) { showToast("⚠️ Chọn video trước"); return; }
+    const params: Record<string, unknown> = vcParams();
+    if (withEdits && vcClusters) {
+      params.clusters = vcClusters.map((c) => ({
+        start: c.start, end: c.end, text: c.text,
+        // giữ word timestamps để karaoke; nếu text bị sửa khác thì bỏ words (dùng text thô)
+        words: c.text === c.words.map((w) => w.t).join(" ") ? c.words : undefined,
+      }));
+    }
+    try {
+      await createJob("viral_caption", selected.name, params);
+      setJobs(await getJobs()); setRightTab("jobs");
+      showToast("🔥 Đang cháy phụ đề viral — chạy trên GPU máy bạn");
+    } catch (e) { showToast("❌ " + String(e)); }
+  };
+
+  // overlay preview: hiện text cụm hiện tại trên player theo currentTime
+  useEffect(() => {
+    if (tool !== "viral" || !vcClusters) { setVcNowText(""); return; }
+    const v = vidElRef.current;
+    if (!v) return;
+    const onT = () => {
+      const t = v.currentTime;
+      const c = vcClusters.find((x) => t >= x.start && t <= x.end);
+      setVcNowText(c ? c.text : "");
+    };
+    v.addEventListener("timeupdate", onT);
+    return () => v.removeEventListener("timeupdate", onT);
+  }, [tool, vcClusters]);
+
   // merge/beatsync: NHIỀU clip vào MỘT job (thứ tự = thứ tự chọn trong batch)
   const runMulti = async (type: string, params: Record<string, unknown>) => {
     const sources = batch && batchSel.length > 0 ? batchSel
@@ -289,7 +384,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v0.9 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v1.0 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -381,6 +476,7 @@ export default function App() {
                      (t.key === "face_blur" && !feats.face_blur) ||
                      (t.key === "director" && !feats.director) ||
                      (t.key === "lesson" && !feats.lesson) ||
+                     (t.key === "viral" && !feats.viral_caption) ||
                      (["reframe", "speed", "color", "music", "stabilize",
                        "merge", "audio_enhance", "brand", "audiogram"].includes(t.key) && !feats.ffmpeg) ||
                      (t.key === "export" && !feats.export) ? " disabled" : "")}
@@ -408,7 +504,18 @@ export default function App() {
                     {ab === "sua" ? "BẢN SỬA" : "BẢN GỐC"}
                   </span>
                 )}
-                <video key={stageSrc} src={stageSrc} controls autoPlay={!!preview} />
+                <video ref={vidElRef} key={stageSrc} src={stageSrc} controls autoPlay={!!preview} />
+                {tool === "viral" && vcNowText && !preview && (
+                  <div className="vcoverlay" style={{ bottom: `${vcPos}%` }}>
+                    {vcNowText.split("\n").map((ln, i) => (
+                      <div key={i} className="vcline"
+                        style={{ fontSize: `${vcFont}cqh`,
+                          WebkitTextStrokeWidth: `${vcOutline * 0.9}cqh` }}>
+                        {renderVcLine(ln, vcKeyword, vcKeywords)}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : (
               <div className="emptyframe">chọn video trong kho media để bắt đầu</div>
@@ -636,6 +743,98 @@ export default function App() {
                   <button className="btn pri big" onClick={() => run("upscale", { mode: upMode, scale: upScale, model: upModel })}>
                     ▶ Chạy trên máy
                   </button>
+                </>
+              )}
+
+              {tool === "viral" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🔥 Thả video dọc → 1 chạm: tự nhận dạng lời nói, tách cụm, cháy phụ đề
+                    preset "Viral Trắng Viền Đen" + chuẩn hoá âm thanh (-14 LUFS). Chạy offline
+                    trên GPU, không watermark. Xuất mp4 + .ass + .srt.
+                  </div>
+                  <div className="field"><label>Model nhận dạng (word-level)</label>
+                    <select value={vcModel} onChange={(e) => setVcModel(e.target.value)}>
+                      <option value="large-v3-turbo">large-v3-turbo (nhanh, khuyên dùng)</option>
+                      <option value="large-v3">large-v3 (chính xác nhất, chậm hơn)</option>
+                      <option value="medium">medium</option>
+                      <option value="small">small</option>
+                      <option value="base">base (test nhanh)</option>
+                    </select>
+                  </div>
+                  <div className="optrow">
+                    <label className="chk"><input type="checkbox" checked={vcKeyword} onChange={(e) => setVcKeyword(e.target.checked)} />Tô sáng từ khoá (vàng)</label>
+                    <label className="chk"><input type="checkbox" checked={vcKaraoke} onChange={(e) => setVcKaraoke(e.target.checked)} />Karaoke từng từ</label>
+                  </div>
+                  {vcKeyword && (
+                    <div className="field"><label>Từ khoá (cách nhau dấu phẩy, để trống = AI tự chọn)</label>
+                      <input className="ttsbox" style={{ height: 32, resize: "none" }}
+                        value={vcKeywords} placeholder="vd: AI, TikTok, 30 triệu"
+                        onChange={(e) => setVcKeywords(e.target.value)} />
+                    </div>
+                  )}
+                  <div className="field">
+                    <div className="sl-h"><span>Cỡ chữ (% chiều cao)</span><b>{vcFont.toFixed(1)}%</b></div>
+                    <input type="range" min={3} max={7} step={0.1} value={vcFont}
+                      onChange={(e) => setVcFont(parseFloat(e.target.value))} />
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Độ dày viền (% chiều rộng)</span><b>{vcOutline.toFixed(1)}%</b></div>
+                    <input type="range" min={0.2} max={1.5} step={0.1} value={vcOutline}
+                      onChange={(e) => setVcOutline(parseFloat(e.target.value))} />
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Chiều cao đặt chữ (% từ đáy)</span><b>{vcPos}%</b></div>
+                    <input type="range" min={12} max={40} step={1} value={vcPos}
+                      onChange={(e) => setVcPos(parseInt(e.target.value))} />
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI chọn từ khoá</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (offline)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude</button>
+                      </div>
+                    </div>
+                  )}
+                  {audioFiles.length > 0 && (
+                    <div className="field"><label>Nhạc nền (tuỳ chọn — tự ducking khi có giọng)</label>
+                      <select value={vcMusic} onChange={(e) => setVcMusic(e.target.value)}>
+                        <option value="">— không —</option>
+                        {audioFiles.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                      </select>
+                    </div>
+                  )}
+                  {imageFiles.length > 0 && (
+                    <div className="field"><label>End card (ảnh cuối 3s, tuỳ chọn)</label>
+                      <select value={vcEndcard} onChange={(e) => setVcEndcard(e.target.value)}>
+                        <option value="">— không —</option>
+                        {imageFiles.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                      </select>
+                    </div>
+                  )}
+                  <div className="optrow">
+                    <button className="btn pri big" style={{ flex: 1 }} disabled={vcBusy || !selected}
+                      onClick={() => renderViral(false)}>🔥 1 chạm — Cháy luôn</button>
+                    <button className="btn" disabled={vcBusy || !selected}
+                      onClick={analyzeViral} title="Phân tích để sửa text từng cụm">
+                      {vcBusy ? "⏳" : "✎ Sửa cụm"}
+                    </button>
+                  </div>
+                  {vcClusters && (
+                    <div className="vceditor">
+                      <div className="lp-title">Sửa nội dung từng cụm ({vcClusters.length}) — bấm cụm để nhảy player</div>
+                      {vcClusters.map((c, i) => (
+                        <div key={i} className="vcrow">
+                          <button className="vcts" onClick={() => { if (vidElRef.current) vidElRef.current.currentTime = c.start; }}>
+                            {c.start.toFixed(1)}s
+                          </button>
+                          <input value={c.text}
+                            onChange={(e) => setVcClusters((cl) => cl!.map((x, j) => j === i ? { ...x, text: e.target.value } : x))} />
+                        </div>
+                      ))}
+                      <button className="btn pri big" onClick={() => renderViral(true)}>🔥 Cháy phụ đề (đã sửa)</button>
+                    </div>
+                  )}
                 </>
               )}
 

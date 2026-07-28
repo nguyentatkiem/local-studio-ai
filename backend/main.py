@@ -304,6 +304,14 @@ def run_ffmpeg_progress(args: list, duration: float, on_progress,
             raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {err[-800:]}")
 
 
+def _ff_escape_path(p) -> str:
+    """Thoát đường dẫn để dùng trong giá trị filter ffmpeg (subtitles/fontsdir):
+    escape \\ , : và ' — tránh vỡ chuỗi filter."""
+    s = str(p)
+    s = s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    return s
+
+
 def unique_out(stem: str, suffix: str) -> Path:
     """Collision-free output path in OUTPUTS."""
     base = re.sub(r"[^\w\-.]+", "_", stem)
@@ -330,6 +338,8 @@ _whisper_lock = threading.Lock()
 
 def get_whisper(size: str):
     from faster_whisper import WhisperModel
+    if size == "large-v3-turbo":  # faster-whisper không nhận tên turbo → dùng large-v3
+        size = "large-v3"
     with _whisper_lock:
         if size not in _whisper_models:
             _whisper_models[size] = WhisperModel(size, device="cpu", compute_type="int8")
@@ -341,7 +351,18 @@ MLX_WHISPER_REPOS = {
     "base": "mlx-community/whisper-base-mlx",
     "small": "mlx-community/whisper-small-mlx",
     "medium": "mlx-community/whisper-medium-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
 }
+FONTS_DIR = BINARIES / "fonts"   # font đóng gói (Be Vietnam Pro) cho libass — không phụ thuộc hệ thống
+
+
+def whisper_available_any() -> bool:
+    try:
+        import faster_whisper  # noqa: F401
+        return True
+    except ImportError:
+        return mlx_whisper_available()
 
 
 def mlx_whisper_available() -> bool:
@@ -2223,6 +2244,13 @@ def _safe_int(v, default: int) -> int:
         return default
 
 
+def _safe_float(v, default: float) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def ailms_available() -> bool:
     return AILMS_DB.exists()
 
@@ -2324,6 +2352,364 @@ def job_lesson(job_id: str, src: Path, p: dict):
             return outputs
     _set(job_id, message=f"Xong — giáo án + {n_quiz} câu hỏi ({brain})")
     return outputs
+
+
+# ================================================================ Phụ đề Viral 1 chạm (v1.0)
+# Giới từ / liên từ tiếng Việt không nên đứng lẻ cuối dòng đầu (bước 3)
+_VN_DANGLING = {
+    "và", "hoặc", "nhưng", "mà", "thì", "là", "của", "cho", "với", "để", "vì",
+    "nên", "khi", "nếu", "hay", "rồi", "ở", "trong", "trên", "dưới", "ra", "vào",
+    "từ", "đến", "bằng", "về", "theo", "như", "bởi", "do", "tại", "qua", "cùng",
+    "sẽ", "đã", "đang", "một", "các", "những", "này", "đó", "kia",
+}
+
+
+def _flatten_words(seg_list):
+    """Lấy list từ có mốc thời gian cấp từ (bước 1 đã bật word_timestamps)."""
+    words = []
+    for s in seg_list:
+        for w in (getattr(s, "words", None) or []):
+            t = (w.word or "").strip()
+            if t:
+                words.append({"t": t, "s": float(w.start), "e": float(w.end)})
+        if not getattr(s, "words", None):  # model không trả word → cả câu 1 "từ"
+            t = (s.text or "").strip()
+            if t:
+                words.append({"t": t, "s": float(s.start), "e": float(s.end)})
+    return words
+
+
+def _viral_clusters(seg_list, max_line_chars=28, max_lines=2,
+                    min_dur=1.2, max_dur=3.0):
+    """Bước 2: gộp từ thành cụm hiển thị theo 3 ràng buộc đồng thời (≤2 dòng,
+    ≤28 ký tự/dòng, 1.2-3.0s). Ưu tiên cắt tại dấu câu > khoảng lặng >250ms >
+    giới hạn ký tự. Không tách rời một từ."""
+    words = _flatten_words(seg_list)
+    if not words:
+        return []
+    max_chars = max_line_chars * max_lines  # trần ký tự cả cụm (2 dòng)
+    clusters, cur = [], []
+
+    def chars(c):
+        return sum(len(w["t"]) for w in c) + max(0, len(c) - 1)
+
+    for i, w in enumerate(words):
+        cur.append(w)
+        nxt = words[i + 1] if i + 1 < len(words) else None
+        d = cur[-1]["e"] - cur[0]["s"]
+        c = chars(cur)
+        ends_punct = w["t"][-1] in ".,!?…;:"
+        gap_next = (nxt["s"] - w["e"]) if nxt else 99.0
+        # nếu thêm từ kế sẽ vượt trần ký tự/thời lượng → phải chốt ngay
+        next_over = nxt and (c + 1 + len(nxt["t"]) > max_chars
+                             or (nxt["e"] - cur[0]["s"]) > max_dur)
+        close = False
+        if not nxt:
+            close = True
+        elif c >= max_chars or d >= max_dur or next_over:
+            close = True
+        elif d >= min_dur and ends_punct:        # ưu tiên 1: dấu câu
+            close = True
+        elif d >= min_dur and gap_next > 0.25:    # ưu tiên 2: khoảng lặng
+            close = True
+        if close:
+            clusters.append(cur)
+            cur = []
+    # cụm cuối quá ngắn → gộp vào cụm trước nếu vẫn trong trần
+    if len(clusters) >= 2:
+        last = clusters[-1]
+        if last[-1]["e"] - last[0]["s"] < min_dur:
+            merged = clusters[-2] + last
+            if (merged[-1]["e"] - merged[0]["s"] <= max_dur
+                    and chars(merged) <= max_chars):
+                clusters[-2] = merged
+                clusters.pop()
+    return clusters
+
+
+def _balance_lines(words, max_line_chars=28):
+    """Bước 3: ngắt tối đa 2 dòng, cân bằng độ dài (chênh ≤20%), không để dòng
+    đầu kết thúc bằng giới từ/liên từ lẻ. Trả về (line1_words, line2_words|None)."""
+    texts = [w["t"] for w in words]
+    total = sum(len(t) for t in texts) + max(0, len(texts) - 1)
+    if total <= max_line_chars or len(texts) == 1:
+        return words, None
+    best, best_score = None, 1e9
+    for k in range(1, len(texts)):  # dòng 1 = [0:k]
+        l1 = " ".join(texts[:k])
+        l2 = " ".join(texts[k:])
+        if len(l1) > max_line_chars or len(l2) > max_line_chars:
+            continue
+        imbalance = abs(len(l1) - len(l2)) / max(1, max(len(l1), len(l2)))
+        dangling = texts[k - 1].lower().strip(".,!?…;:") in _VN_DANGLING
+        score = imbalance + (0.5 if imbalance > 0.20 else 0) + (1.0 if dangling else 0)
+        if score < best_score:
+            best_score, best = score, k
+    if best is None:  # không chỗ nào ≤28/dòng → cắt giữa theo từ
+        best = max(1, len(texts) // 2)
+    return words[:best], words[best:]
+
+
+# --- Preset chữ "Viral Trắng Viền Đen" (kích thước theo % khung để tự co giãn)
+VIRAL_KEYWORD_ASS = r"{\c&H0000D4FF&}"   # vàng #FFD400 (ASS &HAABBGGRR)
+VIRAL_WHITE_ASS = r"{\c&H00FFFFFF&}"
+
+
+def _is_keyword(word_clean: str, kw_set: set) -> bool:
+    if word_clean.lower() in kw_set:
+        return True
+    return bool(re.search(r"\d", word_clean))  # con số luôn là từ khoá quan trọng
+
+
+def _viral_ass(clusters, w: int, h: int, params: dict) -> str:
+    """Bước 4: sinh .ass theo preset Viral. fontsize/outline/marginV theo % khung."""
+    # validate + clamp mọi tham số client (tránh giá trị rác làm libass vỡ SAU transcribe)
+    fs = params.get("fontsize")
+    fontsize = int(min(h * 0.12, max(h * 0.02, _safe_float(fs, h * 0.046))))
+    ol = params.get("outline")
+    outline = round(min(w * 0.03, max(0.0, _safe_float(ol, w * 0.007))), 1)
+    mv = params.get("marginV")
+    margin_v = int(min(h * 0.85, max(0.0, _safe_float(mv, h * 0.15))))
+    # font: chỉ giữ chữ/số/space (chống chèn dấu phẩy / xuống dòng vào Style)
+    font = re.sub(r"[^\w \-]", "", str(params.get("font") or "Be Vietnam Pro")).strip() \
+        or "Be Vietnam Pro"
+    kw_on = bool(params.get("keyword", False))
+    kw_set = set(k.strip().lower() for k in (params.get("keywords") or []) if k.strip())
+    karaoke = bool(params.get("karaoke", False))
+
+    head = (
+        "[Script Info]\nScriptType: v4.00+\n"
+        f"PlayResX: {w}\nPlayResY: {h}\nScaledBorderAndShadow: yes\nWrapStyle: 2\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Viral,{font},{fontsize},&H00FFFFFF,&H00FFFFFF,&H00000000,"
+        f"&H00000000,-1,0,0,0,100,100,0,0,1,{outline},0,2,60,60,{margin_v},1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+    def render_word(wd: dict) -> str:
+        raw = ass_escape(wd["t"])
+        clean = raw.strip(".,!?…;:\"'()")
+        piece = raw
+        if kw_on and _is_keyword(clean, kw_set):
+            piece = VIRAL_KEYWORD_ASS + raw + VIRAL_WHITE_ASS
+        if karaoke:
+            cs = max(1, int(round((wd["e"] - wd["s"]) * 100)))
+            piece = (r"{\kf%d}" % cs) + piece
+        return piece
+
+    lines = []
+    for c in clusters:
+        st = max(0.0, c[0]["s"])          # clamp: không âm, end > start
+        en = max(st + 0.1, c[-1]["e"])
+        l1, l2 = _balance_lines(c)
+        prefix = r"{\2c&H00AAAAAA&}" if karaoke else ""  # chưa đọc = xám → sweep sang trắng
+        t1 = " ".join(render_word(x) for x in l1)
+        text = prefix + t1
+        if l2:
+            text += r"\N" + " ".join(render_word(x) for x in l2)
+        lines.append(f"Dialogue: 0,{ass_ts(st)},{ass_ts(en)},Viral,,0,0,0,,{text}")
+    return head + "\n".join(lines) + "\n"
+
+
+def _viral_srt(clusters) -> str:
+    """Xuất .srt (chữ thuần) để người dùng chỉnh tay."""
+    out = []
+    for n, c in enumerate(clusters, 1):
+        l1, l2 = _balance_lines(c)
+        txt = " ".join(x["t"] for x in l1)
+        if l2:
+            txt += "\n" + " ".join(x["t"] for x in l2)
+        out.append(f"{n}\n{srt_ts(c[0]['s'])} --> {srt_ts(c[-1]['e'])}\n{txt}\n")
+    return "\n".join(out) + "\n"
+
+
+# --- Bước 5: chuỗi xử lý âm thanh (giọng) + ducking nhạc nền
+def _viral_voice_af() -> str:
+    """Khử ồn nhẹ + nén động 3:1 ngưỡng -18dB + chuẩn hoá -14 LUFS, chặn đỉnh
+    thực ≤ -1 dBTP (alimiter brickwall vì loudnorm 1 lượt không đảm bảo TP)."""
+    return ("highpass=f=80,afftdn=nf=-25,"
+            "acompressor=threshold=-18dB:ratio=3:attack=5:release=100,"
+            "loudnorm=I=-14:TP=-1.5:LRA=11,"
+            "alimiter=limit=0.82:level=false")  # ~-1.7 dBFS: chừa headroom cho AAC (lossy đẩy TP lên ~0.5dB) → file cuối ≤ -1 dBTP
+
+
+def _viral_ai_keywords(seg_list, job_id, engine) -> list:
+    """AI tự chọn danh từ/con số quan trọng làm từ khoá tô sáng."""
+    lines = _transcript_lines(seg_list)
+    text = "\n".join(lines)
+    if len(text) > (100000 if engine == "claude" else 9000):
+        text = text[:(100000 if engine == "claude" else 9000)]
+    prompt = (
+        "Đây là lời thoại một video tiếng Việt:\n\n" + text +
+        "\n\nChọn 8-20 TỪ KHOÁ quan trọng nhất để tô sáng trong phụ đề viral "
+        "(danh từ chính, tên riêng, con số, cụm gây chú ý). Chỉ 1 từ mỗi mục, "
+        "viết thường, đúng như trong lời thoại.\n"
+        'Trả về DUY NHẤT mảng JSON: ["từ1","từ2",...]'
+    )
+    try:
+        data = _extract_json(llm_generate(prompt, max_tokens=400,
+                                          job_id=job_id, engine=engine))
+        return [str(x).strip().lower() for x in data if str(x).strip()][:30] \
+            if isinstance(data, list) else []
+    except (ValueError, json.JSONDecodeError):
+        return []
+
+
+def _run_viral_recognize(job_id, src, p, lo, hi):
+    """Bước 1: nhận dạng cấp từ. Mặc định tiếng Việt, model large-v3."""
+    model = p.get("model") if p.get("model") in WHISPER_MODELS else "large-v3"
+    lang = p.get("language") or "vi"
+    if lang not in ("vi", "en"):
+        lang = "vi"
+    info = media_info(src)
+    seg_list, _lines, _lang = _speech_recognize(
+        job_id, src, model, lang, p.get("engine"), info["duration"] or 1, lo, hi)
+    return seg_list
+
+
+def job_viral_caption(job_id: str, src: Path, p: dict):
+    """Phụ đề Viral 1 chạm — pipeline 7 bước, xuất mp4 (burn) + .ass + .srt."""
+    info = media_info(src)
+    w, h = info["width"], info["height"]
+    if not w or not h:
+        raise RuntimeError("Tệp không có luồng video")
+    dur = info["duration"] or 1
+
+    # cụm: từ dữ liệu chỉnh tay, hoặc tự phân tích (bước 1-3)
+    edited = p.get("clusters")
+    if edited and isinstance(edited, list):
+        seg_list = None
+        clusters = []
+        for c in edited:
+            if not isinstance(c, dict):
+                continue
+            ws = c.get("words")
+            if isinstance(ws, list) and ws:
+                wl = [{"t": str(x["t"]), "s": _safe_float(x.get("s"), 0),
+                       "e": _safe_float(x.get("e"), 0)}
+                      for x in ws if isinstance(x, dict) and x.get("t") is not None]
+                if wl:
+                    clusters.append(wl)
+            elif c.get("text"):
+                s = _safe_float(c.get("start"), 0)
+                e = _safe_float(c.get("end"), s + 1.5)
+                if e <= s:
+                    e = s + 1.0
+                clusters.append([{"t": str(c["text"]).strip(), "s": s, "e": e}])
+    else:
+        seg_list = _run_viral_recognize(job_id, src, p, 3, 42)
+        _cancel_point(job_id)
+        clusters = _viral_clusters(seg_list)
+    if not clusters:
+        raise RuntimeError("Không tách được cụm phụ đề — video có lời thoại không?")
+
+    # từ khoá tô sáng
+    params = dict(p)
+    if p.get("keyword"):
+        kws = [k for k in (p.get("keywords") or []) if str(k).strip()]
+        if not kws and seg_list is not None:  # để trống → AI tự chọn
+            # TÔN TRỌNG lựa chọn offline: chỉ dùng Claude khi người dùng CHỌN claude
+            # (không tự fallback → không gửi transcript ra ngoài ngoài ý muốn)
+            want_claude = p.get("ai") == "claude"
+            if want_claude and claude_available():
+                _set(job_id, progress=46, message="Claude chọn từ khoá tô sáng...")
+                kws = _viral_ai_keywords(seg_list, job_id, "claude")
+            elif llm_available():
+                _set(job_id, progress=46, message="AI local chọn từ khoá tô sáng...")
+                kws = _viral_ai_keywords(seg_list, job_id, "local")
+            # không có engine phù hợp → bỏ qua tô từ khoá (con số vẫn tự tô ở _is_keyword)
+        params["keywords"] = kws
+    _cancel_point(job_id)
+
+    # bước 4: sinh .ass + .srt
+    _set(job_id, progress=52, message="Áp preset chữ Viral, sinh .ass...")
+    ass_text = _viral_ass(clusters, w, h, params)
+    ass_path = unique_out(f"{src.stem}_viral", ".ass")
+    ass_path.write_text(ass_text, encoding="utf-8")
+    srt_path = ass_path.with_suffix(".srt")
+    srt_path.write_text(_viral_srt(clusters), encoding="utf-8")
+
+    # bước 6: end card (ảnh tĩnh cuối)
+    endcard = None
+    if p.get("endcard"):
+        ec = safe_upload_path(str(p["endcard"]))
+        if ec.is_file() and ec.suffix.lower() in IMAGE_EXT:
+            endcard = ec
+
+    # bước 5+7: xử lý âm thanh + burn phụ đề (libass) + mã hoá H.264 CRF18 slow
+    _set(job_id, progress=58, message="Chuẩn âm thanh + cháy phụ đề (libass)...")
+    out = unique_out(f"{src.stem}_viral", ".mp4")
+    voice_af = _viral_voice_af()
+    subs = f"subtitles={_ff_escape_path(ass_path)}:fontsdir={_ff_escape_path(FONTS_DIR)}"
+    music = None
+    if p.get("music"):
+        mp = safe_upload_path(str(p["music"]))
+        if mp.is_file():
+            music = mp
+
+    common_v = ["-c:v", "libx264", "-crf", "18", "-preset", "slow",
+                "-pix_fmt", "yuv420p", "-colorspace", "bt709",
+                "-color_primaries", "bt709", "-color_trc", "bt709"]
+    if music is not None and info["has_audio"]:
+        # nhạc nền + ducking -18dB khi có tiếng nói, nhả 400ms
+        fc = (f"[0:v]{subs}[v];"
+              f"[0:a]{voice_af},asplit=2[vo][sc];"
+              "[1:a]volume=1.0[mus];"
+              "[mus][sc]sidechaincompress=threshold=0.05:ratio=8:attack=5:"
+              "release=400:makeup=1[duck];"
+              "[vo][duck]amix=inputs=2:duration=first:normalize=0,"
+              "alimiter=limit=0.82[a]")  # chừa headroom cho AAC → ≤ -1 dBTP
+        args = ["-i", str(src), "-stream_loop", "-1", "-i", str(music),
+                "-filter_complex", fc, "-map", "[v]", "-map", "[a]",
+                "-shortest"] + common_v + ["-c:a", "aac", "-b:a", "192k", str(out)]
+    elif music is not None:
+        # video KHÔNG có tiếng nhưng người dùng thêm nhạc → dùng nhạc làm audio
+        args = ["-i", str(src), "-stream_loop", "-1", "-i", str(music),
+                "-vf", subs, "-map", "0:v", "-map", "1:a", "-shortest"] \
+            + common_v + ["-c:a", "aac", "-b:a", "192k", str(out)]
+    else:
+        args = ["-i", str(src), "-vf", subs]
+        if info["has_audio"]:
+            args += ["-af", voice_af]
+        args += common_v + ["-c:a", "aac", "-b:a", "192k", str(out)]
+    run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=58 + pr * 0.30),
+                        job_id)
+
+    outputs = [out, ass_path, srt_path]
+    if endcard is not None:
+        _set(job_id, progress=92, message="Nối end card...")
+        ec_dur = min(10.0, max(1.0, float(p.get("endcard_dur", 3.0))))
+        ec_clip = TMP / f"vc_ec_{job_id}.mp4"
+        r = _run_tracked(job_id, [
+            FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+            "-loop", "1", "-i", str(endcard),
+            "-f", "lavfi", "-t", f"{ec_dur:.2f}", "-i", "anullsrc=r=48000:cl=stereo",
+            "-t", f"{ec_dur:.2f}", "-vf",
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={info['fps'] or 30},setsar=1",
+            "-map", "0:v", "-map", "1:a"] + common_v + [
+            "-c:a", "aac", "-b:a", "192k", str(ec_clip)])
+        if r.returncode == 0 and ec_clip.exists():
+            lst = TMP / f"vc_cat_{job_id}.txt"
+            lst.write_text(f"file '{out.as_posix()}'\nfile '{ec_clip.as_posix()}'\n",
+                           encoding="utf-8")
+            final = unique_out(f"{src.stem}_viral_end", ".mp4")
+            r2 = _run_tracked(job_id, [
+                FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "concat", "-safe", "0", "-i", str(lst),
+                "-c", "copy", str(final)])
+            lst.unlink(missing_ok=True)
+            ec_clip.unlink(missing_ok=True)
+            if r2.returncode == 0 and final.exists():
+                out.unlink(missing_ok=True)
+                outputs[0] = final
+    _set(job_id, message=f"Xong — {len(clusters)} cụm phụ đề viral (burn + .ass + .srt)")
+    return [out_entry(x) for x in outputs]
 
 
 # ---------------------------------------------------------------- job: face blur
@@ -2474,7 +2860,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "0.9.0",
+        "version": "1.0.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "gpu": gpu_info(),
@@ -2510,6 +2896,7 @@ def health():
             "ailms": ailms_available(),
             "broll": pexels_available() and (llm_available() or claude_available())
             and whisper_ok and ffmpeg_ok,
+            "viral_caption": whisper_ok and ffmpeg_ok and FONTS_DIR.exists(),
         },
     }
 
@@ -2560,7 +2947,7 @@ class JobRequest(BaseModel):
 
 
 MAX_PENDING_JOBS = 40  # đủ cho batch "render qua đêm"
-WHISPER_MODELS = {"tiny", "base", "small", "medium"}
+WHISPER_MODELS = {"tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"}
 ESRGAN_MODELS = {"realesr-animevideov3", "realesrgan-x4plus"}
 
 
@@ -2732,6 +3119,10 @@ def create_job(req: JobRequest):
         if not llm_available() and not claude_available():
             raise HTTPException(400, "Cần mlx-lm hoặc Claude CLI để chọn cảnh B-roll")
         return submit_job("broll", src.name, job_broll, src, dict(p))
+    if req.type == "viral_caption":
+        if not (whisper_available_any()):
+            raise HTTPException(400, "Cần whisper (faster/MLX) để nhận dạng lời nói")
+        return submit_job("viral_caption", src.name, job_viral_caption, src, dict(p))
     raise HTTPException(400, f"Loại job không hỗ trợ: {req.type}")
 
 
@@ -2871,6 +3262,82 @@ def director(req: DirectorReq):
         DIRECTOR_HISTORY.append({"role": "ai", "text": ai_note[:500]})
         del DIRECTOR_HISTORY[:-DIRECTOR_MAX_TURNS * 2]
     return {"reply": reply, "jobs": created, "errors": errors}
+
+
+# ---------------------------------------------------------------- Phụ đề Viral: analyze + preset
+class ViralAnalyzeReq(BaseModel):
+    file: str
+    model: str = "large-v3"
+    language: str = "vi"
+    engine: str = ""
+
+
+@app.post("/api/viral/analyze")
+def viral_analyze(req: ViralAnalyzeReq):
+    """Bước 1-3: nhận dạng + tách cụm → trả về danh sách cụm (text + mốc thời
+    gian cấp từ) để người dùng chỉnh tay trên timeline trước khi render."""
+    if not whisper_available_any():
+        raise HTTPException(400, "Cần whisper để nhận dạng lời nói")
+    src = safe_upload_path(req.file)
+    if not src.is_file():
+        raise HTTPException(404, f"Không tìm thấy file: {req.file}")
+    info = media_info(src)
+    p = {"model": req.model, "language": req.language, "engine": req.engine or None}
+    job = submit_job("viral_analyze", src.name, _job_viral_analyze, src, p)
+    return {"job": job}
+
+
+def _job_viral_analyze(job_id: str, src: Path, p: dict):
+    seg_list = _run_viral_recognize(job_id, src, p, 5, 90)
+    _cancel_point(job_id)
+    clusters = _viral_clusters(seg_list)
+    info = media_info(src)
+    data = []
+    for c in clusters:
+        l1, l2 = _balance_lines(c)
+        text = " ".join(x["t"] for x in l1)
+        if l2:
+            text += "\n" + " ".join(x["t"] for x in l2)
+        data.append({"start": round(c[0]["s"], 2), "end": round(c[-1]["e"], 2),
+                     "text": text,
+                     "words": [{"t": x["t"], "s": round(x["s"], 2),
+                                "e": round(x["e"], 2)} for x in c]})
+    note = unique_out(f"{src.stem}_viral_cues", ".json")
+    note.write_text(json.dumps({"w": info["width"], "h": info["height"],
+                                "clusters": data}, ensure_ascii=False), encoding="utf-8")
+    _set(job_id, message=f"Phân tích xong — {len(data)} cụm (chỉnh tay rồi render)")
+    return [out_entry(note)]
+
+
+VIRAL_PRESETS_DIR = WORKSPACE / "presets"
+VIRAL_PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.get("/api/viral/presets")
+def viral_presets_list():
+    items = []
+    for f in sorted(VIRAL_PRESETS_DIR.glob("*.json")):
+        try:
+            items.append(json.loads(f.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return items
+
+
+class ViralPresetReq(BaseModel):
+    name: str
+    params: dict = {}
+
+
+@app.post("/api/viral/presets")
+def viral_preset_save(req: ViralPresetReq):
+    name = re.sub(r"[^\w\- ]+", "", req.name).strip()[:60]
+    if not name:
+        raise HTTPException(400, "Tên preset không hợp lệ")
+    data = {"name": name, "params": req.params}
+    (VIRAL_PRESETS_DIR / f"{name}.json").write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return data
 
 
 @app.post("/api/jobs/{job_id}/cancel")

@@ -237,3 +237,15 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;bac
 .dmsg{padding:9px 12px;border-radius:10px;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word}
 .dmsg.user{align-self:flex-end;background:var(--amberg);border:1px solid rgba(255,178,63,.35);max-width:88%}
 .dmsg.ai{align-self:flex-start;background:var(--p2);border:1px solid var(--line2);max-width:94%}
+/* v1.0: Phụ đề Viral — overlay preview + editor cụm */
+.canvas{container-type:size}
+.vcoverlay{position:absolute;left:6%;right:6%;text-align:center;pointer-events:none;
+  font-family:'Be Vietnam Pro','Montserrat',system-ui,sans-serif;font-weight:800;line-height:1.15}
+.vcline{color:#fff;-webkit-text-stroke:1px #000;paint-order:stroke fill;
+  text-shadow:0 0 2px #000;display:block}
+.vceditor{margin-top:12px;border-top:1px solid var(--line2);padding-top:10px}
+.vcrow{display:flex;gap:6px;align-items:center;margin-bottom:5px}
+.vcts{flex:0 0 46px;font-size:11px;color:var(--amber);border:1px solid var(--line2);border-radius:5px;padding:4px 0}
+.vcts:hover{background:var(--p3)}
+.vcrow input{flex:1;background:var(--p2);border:1px solid var(--line2);border-radius:6px;color:var(--ink);font-size:12.5px;padding:6px 8px;font-family:var(--ui)}
+.vcrow input:focus{outline:2px solid var(--amber);outline-offset:0}
