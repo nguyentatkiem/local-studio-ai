@@ -135,6 +135,35 @@ export async function fetchCuesJson(url: string): Promise<{ w: number; h: number
   return r.json();
 }
 
+export type ClaudeSettings = {
+  enabled: boolean; model: string; cli_present: boolean;
+  cli_path: string; model_aliases: string[];
+};
+
+export async function getClaudeSettings(): Promise<ClaudeSettings> {
+  const r = await fetch("/api/settings/claude");
+  if (!r.ok) throw new Error("Không đọc được cấu hình Claude");
+  return r.json();
+}
+
+export async function saveClaudeSettings(
+  patch: { enabled?: boolean; model?: string }
+): Promise<ClaudeSettings> {
+  const r = await fetch("/api/settings/claude", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!r.ok) throw new Error("Lưu cấu hình thất bại");
+  return r.json();
+}
+
+export async function testClaude(): Promise<{ ok: boolean; model: string; ms: number; reply: string }> {
+  const r = await fetch("/api/settings/claude/test", { method: "POST" });
+  const d = await r.json().catch(() => ({ detail: r.statusText }));
+  if (!r.ok) throw new Error(d.detail || "Test thất bại");
+  return d;
+}
+
 export async function cancelJob(id: string): Promise<void> {
   await fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
 }

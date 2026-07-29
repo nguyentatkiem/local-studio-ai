@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   askDirector, authStatus, cancelJob, createJob, fetchCuesJson, fmtDur, fmtSize,
-  getHealth, getJobs, getMedia, login, logout, openOutputs, resetDirector,
+  getClaudeSettings, getHealth, getJobs, getMedia, login, logout, openOutputs,
+  resetDirector, saveClaudeSettings, testClaude,
   uploadFile, viralAnalyze, type Health, type Job, type MediaItem, type ViralCluster,
 } from "./api";
+
+// Ngôn ngữ đích cho Dịch phụ đề AI
+const TR_LANGS: [string, string][] = [
+  ["en", "English"], ["vi", "Tiếng Việt"], ["zh", "中文 Chinese"], ["ja", "日本語 Japanese"],
+  ["ko", "한국어 Korean"], ["fr", "Français"], ["es", "Español"], ["de", "Deutsch"],
+  ["th", "ไทย Thai"], ["id", "Indonesia"], ["pt", "Português"], ["ru", "Русский"],
+];
 
 function LoginScreen({ onOk }: { onOk: () => void }) {
   const [pw, setPw] = useState("");
@@ -40,7 +48,7 @@ type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" |
   | "tts" | "reframe" | "speed" | "color" | "music" | "stabilize" | "export"
   | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
   | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll" | "viral"
-  | "pipeline";
+  | "translate" | "social_pack" | "pipeline";
 
 // Các bước có thể xếp vào Chuỗi tự động (nối tiếp output→input)
 type PipeStep = { type: string; params: Record<string, unknown> };
@@ -66,6 +74,8 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "director", icon: "🎬", name: "Đạo diễn AI (Claude)", desc: "ra lệnh bằng lời — Claude tự xếp job", gpu: false },
   { key: "highlights", icon: "🎯", name: "AI cắt Shorts từ video dài", desc: "AI chọn khoảnh khắc → shorts 9:16", gpu: true },
   { key: "broll", icon: "🎞️", name: "Ghép B-roll tự động (Pexels)", desc: "AI tải cảnh minh hoạ chèn theo lời nói", gpu: false },
+  { key: "translate", icon: "🌐", name: "Dịch phụ đề AI", desc: "Whisper → Claude dịch → .srt + cháy vào video", gpu: false },
+  { key: "social_pack", icon: "📢", name: "Tái chế nội dung (Claude)", desc: "1 video → tiêu đề, caption, tweet, LinkedIn...", gpu: false },
   { key: "auto_edit", icon: "✨", name: "Tự động dựng (AI 1 chạm)", desc: "cắt lặng → caption → preset · batch", gpu: false },
   { key: "merge", icon: "🎬", name: "Ghép clip + chuyển cảnh", desc: "xfade 10 hiệu ứng · chọn nhiều clip", gpu: false },
   { key: "beatsync", icon: "🥁", name: "Cắt theo nhịp nhạc", desc: "beat-sync kiểu CapCut · librosa", gpu: false },
@@ -211,6 +221,17 @@ export default function App() {
   const [fbMode, setFbMode] = useState("blur");
   const [fbStrength, setFbStrength] = useState(1.0);
   const [ctPlatform, setCtPlatform] = useState("youtube");
+  // Dịch phụ đề AI
+  const [trLang, setTrLang] = useState("en");
+  const [trBurn, setTrBurn] = useState(true);
+  // Settings — gói sub Claude
+  const [csEnabled, setCsEnabled] = useState(true);
+  const [csModel, setCsModel] = useState("sonnet");
+  const [csAliases, setCsAliases] = useState<string[]>(["haiku", "sonnet", "opus"]);
+  const [csPresent, setCsPresent] = useState(false);
+  const [csTest, setCsTest] = useState("");
+  const [csBusy, setCsBusy] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   const refreshMedia = useCallback(async () => {
     try { setMedia(await getMedia()); } catch { /* not up yet */ }
@@ -302,6 +323,31 @@ export default function App() {
         body: JSON.stringify({ workers: n }),
       });
     } catch { /* ignore */ }
+  };
+
+  // Settings — cấu hình gói sub Claude
+  const loadClaudeSettings = useCallback(async () => {
+    try {
+      const s = await getClaudeSettings();
+      setCsEnabled(s.enabled); setCsModel(s.model);
+      setCsAliases(s.model_aliases); setCsPresent(s.cli_present);
+    } catch { /* ignore */ }
+  }, []);
+  useEffect(() => { if (showSettings) { setCsTest(""); loadClaudeSettings(); } }, [showSettings, loadClaudeSettings]);
+  const applyClaude = async (patch: { enabled?: boolean; model?: string }) => {
+    try {
+      const s = await saveClaudeSettings(patch);
+      setCsEnabled(s.enabled); setCsModel(s.model);
+      setHealth(await getHealth());  // cập nhật feats (claude/translate...) theo trạng thái mới
+    } catch (e) { showToast("❌ " + String((e as Error).message)); }
+  };
+  const runClaudeTest = async () => {
+    setCsBusy(true); setCsTest("");
+    try {
+      const r = await testClaude();
+      setCsTest(`✅ ${r.model} · ${r.ms}ms · "${r.reply}"`);
+    } catch (e) { setCsTest("❌ " + String((e as Error).message)); }
+    finally { setCsBusy(false); }
   };
 
   // Chuỗi tự động: thêm/xoá/đổi chỗ/đổi tham số bước, rồi chạy 1 job nối tiếp
@@ -451,7 +497,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v1.1 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v1.2 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -461,9 +507,58 @@ export default function App() {
         <button className="btn pri" onClick={() => { setTool("export"); setRightTab("tool"); setLeftTab("ai"); }}>
           Xuất bản
         </button>
+        <button className="btn" title="Cài đặt gói sub Claude" onClick={() => setShowSettings(true)}>⚙️</button>
         <button className="btn" title="Đăng xuất admin"
           onClick={async () => { await logout(); setAuthed(false); }}>🔒</button>
       </header>
+
+      {showSettings && (
+        <div className="modal-bg" onClick={() => setShowSettings(false)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <b>⚙️ Cài đặt — Gói sub Claude</b>
+              <button className="btn" onClick={() => setShowSettings(false)}>✕</button>
+            </div>
+            <p className="logindesc" style={{ textAlign: "left", marginBottom: 12 }}>
+              Các tính năng AI (Đạo diễn, Dịch phụ đề, Tái chế nội dung, viết nội dung...)
+              dùng gói Claude bạn đã <b>đăng nhập sẵn trên máy</b> qua Claude Code CLI.
+              Chỉ văn bản (transcript) được gửi đi — video luôn nằm trên máy.
+            </p>
+            <div className="field">
+              <label>Claude CLI trên máy</label>
+              <div className={"csrow " + (csPresent ? "ok" : "bad")}>
+                {csPresent ? "✅ Đã phát hiện & đăng nhập" : "❌ Không thấy — cài Claude Code + đăng nhập rồi thử lại"}
+              </div>
+            </div>
+            <label className="chk"><input type="checkbox" checked={csEnabled}
+              onChange={(e) => { setCsEnabled(e.target.checked); applyClaude({ enabled: e.target.checked }); }} />
+              Bật Claude cho các tính năng AI (tắt = mọi thứ chạy Qwen local)</label>
+            <div className="field" style={{ marginTop: 10 }}>
+              <label>Model Claude</label>
+              <div className="seg">
+                {(csAliases.includes(csModel) ? csAliases : [...csAliases, csModel]).map((m) => (
+                  <button key={m} className={csModel === m ? "on" : ""}
+                    onClick={() => { setCsModel(m); applyClaude({ model: m }); }}>{m}</button>
+                ))}
+              </div>
+            </div>
+            <div className="field">
+              <label>…hoặc nhập model ID cụ thể</label>
+              <div style={{ display: "flex", gap: 6 }}>
+                <input className="logininput" style={{ flex: 1 }} placeholder="vd claude-opus-4-8"
+                  value={csModel} onChange={(e) => setCsModel(e.target.value)} />
+                <button className="btn" onClick={() => applyClaude({ model: csModel })}>Áp dụng</button>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 12 }}>
+              <button className="btn pri" disabled={csBusy || !csPresent} onClick={runClaudeTest}>
+                {csBusy ? "Đang gọi Claude..." : "🔌 Test kết nối"}
+              </button>
+              {csTest && <span className="logindesc" style={{ margin: 0 }}>{csTest}</span>}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ================= MID ================= */}
       <div className="mid">
@@ -548,6 +643,8 @@ export default function App() {
                      (t.key === "face_blur" && !feats.face_blur) ||
                      (t.key === "director" && !feats.director) ||
                      (t.key === "lesson" && !feats.lesson) ||
+                     (t.key === "translate" && !feats.translate) ||
+                     (t.key === "social_pack" && !feats.social_pack) ||
                      (t.key === "viral" && !feats.viral_caption) ||
                      (t.key === "pipeline" && !feats.export) ||
                      (["reframe", "speed", "color", "music", "stabilize",
@@ -1208,6 +1305,66 @@ export default function App() {
                   <button className="btn pri big" onClick={() => run("content", {
                     platform: ctPlatform, model: whModel, ai: aiEngine,
                   })}>📝 AI viết nội dung</button>
+                </>
+              )}
+
+              {tool === "translate" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🌐 Whisper nghe lời thoại → AI dịch (giữ đúng mốc thời gian) → xuất
+                    file .srt, tuỳ chọn cháy thẳng phụ đề dịch vào video. Video KHÔNG rời máy.
+                  </div>
+                  <div className="field"><label>Dịch sang</label>
+                    <select value={trLang} onChange={(e) => setTrLang(e.target.value)}>
+                      {TR_LANGS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                    </select>
+                  </div>
+                  <div className="field"><label>Model Whisper</label>
+                    <div className="seg">
+                      {["tiny", "base", "small", "large-v3-turbo"].map((m) => (
+                        <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <label className="chk"><input type="checkbox" checked={trBurn} onChange={(e) => setTrBurn(e.target.checked)} />Cháy phụ đề dịch vào video (.mp4)</label>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI dịch</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <button className="btn pri big" onClick={() => run("translate", {
+                    target_lang: trLang, model: whModel, ai: aiEngine, burn: trBurn,
+                  })}>🌐 Dịch phụ đề</button>
+                </>
+              )}
+
+              {tool === "social_pack" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    📢 1 video → AI sinh trọn bộ đăng: 5 tiêu đề, mô tả SEO, caption
+                    TikTok, tweet thread, bài LinkedIn, đoạn cắt short & câu trích dẫn — file .md.
+                  </div>
+                  <div className="field"><label>Model Whisper</label>
+                    <div className="seg">
+                      {["tiny", "base", "small"].map((m) => (
+                        <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <button className="btn pri big" onClick={() => run("social_pack", {
+                    model: whModel, ai: aiEngine,
+                  })}>📢 Tái chế nội dung</button>
                 </>
               )}
 

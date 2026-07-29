@@ -1736,18 +1736,58 @@ def llm_available() -> bool:
 CLAUDE_BIN = shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
 _CLAUDE_SEM = threading.Semaphore(2)  # trần số lệnh Claude song song
 
+# Cấu hình gói sub Claude do NGƯỜI DÙNG đặt trong Settings (bật/tắt + chọn model).
+# Model nhận alias (haiku/sonnet/opus) hoặc ID cụ thể; mặc định theo LS_CLAUDE_MODEL.
+CLAUDE_CFG_FILE = BACKEND_DIR / "claude_config.json"
+CLAUDE_MODEL_ALIASES = ["haiku", "sonnet", "opus"]
+
+
+def _sanitize_model(m: str) -> str:
+    m = re.sub(r"[^A-Za-z0-9._-]", "", str(m or "")).strip()[:60]
+    return m or "sonnet"
+
+
+def _load_claude_cfg() -> dict:
+    cfg = {"enabled": True,
+           "model": _sanitize_model(os.environ.get("LS_CLAUDE_MODEL", "sonnet"))}
+    if CLAUDE_CFG_FILE.exists():
+        try:
+            data = json.loads(CLAUDE_CFG_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cfg["enabled"] = bool(data.get("enabled", cfg["enabled"]))
+                cfg["model"] = _sanitize_model(data.get("model", cfg["model"]))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return cfg
+
+
+CLAUDE_CFG = _load_claude_cfg()
+
+
+def _save_claude_cfg():
+    try:
+        CLAUDE_CFG_FILE.write_text(json.dumps(CLAUDE_CFG), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def claude_cli_present() -> bool:
+    """CLI Claude có trên máy (không xét bật/tắt) — dùng cho nút Test kết nối."""
+    return bool(CLAUDE_BIN) and Path(CLAUDE_BIN).exists()
+
 
 def claude_available() -> bool:
-    return bool(CLAUDE_BIN) and Path(CLAUDE_BIN).exists()
+    """Claude sẵn sàng để tính năng dùng: CLI có + người dùng đang BẬT trong Settings."""
+    return claude_cli_present() and CLAUDE_CFG.get("enabled", True)
 
 
 def claude_generate(prompt: str, job_id: str = None, model: str = None,
                     timeout: int = 420) -> str:
     """Gọi Claude bằng gói sub của người dùng (claude -p, prompt qua stdin).
     Video không rời máy — chỉ văn bản trong prompt được gửi đi."""
-    if not claude_available():
+    if not claude_cli_present():
         raise RuntimeError("Chưa cài / chưa đăng nhập Claude Code CLI trên máy")
-    model = model or os.environ.get("LS_CLAUDE_MODEL", "sonnet")
+    model = model or CLAUDE_CFG.get("model") or "sonnet"
     # BẢO MẬT: --tools "" vô hiệu hoá MỌI tool của Claude Code — prompt chứa
     # input người dùng + tên file (không tin cậy), nên agent chỉ được sinh text,
     # KHÔNG được chạy Bash/Read/Write dù prompt có bị tiêm chỉ thị độc.
@@ -2127,6 +2167,132 @@ def job_content(job_id: str, src: Path, p: dict):
     out.write_text(f"# Nội dung cho: {src.name} ({platform})\n\n{content}\n",
                    encoding="utf-8")
     _set(job_id, message=f"Xong — tiêu đề/mô tả/hashtags{' /chapters' if chapters_req else ''}")
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: Dịch phụ đề AI
+LANG_NAMES = {
+    "en": "English", "vi": "Tiếng Việt", "zh": "中文 (Chinese giản thể)",
+    "ja": "日本語 (Japanese)", "ko": "한국어 (Korean)", "fr": "Français",
+    "es": "Español", "de": "Deutsch", "th": "ภาษาไทย (Thai)",
+    "id": "Bahasa Indonesia", "pt": "Português", "ru": "Русский",
+}
+
+
+def _ai_translate_lines(texts: list, target_name: str, engine: str,
+                        job_id: str, batch: int = 120) -> list:
+    """Dịch danh sách câu qua Claude/LLM theo lô, GIỮ đúng số dòng & thứ tự.
+    Câu nào AI bỏ sót → giữ nguyên bản gốc (không lệch mốc thời gian)."""
+    out = []
+    for i in range(0, len(texts), batch):
+        chunk = texts[i:i + batch]
+        numbered = "\n".join(f"{k + 1}. {t}" for k, t in enumerate(chunk))
+        prompt = (
+            f"Dịch các câu phụ đề sau sang {target_name}. Dịch tự nhiên, ngắn gọn "
+            f"hợp phụ đề, KHÔNG thêm chú thích hay đánh số. Giữ NGUYÊN số lượng và "
+            f"thứ tự câu.\nTrả về DUY NHẤT một JSON dạng "
+            f'{{"lines": ["bản dịch câu 1", "bản dịch câu 2", ...]}} '
+            f"đúng {len(chunk)} phần tử.\n\n{numbered}")
+        raw = llm_generate(prompt, max_tokens=4000, job_id=job_id, engine=engine)
+        arr = None
+        try:
+            data = _extract_json(raw)
+            arr = data.get("lines") if isinstance(data, dict) else data
+        except ValueError:
+            arr = None
+        if not isinstance(arr, list):
+            arr = []
+        arr = [str(x).strip() for x in arr][:len(chunk)]
+        while len(arr) < len(chunk):        # AI trả thiếu → chèn câu gốc
+            arr.append(chunk[len(arr)])
+        out.extend(arr)
+        _cancel_point(job_id)
+    return out
+
+
+def job_translate(job_id: str, src: Path, p: dict):
+    """Dịch phụ đề AI: Whisper nhận dạng → Claude/LLM dịch (giữ mốc thời gian) →
+    xuất .srt (+ .mp4 cháy phụ đề nếu chọn). Video KHÔNG rời máy, chỉ text đi Claude."""
+    info = media_info(src)
+    dur = info["duration"] or 1
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    src_lang = p.get("source_lang") if p.get("source_lang") in ("vi", "en") else None
+    target = p.get("target_lang") if p.get("target_lang") in LANG_NAMES else "en"
+    seg_list, _l, lang = _speech_recognize(
+        job_id, src, model_size, src_lang, p.get("engine"), dur, 3, 55)
+    segs = [s for s in seg_list if s.text.strip()]
+    if not segs:
+        raise RuntimeError("Video không có lời thoại để dịch")
+    _cancel_point(job_id)
+
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+    brain = "Claude (gói sub)" if ai == "claude" else "Qwen3 local"
+    tgt_name = LANG_NAMES[target]
+    _set(job_id, progress=60, message=f"AI ({brain}) đang dịch {len(segs)} câu sang {tgt_name}...")
+    translated = _ai_translate_lines([s.text.strip() for s in segs], tgt_name, ai, job_id)
+    _cancel_point(job_id)
+
+    srt = unique_out(f"{src.stem}_{target}", ".srt")
+    blocks = [f"{i}\n{srt_ts(s.start)} --> {srt_ts(s.end)}\n{t}\n"
+              for i, (s, t) in enumerate(zip(segs, translated), 1)]
+    srt.write_text("\n".join(blocks), encoding="utf-8")
+    outputs = [out_entry(srt)]
+
+    if p.get("burn") and info["width"]:
+        _set(job_id, progress=88, message="Cháy phụ đề bản dịch vào video...")
+        burned = unique_out(f"{src.stem}_{target}_sub", ".mp4")
+        # cwd=OUTPUTS để tên .srt tương đối né escape path; libass mượn font hệ (phủ CJK)
+        style = "Fontsize=18,Outline=1,Shadow=0,MarginV=28"
+        cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
+               "-vf", f"subtitles={srt.name}:force_style='{style}'",
+               "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+               "-c:a", "aac", "-b:a", "192k", str(burned)]
+        r = _run_tracked(job_id, cmd, cwd=str(OUTPUTS))
+        if r.returncode == 0 and burned.exists():
+            outputs.insert(0, out_entry(burned))
+    _set(job_id, message=f"Xong — dịch {len(segs)} câu sang {tgt_name} (.srt"
+         + (" + video" if len(outputs) > 1 else "") + ")")
+    return outputs
+
+
+# ---------------------------------------------------------------- job: Tái chế nội dung (social)
+def job_social_pack(job_id: str, src: Path, p: dict):
+    """Bộ tái chế nội dung 1 chạm: video dài → Claude sinh gói đăng đa nền tảng
+    (tiêu đề, mô tả, hashtag, caption, tweet thread, LinkedIn, đoạn cắt, trích dẫn)."""
+    info = media_info(src)
+    dur = info["duration"] or 1
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    language = p.get("language") if p.get("language") in ("vi", "en") else None
+    seg_list, _l, lang = _speech_recognize(
+        job_id, src, model_size, language, p.get("engine"), dur, 3, 60)
+    lines = _transcript_lines(seg_list)
+    if not lines:
+        raise RuntimeError("Video không có lời thoại để tái chế")
+    _cancel_point(job_id)
+
+    text_all = "\n".join(lines)
+    if len(text_all) > 16000:
+        text_all = text_all[:10000] + "\n[...phần giữa lược bớt...]\n" + text_all[-5000:]
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+    brain = "Claude (gói sub)" if ai == "claude" else "Qwen3 local"
+    _set(job_id, progress=65, message=f"AI ({brain}) đang tái chế nội dung...")
+    prompt = (
+        f"Bạn là chuyên gia repurpose nội dung mạng xã hội người Việt. Transcript "
+        f"video ({dur:.0f}s, ngôn ngữ {lang}), có mốc [giây]:\n\n{text_all}\n\n"
+        "Viết bằng tiếng Việt, định dạng Markdown, ĐÚNG các mục sau:\n"
+        "## 1. Tiêu đề — 5 phương án giật hook (≤70 ký tự)\n"
+        "## 2. Mô tả YouTube — SEO 2-4 câu + CTA, kèm 10 hashtag\n"
+        "## 3. Caption TikTok/Reels — 2-3 câu + emoji + 5 hashtag\n"
+        "## 4. Tweet/X thread — 5-7 tweet đánh số, mỗi tweet ≤270 ký tự\n"
+        "## 5. Bài LinkedIn — đoạn ngắn chuyên nghiệp + 3 hashtag\n"
+        "## 6. 3 đoạn nên cắt short — 'mm:ss–mm:ss + lý do viral' (dựa mốc giây)\n"
+        "## 7. 5 câu trích dẫn đắt giá (quotable) rút từ video")
+    content = llm_generate(prompt, max_tokens=2600, job_id=job_id, engine=ai)
+    _cancel_point(job_id)
+    out = unique_out(f"{src.stem}_social", ".md")
+    out.write_text(f"# Bộ tái chế nội dung — {src.name}\n\n> Bộ não: {brain}\n\n{content}\n",
+                   encoding="utf-8")
+    _set(job_id, message="Xong — gói đăng đa nền tảng (.md)")
     return [out_entry(out)]
 
 
@@ -2961,7 +3127,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -2993,6 +3159,8 @@ def health():
             "director": claude_available(),
             "highlights": (llm_available() or claude_available()) and whisper_ok and ffmpeg_ok,
             "content": (llm_available() or claude_available()) and whisper_ok,
+            "translate": whisper_ok and (llm_available() or claude_available()),
+            "social_pack": whisper_ok and (llm_available() or claude_available()),
             "face_blur": cv2_available() and YUNET_ONNX.exists() and ffmpeg_ok,
             "lesson": (llm_available() or claude_available()) and whisper_ok,
             "ailms": ailms_available(),
@@ -3339,6 +3507,18 @@ def create_job(req: JobRequest):
         if not llm_available() and not claude_available():
             raise HTTPException(400, "Cần mlx-lm (LLM local) hoặc Claude CLI trên máy chủ")
         return submit_job("content", src.name, job_content, src, dict(p))
+    if req.type == "translate":
+        if not whisper_available_any():
+            raise HTTPException(400, "Cần whisper (faster/MLX) để nhận dạng lời nói")
+        if not llm_available() and not claude_available():
+            raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm (LLM local) để dịch")
+        return submit_job("translate", src.name, job_translate, src, dict(p))
+    if req.type == "social_pack":
+        if not whisper_available_any():
+            raise HTTPException(400, "Cần whisper (faster/MLX) để nhận dạng lời nói")
+        if not llm_available() and not claude_available():
+            raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm (LLM local)")
+        return submit_job("social_pack", src.name, job_social_pack, src, dict(p))
     if req.type == "face_blur":
         mode = p.get("mode", "blur")
         if mode not in ("blur", "pixelate"):
@@ -3599,6 +3779,51 @@ class WorkersReq(BaseModel):
 def set_workers(req: WorkersReq):
     """Chỉnh số job chạy song song (1-4)."""
     return {"workers": set_worker_limit(req.workers)}
+
+
+# ---------------------------------------------------------------- Settings: gói sub Claude
+class ClaudeSettingsReq(BaseModel):
+    enabled: Optional[bool] = None
+    model: Optional[str] = None
+
+
+def _claude_settings_payload() -> dict:
+    return {"enabled": bool(CLAUDE_CFG.get("enabled", True)),
+            "model": CLAUDE_CFG.get("model", "sonnet"),
+            "cli_present": claude_cli_present(),
+            "cli_path": CLAUDE_BIN,
+            "model_aliases": CLAUDE_MODEL_ALIASES}
+
+
+@app.get("/api/settings/claude")
+def get_claude_settings():
+    return _claude_settings_payload()
+
+
+@app.post("/api/settings/claude")
+def save_claude_settings(req: ClaudeSettingsReq):
+    if req.enabled is not None:
+        CLAUDE_CFG["enabled"] = bool(req.enabled)
+    if req.model is not None:
+        CLAUDE_CFG["model"] = _sanitize_model(req.model)
+    _save_claude_cfg()
+    return _claude_settings_payload()
+
+
+@app.post("/api/settings/claude/test")
+def test_claude_settings():
+    """Chạy 1 lệnh Claude nhỏ để kiểm tra gói sub còn đăng nhập + đo độ trễ.
+    Chạy được cả khi đang TẮT (để người dùng thử trước khi bật)."""
+    if not claude_cli_present():
+        raise HTTPException(400, "Không thấy Claude CLI trên máy (cài Claude Code + đăng nhập)")
+    t0 = time.time()
+    try:
+        reply = claude_generate("Trả lời đúng 1 từ: OK", model=CLAUDE_CFG.get("model"),
+                                timeout=60)
+    except RuntimeError as e:
+        raise HTTPException(400, f"Gọi Claude thất bại: {str(e)[:200]}")
+    return {"ok": True, "model": CLAUDE_CFG.get("model"),
+            "ms": int((time.time() - t0) * 1000), "reply": (reply or "").strip()[:80]}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
