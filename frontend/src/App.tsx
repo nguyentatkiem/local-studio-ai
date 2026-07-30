@@ -48,7 +48,7 @@ type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" |
   | "tts" | "reframe" | "speed" | "color" | "music" | "stabilize" | "export"
   | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
   | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll" | "viral"
-  | "translate" | "social_pack" | "pipeline";
+  | "translate" | "social_pack" | "dub" | "qc" | "script" | "thumbnail" | "pipeline";
 
 // Các bước có thể xếp vào Chuỗi tự động (nối tiếp output→input)
 type PipeStep = { type: string; params: Record<string, unknown> };
@@ -76,6 +76,10 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "broll", icon: "🎞️", name: "Ghép B-roll tự động (Pexels)", desc: "AI tải cảnh minh hoạ chèn theo lời nói", gpu: false },
   { key: "translate", icon: "🌐", name: "Dịch phụ đề AI", desc: "Whisper → Claude dịch → .srt + cháy vào video", gpu: false },
   { key: "social_pack", icon: "📢", name: "Tái chế nội dung (Claude)", desc: "1 video → tiêu đề, caption, tweet, LinkedIn...", gpu: false },
+  { key: "dub", icon: "🎙️", name: "Lồng tiếng AI", desc: "dịch → Piper đọc tiếng đích → thay track (vi/en)", gpu: false },
+  { key: "qc", icon: "🔍", name: "QC video AI (Claude)", desc: "soi filler/khoảng chết → báo cáo + tự cắt", gpu: false },
+  { key: "script", icon: "✍️", name: "Bác sĩ kịch bản (Claude)", desc: "viết lại lời + hook + teleprompter", gpu: false },
+  { key: "thumbnail", icon: "🖼️", name: "Claude chọn Thumbnail", desc: "Claude nhìn khung hình → chấm ảnh bìa giật view", gpu: false },
   { key: "auto_edit", icon: "✨", name: "Tự động dựng (AI 1 chạm)", desc: "cắt lặng → caption → preset · batch", gpu: false },
   { key: "merge", icon: "🎬", name: "Ghép clip + chuyển cảnh", desc: "xfade 10 hiệu ứng · chọn nhiều clip", gpu: false },
   { key: "beatsync", icon: "🥁", name: "Cắt theo nhịp nhạc", desc: "beat-sync kiểu CapCut · librosa", gpu: false },
@@ -224,6 +228,10 @@ export default function App() {
   // Dịch phụ đề AI
   const [trLang, setTrLang] = useState("en");
   const [trBurn, setTrBurn] = useState(true);
+  // Lồng tiếng / QC / Thumbnail
+  const [dubVoice, setDubVoice] = useState("vi");
+  const [qcAutocut, setQcAutocut] = useState(true);
+  const [thumbCount, setThumbCount] = useState(6);
   // Settings — gói sub Claude
   const [csEnabled, setCsEnabled] = useState(true);
   const [csModel, setCsModel] = useState("sonnet");
@@ -497,7 +505,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v1.2 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v1.3 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -645,6 +653,10 @@ export default function App() {
                      (t.key === "lesson" && !feats.lesson) ||
                      (t.key === "translate" && !feats.translate) ||
                      (t.key === "social_pack" && !feats.social_pack) ||
+                     (t.key === "dub" && !feats.dub) ||
+                     (t.key === "qc" && !feats.qc) ||
+                     (t.key === "script" && !feats.script) ||
+                     (t.key === "thumbnail" && !feats.thumbnail) ||
                      (t.key === "viral" && !feats.viral_caption) ||
                      (t.key === "pipeline" && !feats.export) ||
                      (["reframe", "speed", "color", "music", "stabilize",
@@ -1365,6 +1377,111 @@ export default function App() {
                   <button className="btn pri big" onClick={() => run("social_pack", {
                     model: whModel, ai: aiEngine,
                   })}>📢 Tái chế nội dung</button>
+                </>
+              )}
+
+              {tool === "dub" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎙️ Nghe lời gốc → AI dịch → Piper đọc tiếng đích → khớp thời gian
+                    từng câu, thay track âm thanh (giữ nguyên hình). Giọng Piper: Việt/Anh.
+                  </div>
+                  <div className="field"><label>Giọng đọc đích</label>
+                    <div className="seg">
+                      <button className={dubVoice === "vi" ? "on" : ""} onClick={() => setDubVoice("vi")}>🇻🇳 Tiếng Việt</button>
+                      <button className={dubVoice === "en" ? "on" : ""} onClick={() => setDubVoice("en")}>🇺🇸 English</button>
+                    </div>
+                  </div>
+                  <div className="field"><label>Model Whisper</label>
+                    <div className="seg">
+                      {["tiny", "base", "small", "large-v3-turbo"].map((m) => (
+                        <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI dịch</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <button className="btn pri big" onClick={() => run("dub", {
+                    voice: dubVoice, model: whModel, ai: aiEngine,
+                  })}>🎙️ Lồng tiếng</button>
+                </>
+              )}
+
+              {tool === "qc" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🔍 Claude soi transcript: gắn mốc chỗ có khoảng chết, câu ề à, lạc đề,
+                    lặp ý → báo cáo .md kèm điểm. Bật "tự cắt" để xuất luôn bản đã gọt.
+                  </div>
+                  <label className="chk"><input type="checkbox" checked={qcAutocut} onChange={(e) => setQcAutocut(e.target.checked)} />Tự cắt bỏ đoạn lỗi → xuất video mới</label>
+                  <div className="field" style={{ marginTop: 8 }}><label>Model Whisper</label>
+                    <div className="seg">
+                      {["tiny", "base", "small"].map((m) => (
+                        <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <button className="btn pri big" onClick={() => run("qc", {
+                    model: whModel, ai: aiEngine, autocut: qcAutocut,
+                  })}>🔍 Soi & QC video</button>
+                </>
+              )}
+
+              {tool === "script" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    ✍️ Claude nghe lời gốc rồi viết lại kịch bản cho gọn/cuốn, thêm hook
+                    mở đầu, bản teleprompter dễ đọc khi quay & gợi ý chèn B-roll — file .md.
+                  </div>
+                  <div className="field"><label>Model Whisper</label>
+                    <div className="seg">
+                      {["tiny", "base", "small"].map((m) => (
+                        <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <button className="btn pri big" onClick={() => run("script", {
+                    model: whModel, ai: aiEngine,
+                  })}>✍️ Biên tập kịch bản</button>
+                </>
+              )}
+
+              {tool === "thumbnail" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🖼️ Trích nhiều khung hình → Claude (thị giác) xem & chấm khung "giật
+                    view" nhất làm ảnh bìa .jpg. Chỉ các khung hình rời máy, video thì không.
+                  </div>
+                  <div className="field"><label>Số khung để Claude chấm: {thumbCount}</label>
+                    <input type="range" min={4} max={10} step={1} value={thumbCount}
+                      onChange={(e) => setThumbCount(Number(e.target.value))} style={{ width: "100%" }} />
+                  </div>
+                  {!feats.thumbnail && <div className="hint">⚠ Cần bật Claude trong ⚙ Cài đặt (tính năng thị giác).</div>}
+                  <button className="btn pri big" disabled={!feats.thumbnail} onClick={() => run("thumbnail", {
+                    count: thumbCount,
+                  })}>🖼️ Claude chọn thumbnail</button>
                 </>
               )}
 

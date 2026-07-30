@@ -1150,6 +1150,25 @@ def job_tts(job_id: str, text: str, voice: str, speed: float):
     return outputs
 
 
+def _piper_synth(job_id: str, text: str, voice: str, out_wav: Path,
+                 length_scale: float = 1.0):
+    """Tổng hợp 1 đoạn giọng Piper ra out_wav (dùng cho lồng tiếng theo câu)."""
+    onnx = PIPER_VOICES_DIR / PIPER_VOICE_MAP[voice]
+    if not onnx.exists():
+        raise RuntimeError(f"Chưa tải giọng Piper '{voice}'")
+    cmd = [sys.executable, "-m", "piper", "-m", str(onnx), "-f", str(out_wav)]
+    if abs(length_scale - 1.0) > 0.01:
+        cmd += ["--length-scale", str(round(length_scale, 2))]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", errors="replace")
+    if job_id:
+        _track_proc(job_id, proc)
+    _, se = proc.communicate(input=(text or " "))
+    if proc.returncode != 0 or not out_wav.exists():
+        raise RuntimeError(f"Piper TTS lỗi: {(se or '')[-300:]}")
+
+
 # ---------------------------------------------------------------- job: auto edit (AI 1 chạm)
 def job_auto_edit(job_id: str, src: Path, p: dict):
     """Pipeline AI tự động: cắt khoảng lặng → caption karaoke → xuất preset.
@@ -1822,6 +1841,41 @@ def claude_generate(prompt: str, job_id: str = None, model: str = None,
     return env.get("result") or ""
 
 
+def claude_vision(prompt: str, image_dir: Path, job_id: str = None,
+                  model: str = None, timeout: int = 180) -> str:
+    """Claude 'nhìn' ảnh cục bộ: bật Read + --add-dir GIỚI HẠN đúng thư mục ảnh.
+    An toàn vì prompt do SERVER soạn (không nhồi text người dùng) và Read chỉ mở
+    được đúng 1 thư mục khung hình. Chỉ ảnh (frame) rời máy, video thì không."""
+    if not claude_cli_present():
+        raise RuntimeError("Chưa cài / chưa đăng nhập Claude Code CLI trên máy")
+    model = model or CLAUDE_CFG.get("model") or "sonnet"
+    with _CLAUDE_SEM:
+        proc = subprocess.Popen(
+            [CLAUDE_BIN, "-p", "--output-format", "json", "--model", model,
+             "--allowedTools", "Read", "--add-dir", str(image_dir)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace")
+        if job_id:
+            _track_proc(job_id, proc)
+        try:
+            so, se = proc.communicate(input=prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(f"Claude Vision không phản hồi sau {timeout}s")
+    if job_id:
+        _cancel_point(job_id)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Claude Vision lỗi: {(se or so)[-400:]}")
+    try:
+        env = json.loads(so)
+    except json.JSONDecodeError:
+        return so
+    if isinstance(env, dict) and env.get("is_error"):
+        raise RuntimeError(f"Claude trả lỗi: {str(env.get('result'))[:300]}")
+    return (env.get("result") if isinstance(env, dict) else str(env)) or ""
+
+
 def llm_generate(prompt: str, max_tokens: int = 1500, job_id: str = None,
                  engine: str = "local") -> str:
     """Router não AI: 'claude' → gói sub qua CLI; 'local' → Qwen3 4B MLX.
@@ -2294,6 +2348,289 @@ def job_social_pack(job_id: str, src: Path, p: dict):
                    encoding="utf-8")
     _set(job_id, message="Xong — gói đăng đa nền tảng (.md)")
     return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: Lồng tiếng AI (dub)
+def job_dub(job_id: str, src: Path, p: dict):
+    """Lồng tiếng AI đa ngôn ngữ: Whisper → Claude/LLM dịch → Piper đọc tiếng đích
+    → khớp thời gian từng câu (atempo theo ô) → thay track âm thanh. Giọng: vi/en."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình để lồng tiếng")
+    dur = info["duration"] or 1
+    voice = p.get("voice") if p.get("voice") in PIPER_VOICE_MAP else "vi"
+    if not (PIPER_VOICES_DIR / PIPER_VOICE_MAP[voice]).exists():
+        raise RuntimeError(f"Chưa tải giọng Piper '{voice}'")
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    src_lang = p.get("source_lang") if p.get("source_lang") in ("vi", "en") else None
+    seg_list, _l, lang = _speech_recognize(
+        job_id, src, model_size, src_lang, p.get("engine"), dur, 3, 45)
+    segs = [s for s in seg_list if s.text.strip()]
+    if not segs:
+        raise RuntimeError("Video không có lời thoại để lồng tiếng")
+    _cancel_point(job_id)
+
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+    tgt_name = LANG_NAMES.get(voice, voice)
+    _set(job_id, progress=48, message=f"Dịch {len(segs)} câu sang {tgt_name}...")
+    translated = _ai_translate_lines([s.text.strip() for s in segs], tgt_name, ai, job_id)
+    _cancel_point(job_id)
+
+    tmp, inputs, parts, idx = [], ["-i", str(src)], [], 0
+    try:
+        for i, (s, t) in enumerate(zip(segs, translated)):
+            if not t.strip():
+                continue
+            _cancel_point(job_id)
+            _set(job_id, progress=48 + int(i / len(segs) * 38),
+                 message=f"Piper đọc câu {i + 1}/{len(segs)}...")
+            raw = TMP / f"dub_{job_id}_{i}.wav"
+            _piper_synth(job_id, t.strip(), voice, raw)
+            tmp.append(raw)
+            d = media_info(raw)["duration"] or 0.5
+            slot = max(0.3, s.end - s.start)
+            tempo = min(2.0, max(0.5, d / slot))        # co/giãn cho vừa ô thời gian gốc
+            idx += 1
+            inputs += ["-i", str(raw)]
+            parts.append(f"[{idx}:a]atempo={tempo:.3f},"
+                         f"adelay={int(s.start * 1000)}:all=1[d{idx}]")
+        if idx == 0:
+            raise RuntimeError("Không tổng hợp được câu giọng nào")
+        mix = "".join(f"[d{k}]" for k in range(1, idx + 1))
+        fc = (";".join(parts) + f";{mix}amix=inputs={idx}:normalize=0,"
+              f"alimiter=limit=0.9,atrim=0:{dur:.3f}[aout]")
+        out = unique_out(f"{src.stem}_dub_{voice}", ".mp4")
+        vcopy = (info.get("vcodec") or "") in ("h264", "hevc", "mpeg4", "av1")
+        vopts = ["-c:v", "copy"] if vcopy else \
+            ["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p"]
+        cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error"] + inputs + \
+              ["-filter_complex", fc, "-map", "0:v", "-map", "[aout]"] + vopts + \
+              ["-c:a", "aac", "-b:a", "192k", str(out)]
+        r = _run_tracked(job_id, cmd)
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Ghép lồng tiếng thất bại: {r.stderr_text[-400:]}")
+    finally:
+        for f in tmp:
+            f.unlink(missing_ok=True)
+    _set(job_id, message=f"Xong — lồng tiếng {tgt_name} ({idx} câu, giữ hình gốc)")
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: QC video AI
+QC_TYPES_CUT = {"dead_air", "filler", "off_topic", "repetition"}
+
+
+def _cut_and_concat(job_id: str, src: Path, keep: list, out: Path, has_audio: bool):
+    """Cắt các đoạn GIỮ LẠI (native res) rồi nối — dùng cho QC auto-cut."""
+    tmp, lst = [], TMP / f"qc_{job_id}.txt"
+    try:
+        for i, (a, b) in enumerate(keep):
+            clip = TMP / f"qc_{job_id}_{i}.mp4"
+            cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                   "-ss", f"{a:.3f}", "-to", f"{b:.3f}", "-i", str(src),
+                   "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                   "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+                   "-pix_fmt", "yuv420p"]
+            cmd += (["-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k"]
+                    if has_audio else ["-an"])
+            cmd += [str(clip)]
+            r = _run_tracked(job_id, cmd)
+            if r.returncode == 0 and clip.exists():
+                tmp.append(clip)
+        if not tmp:
+            raise RuntimeError("Không cắt được đoạn nào")
+        lst.write_text("".join(f"file '{c.as_posix()}'\n" for c in tmp), encoding="utf-8")
+        r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                  "-f", "concat", "-safe", "0", "-i", str(lst),
+                                  "-c", "copy", str(out)])
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Nối đoạn thất bại: {r.stderr_text[-300:]}")
+    finally:
+        lst.unlink(missing_ok=True)
+        for c in tmp:
+            c.unlink(missing_ok=True)
+
+
+def job_qc(job_id: str, src: Path, p: dict):
+    """QC video AI: Claude soi transcript, gắn timestamp lỗi (khoảng chết, filler,
+    lạc đề, lặp, thô tục) → báo cáo .md; tuỳ chọn tự cắt bỏ các đoạn lỗi."""
+    info = media_info(src)
+    dur = info["duration"] or 1
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    language = p.get("language") if p.get("language") in ("vi", "en") else None
+    seg_list, _l, lang = _speech_recognize(
+        job_id, src, model_size, language, p.get("engine"), dur, 3, 55)
+    lines = _transcript_lines(seg_list)
+    if not lines:
+        raise RuntimeError("Video không có lời thoại để soi")
+    _cancel_point(job_id)
+
+    text_all = "\n".join(lines)
+    if len(text_all) > 16000:
+        text_all = text_all[:10000] + "\n[...lược giữa...]\n" + text_all[-5000:]
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+    brain = "Claude (gói sub)" if ai == "claude" else "Qwen3 local"
+    _set(job_id, progress=62, message=f"AI ({brain}) đang soi lỗi video...")
+    prompt = (
+        f"Bạn là biên tập viên video khó tính. Dưới đây là transcript video ({dur:.0f}s) "
+        f"với mốc [giây bắt đầu-kết thúc]:\n\n{text_all}\n\n"
+        "Tìm các đoạn nên sửa/cắt: khoảng chết, câu ề à/filler (ừm, à, kiểu như), "
+        "lạc đề, lặp ý, từ thô tục. Trả về DUY NHẤT JSON:\n"
+        '{"score": <điểm 1-10>, "summary": "<nhận xét chung 1-2 câu>", '
+        '"issues": [{"start": <giây>, "end": <giây>, '
+        '"type": "dead_air|filler|off_topic|repetition|profanity", '
+        '"note": "<mô tả ngắn>"}]}')
+    raw = llm_generate(prompt, max_tokens=2500, job_id=job_id, engine=ai)
+    _cancel_point(job_id)
+    try:
+        data = _extract_json(raw)
+    except ValueError:
+        data = {"score": 0, "summary": raw[:300], "issues": []}
+    issues = data.get("issues") if isinstance(data, dict) else []
+    issues = [x for x in (issues or []) if isinstance(x, dict)]
+
+    md = [f"# Báo cáo QC — {src.name}", f"\n> Bộ não: {brain} · thời lượng {dur:.0f}s",
+          f"\n**Điểm tổng:** {data.get('score', '?')}/10  ",
+          f"\n**Nhận xét:** {data.get('summary', '')}\n", "## Các điểm cần sửa\n"]
+    if issues:
+        md.append("| Mốc | Loại | Ghi chú |\n|---|---|---|")
+        for x in issues:
+            a = _safe_float(x.get("start"), 0)
+            b = _safe_float(x.get("end"), a)
+            md.append(f"| {srt_ts(a)[:-4]}–{srt_ts(b)[:-4]} | {x.get('type', '?')} "
+                      f"| {str(x.get('note', '')).replace(chr(124), '/')} |")
+    else:
+        md.append("_Không phát hiện lỗi rõ ràng._")
+    report = unique_out(f"{src.stem}_qc", ".md")
+    report.write_text("\n".join(md) + "\n", encoding="utf-8")
+    outputs = [out_entry(report)]
+
+    if p.get("autocut") and info["width"]:
+        cut = [(_safe_float(x.get("start"), 0), _safe_float(x.get("end"), 0))
+               for x in issues if x.get("type") in QC_TYPES_CUT]
+        cut = sorted((max(0, a), min(dur, b)) for a, b in cut if b - a > 0.15)
+        # gộp các khoảng chồng nhau rồi lấy PHẦN BÙ (đoạn giữ lại)
+        merged = []
+        for a, b in cut:
+            if merged and a <= merged[-1][1] + 0.05:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+            else:
+                merged.append((a, b))
+        keep, pos = [], 0.0
+        for a, b in merged:
+            if a - pos > 0.4:
+                keep.append((pos, a))
+            pos = max(pos, b)
+        if dur - pos > 0.4:
+            keep.append((pos, dur))
+        if keep and merged:
+            _set(job_id, progress=80, message=f"Tự cắt bỏ {len(merged)} đoạn lỗi...")
+            out = unique_out(f"{src.stem}_qc_cut", ".mp4")
+            _cut_and_concat(job_id, src, keep, out, bool(info["has_audio"]))
+            if out.exists():
+                outputs.insert(0, out_entry(out))
+    _set(job_id, message=f"Xong — QC {len(issues)} điểm"
+         + (" + video đã cắt" if len(outputs) > 1 else ""))
+    return outputs
+
+
+# ---------------------------------------------------------------- job: Bác sĩ kịch bản
+def job_script(job_id: str, src: Path, p: dict):
+    """Bác sĩ kịch bản: Claude viết lại lời thoại cho gọn/cuốn + bản teleprompter
+    + gợi ý B-roll — xuất .md."""
+    info = media_info(src)
+    dur = info["duration"] or 1
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    language = p.get("language") if p.get("language") in ("vi", "en") else None
+    seg_list, _l, lang = _speech_recognize(
+        job_id, src, model_size, language, p.get("engine"), dur, 3, 60)
+    lines = _transcript_lines(seg_list)
+    if not lines:
+        raise RuntimeError("Video không có lời thoại")
+    _cancel_point(job_id)
+    text_all = "\n".join(lines)
+    if len(text_all) > 16000:
+        text_all = text_all[:10000] + "\n[...lược giữa...]\n" + text_all[-5000:]
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+    brain = "Claude (gói sub)" if ai == "claude" else "Qwen3 local"
+    _set(job_id, progress=65, message=f"AI ({brain}) đang biên tập kịch bản...")
+    prompt = (
+        f"Bạn là biên kịch/biên tập video chuyên nghiệp. Transcript gốc ({dur:.0f}s):\n\n"
+        f"{text_all}\n\nViết bằng tiếng Việt, Markdown, ĐÚNG các mục:\n"
+        "## 1. Nhận xét — 2-3 điểm mạnh/yếu của lời thoại gốc\n"
+        "## 2. Kịch bản viết lại — mạch lạc, cuốn, giữ đúng ý gốc (chia đoạn rõ)\n"
+        "## 3. Hook mở đầu — 2 phương án câu đầu giữ chân 3 giây\n"
+        "## 4. Bản teleprompter — kịch bản viết lại, tách dòng ngắn dễ đọc khi quay\n"
+        "## 5. Gợi ý B-roll — mốc nào nên chèn cảnh minh hoạ gì")
+    content = llm_generate(prompt, max_tokens=2800, job_id=job_id, engine=ai)
+    _cancel_point(job_id)
+    out = unique_out(f"{src.stem}_script", ".md")
+    out.write_text(f"# Bác sĩ kịch bản — {src.name}\n\n> Bộ não: {brain}\n\n{content}\n",
+                   encoding="utf-8")
+    _set(job_id, message="Xong — kịch bản viết lại + teleprompter (.md)")
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: Claude Vision thumbnail
+def job_thumbnail(job_id: str, src: Path, p: dict):
+    """Claude Vision chọn thumbnail: trích nhiều khung hình → Claude nhìn & chấm
+    khung 'giật view' nhất → xuất ảnh bìa .jpg full-res. Chỉ frame rời máy."""
+    if not claude_cli_present():
+        raise RuntimeError("Cần Claude CLI (đăng nhập gói sub) cho tính năng thị giác")
+    info = media_info(src)
+    dur = info["duration"] or 1
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình để chọn thumbnail")
+    k = _safe_int(p.get("count"), 6)
+    k = min(10, max(4, k))
+    fdir = TMP / f"thumb_{job_id}"
+    fdir.mkdir(parents=True, exist_ok=True)
+    try:
+        times = [dur * (i + 0.5) / k for i in range(k)]
+        for i, t in enumerate(times):
+            _cancel_point(job_id)
+            _set(job_id, progress=10 + int(i / k * 45),
+                 message=f"Trích khung hình {i + 1}/{k}...")
+            r = _run_tracked(job_id, [
+                FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{t:.2f}", "-i", str(src), "-frames:v", "1",
+                "-vf", "scale=640:-2", "-q:v", "3", str(fdir / f"f{i:02d}.jpg")])
+            if r.returncode != 0:
+                raise RuntimeError(f"Trích khung hình lỗi: {r.stderr_text[-200:]}")
+        _cancel_point(job_id)
+        _set(job_id, progress=60, message="Claude đang xem & chấm khung hình...")
+        listing = "\n".join(f"- {(fdir / f'f{i:02d}.jpg')}" for i in range(k))
+        prompt = (
+            f"Có {k} ảnh JPG là các khung hình trích từ 1 video (index 0..{k - 1}). "
+            f"Hãy ĐỌC tất cả các ảnh ở đường dẫn sau:\n{listing}\n\n"
+            "Chọn 1 khung làm THUMBNAIL 'giật view' nhất: rõ mặt/biểu cảm mạnh, "
+            "sắc nét, bố cục tốt, KHÔNG mờ/nhắm mắt/chuyển cảnh dở. "
+            'Trả về DUY NHẤT JSON: {"best": <index 0..%d>, "reason": "<lý do ngắn tiếng Việt>"}'
+            % (k - 1))
+        raw = claude_vision(prompt, fdir, job_id)
+        try:
+            data = _extract_json(raw)
+            best = _safe_int(data.get("best"), 0)
+            reason = str(data.get("reason", ""))[:300]
+        except ValueError:
+            best, reason = 0, "(không đọc được lựa chọn, lấy khung giữa)"
+        best = min(k - 1, max(0, best))
+        _cancel_point(job_id)
+        _set(job_id, progress=88, message=f"Xuất thumbnail (khung #{best})...")
+        out = unique_out(f"{src.stem}_thumb", ".jpg")
+        r = _run_tracked(job_id, [
+            FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", f"{times[best]:.2f}", "-i", str(src), "-frames:v", "1",
+            "-q:v", "2", str(out)])
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Xuất thumbnail lỗi: {r.stderr_text[-200:]}")
+        note = unique_out(f"{src.stem}_thumb", ".txt")
+        note.write_text(f"Claude chọn khung #{best} (~{times[best]:.1f}s).\nLý do: {reason}\n",
+                        encoding="utf-8")
+    finally:
+        shutil.rmtree(fdir, ignore_errors=True)
+    _set(job_id, message=f"Xong — Claude chọn khung #{best} làm thumbnail")
+    return [out_entry(out), out_entry(note)]
 
 
 # ---------------------------------------------------------------- job: B-roll tự động (Pexels)
@@ -3127,7 +3464,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -3161,6 +3498,10 @@ def health():
             "content": (llm_available() or claude_available()) and whisper_ok,
             "translate": whisper_ok and (llm_available() or claude_available()),
             "social_pack": whisper_ok and (llm_available() or claude_available()),
+            "dub": whisper_ok and piper_available() and (llm_available() or claude_available()),
+            "qc": whisper_ok and (llm_available() or claude_available()),
+            "script": whisper_ok and (llm_available() or claude_available()),
+            "thumbnail": claude_available() and ffmpeg_ok,
             "face_blur": cv2_available() and YUNET_ONNX.exists() and ffmpeg_ok,
             "lesson": (llm_available() or claude_available()) and whisper_ok,
             "ailms": ailms_available(),
@@ -3519,6 +3860,30 @@ def create_job(req: JobRequest):
         if not llm_available() and not claude_available():
             raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm (LLM local)")
         return submit_job("social_pack", src.name, job_social_pack, src, dict(p))
+    if req.type == "dub":
+        if not whisper_available_any():
+            raise HTTPException(400, "Cần whisper (faster/MLX) để nhận dạng lời nói")
+        if not piper_available():
+            raise HTTPException(400, "Cần Piper TTS (giọng vi/en) để lồng tiếng")
+        if not llm_available() and not claude_available():
+            raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm để dịch")
+        return submit_job("dub", src.name, job_dub, src, dict(p))
+    if req.type == "qc":
+        if not whisper_available_any():
+            raise HTTPException(400, "Cần whisper (faster/MLX) để nhận dạng lời nói")
+        if not llm_available() and not claude_available():
+            raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm (LLM local)")
+        return submit_job("qc", src.name, job_qc, src, dict(p))
+    if req.type == "script":
+        if not whisper_available_any():
+            raise HTTPException(400, "Cần whisper (faster/MLX) để nhận dạng lời nói")
+        if not llm_available() and not claude_available():
+            raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm (LLM local)")
+        return submit_job("script", src.name, job_script, src, dict(p))
+    if req.type == "thumbnail":
+        if not claude_available():
+            raise HTTPException(400, "Cần Claude CLI (gói sub) cho tính năng thị giác")
+        return submit_job("thumbnail", src.name, job_thumbnail, src, dict(p))
     if req.type == "face_blur":
         mode = p.get("mode", "blur")
         if mode not in ("blur", "pixelate"):
