@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import {
   askDirector, authStatus, cancelJob, createJob, deleteMedia, fetchCuesJson,
   fmtDur, fmtSize, getClaudeSettings, getHealth, getJobs, getMedia, login,
@@ -118,6 +118,7 @@ const PIPE_PALETTE: { type: string; label: string; def: Record<string, unknown> 
   { type: "silence_cut", label: "✂️ Cắt lặng", def: { margin: 0.2 } },
   { type: "speed", label: "⏩ Tốc độ", def: { factor: 1.5 } },
   { type: "color", label: "🎨 Filter màu", def: { filter: "vivid" } },
+  { type: "grade", label: "🎛️ Chỉnh màu PRO", def: { contrast: 1.1, vibrance: 0.4, temperature: -15 } },
   { type: "stabilize", label: "🧷 Chống rung", def: {} },
   { type: "reframe", label: "📐 Khung 9:16", def: { mode: "blur" } },
   { type: "rife", label: "🎞️ Nội suy mượt", def: { mode: "smooth" } },
@@ -182,6 +183,103 @@ function renderVcLine(line: string, kwOn: boolean, kwCsv: string) {
 }
 
 type Preview = { input: string; url: string; name: string };
+
+// Bánh xe nhuộm màu (kiểu TTM "Nhuộm Tối/Nhuộm Sáng"): kéo/chạm chọn hue + độ đậm
+function ColorWheel({ label, hue, sat, onChange }: {
+  label: string; hue: number; sat: number; onChange: (h: number, s: number) => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const pick = (clientX: number, clientY: number) => {
+    const el = ref.current; if (!el) return;
+    const r = el.getBoundingClientRect();
+    const dx = (clientX - (r.left + r.width / 2)) / (r.width / 2);
+    const dy = (clientY - (r.top + r.height / 2)) / (r.height / 2);
+    const dist = Math.min(1, Math.hypot(dx, dy));
+    const ang = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
+    onChange(Math.round(ang), Math.round(dist * 100) / 100);
+  };
+  const a = hue * Math.PI / 180;
+  return (
+    <div className="cwheel-wrap">
+      <span className="tllab">{label}</span>
+      <div ref={ref} className="cwheel"
+        onPointerDown={(e) => { (e.target as Element).setPointerCapture(e.pointerId); pick(e.clientX, e.clientY); }}
+        onPointerMove={(e) => { if (e.buttons) pick(e.clientX, e.clientY); }}>
+        <i style={{ left: `${50 + sat * 44 * Math.cos(a)}%`, top: `${50 + sat * 44 * Math.sin(a)}%` }} />
+      </div>
+      <button className="btn sm" title="Bỏ nhuộm" onClick={() => onChange(0, 0)}>↺</button>
+    </div>
+  );
+}
+
+// Timeline cắt trực tiếp: kéo tay cầm IN/OUT trên dải khung hình, playhead đồng bộ player
+function TrimBar({ vidRef, dur, name, srcKey, onKeep, onDrop, onAdd, onSeek }: {
+  vidRef: RefObject<HTMLVideoElement | null>; dur: number; name: string; srcKey: string;
+  onKeep: (a: number, b: number) => void; onDrop: (a: number, b: number) => void;
+  onAdd: (a: number, b: number) => void; onSeek: (t: number) => void;
+}) {
+  const [inT, setInT] = useState(0);
+  const [outT, setOutT] = useState(dur);
+  const [ph, setPh] = useState(0);
+  const trackRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<"in" | "out" | "seek" | null>(null);
+  useEffect(() => { setInT(0); setOutT(dur); setPh(0); }, [name, dur]);
+  useEffect(() => {  // đồng bộ playhead với player (nghe trên video element hiện tại)
+    const v = vidRef.current; if (!v) return;
+    const f = () => setPh(v.currentTime || 0);
+    v.addEventListener("timeupdate", f);
+    return () => v.removeEventListener("timeupdate", f);
+  }, [vidRef, name, srcKey]);
+  const posToT = (clientX: number) => {
+    const el = trackRef.current; if (!el) return 0;
+    const r = el.getBoundingClientRect();
+    return Math.min(dur, Math.max(0, (clientX - r.left) / r.width * dur));
+  };
+  const down = (e: React.PointerEvent) => {
+    const el = trackRef.current; if (!el || dur <= 0) return;
+    (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    const r = el.getBoundingClientRect();
+    const xIn = r.left + (inT / dur) * r.width;
+    const xOut = r.left + (outT / dur) * r.width;
+    dragRef.current = Math.abs(e.clientX - xIn) < 10 ? "in"
+      : Math.abs(e.clientX - xOut) < 10 ? "out" : "seek";
+    move(e);
+  };
+  const move = (e: React.PointerEvent) => {
+    if (!dragRef.current || (!e.buttons && e.type === "pointermove")) return;
+    const t = posToT(e.clientX);
+    if (dragRef.current === "in") setInT(Math.min(t, outT - 0.15));
+    else if (dragRef.current === "out") setOutT(Math.max(t, inT + 0.15));
+    else { setPh(t); onSeek(t); }
+  };
+  const fmt = (t: number) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, "0")}`;
+  const pct = (t: number) => `${dur > 0 ? (t / dur) * 100 : 0}%`;
+  return (
+    <div className="trimwrap">
+      <div ref={trackRef} className="trimtrack" onPointerDown={down} onPointerMove={move}
+        onPointerUp={() => { dragRef.current = null; }}>
+        <img className="trimstrip" draggable={false} alt=""
+          src={`/api/strip/${encodeURIComponent(name)}`}
+          onError={(e) => { (e.target as HTMLImageElement).style.visibility = "hidden"; }} />
+        <div className="trimdim" style={{ left: 0, width: pct(inT) }} />
+        <div className="trimdim" style={{ left: pct(outT), right: 0 }} />
+        <div className="trimhandle in" style={{ left: pct(inT) }} />
+        <div className="trimhandle out" style={{ left: pct(outT) }} />
+        <div className="trimph" style={{ left: pct(ph) }} />
+      </div>
+      <div className="trimbar-foot">
+        <span className="tllab">IN {fmt(inT)} → OUT {fmt(outT)} · chọn {(outT - inT).toFixed(1)}s / {dur.toFixed(1)}s</span>
+        <div className="spacer" />
+        <button className="btn sm" title="Chỉ giữ lại khoảng IN→OUT"
+          onClick={() => onKeep(inT, outT)}>✂ Giữ đoạn</button>
+        <button className="btn sm" title="Cắt bỏ khoảng IN→OUT, nối 2 phần còn lại"
+          onClick={() => onDrop(inT, outT)}>🗑 Cắt bỏ đoạn</button>
+        <button className="btn sm" title="Thêm khoảng IN→OUT vào danh sách ghép"
+          onClick={() => onAdd(inT, outT)}>➕ Thêm vào danh sách</button>
+      </div>
+    </div>
+  );
+}
 
 export default function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
@@ -307,6 +405,9 @@ export default function App() {
   const [chatOpen, setChatOpen] = useState(false);
   const GRADE_DEF = { exposure: 0, brightness: 0, contrast: 1, saturation: 1, gamma: 1, temperature: 0, hue: 0, vibrance: 0, sharp: 0, zoom: 1 };
   const [grade, setGrade] = useState<Record<string, number>>({ ...GRADE_DEF });
+  const [shTint, setShTint] = useState({ h: 0, s: 0 });   // Nhuộm Tối (shadows)
+  const [hlTint, setHlTint] = useState({ h: 0, s: 0 });   // Nhuộm Sáng (highlights)
+  const [segs, setSegs] = useState<{ start: number; end: number }[]>([]);  // timeline cắt
   // Settings — gói sub Claude
   const [csEnabled, setCsEnabled] = useState(true);
   const [csModel, setCsModel] = useState("sonnet");
@@ -595,7 +696,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v1.4 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v1.5 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -876,13 +977,35 @@ export default function App() {
             <span className="selchip">{running > 0 ? `▶ ${running} việc đang chạy nền` : "máy đang rảnh"}</span>
           </div>
           {selected && !preview && selected.info.width && selected.info.duration > 0.2 && (
-            <div className="tlbox">{/* timeline hiển thị kiểu NLE: filmstrip + sóng âm */}
-              <div className="tlrow">
-                <span className="tllab">🎞 Video</span>
-                <img className="tlstrip" loading="lazy" alt=""
-                  src={`/api/strip/${encodeURIComponent(selected.name)}`}
-                  onError={(e) => { (e.target as HTMLImageElement).parentElement!.style.display = "none"; }} />
-              </div>
+            <div className="tlbox">{/* timeline NLE: kéo IN/OUT cắt trực tiếp + sóng âm */}
+              <TrimBar vidRef={vidElRef} dur={selected.info.duration}
+                name={selected.name} srcKey={previewFb ?? stageSrc ?? ""}
+                onSeek={(t) => { if (vidElRef.current) vidElRef.current.currentTime = t; }}
+                onKeep={(a, b) => run("cutlist", { segments: [{ start: a, end: b }] })}
+                onDrop={(a, b) => {
+                  const d = selected.info.duration;
+                  const keep = [{ start: 0, end: a }, { start: b, end: d }]
+                    .filter((s) => s.end - s.start > 0.2);
+                  if (!keep.length) { showToast("⚠️ Cắt bỏ hết thì không còn gì"); return; }
+                  run("cutlist", { segments: keep });
+                }}
+                onAdd={(a, b) => { setSegs((s) => [...s, { start: a, end: b }]); showToast("➕ Đã thêm đoạn vào danh sách ghép"); }} />
+              {segs.length > 0 && (
+                <div className="tlrow">
+                  <span className="tllab">📋 Ghép</span>
+                  <div className="segchips">
+                    {segs.map((s, i) => (
+                      <span key={i} className="segchip">{i + 1}. {s.start.toFixed(1)}–{s.end.toFixed(1)}s
+                        <button onClick={() => setSegs((x) => x.filter((_, j) => j !== i))}>✕</button>
+                      </span>
+                    ))}
+                    <button className="btn sm pri" onClick={() => { run("cutlist", { segments: segs }); setSegs([]); }}>
+                      🎬 Render {segs.length} đoạn
+                    </button>
+                    <button className="btn sm" onClick={() => setSegs([])}>Xoá hết</button>
+                  </div>
+                </div>
+              )}
               {selected.info.has_audio && (
                 <div className="tlrow">
                   <span className="tllab">🔊 Âm</span>
@@ -1782,11 +1905,23 @@ export default function App() {
                         onChange={(e) => setGrade((g) => ({ ...g, [k]: parseFloat(e.target.value) }))} />
                     </div>
                   ))}
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <button className="btn" onClick={() => setGrade({ ...GRADE_DEF })}>↺ Đặt lại</button>
-                    <button className="btn pri big" style={{ flex: 1 }}
-                      onClick={() => run("grade", { ...grade })}>🎛️ Render bản chỉnh màu</button>
+                  <div className="field"><label>Bánh xe nhuộm màu (kéo trong vòng tròn)</label>
+                    <div className="cwheels">
+                      <ColorWheel label="Nhuộm Tối" hue={shTint.h} sat={shTint.s}
+                        onChange={(h, s) => setShTint({ h, s })} />
+                      <ColorWheel label="Nhuộm Sáng" hue={hlTint.h} sat={hlTint.s}
+                        onChange={(h, s) => setHlTint({ h, s })} />
+                    </div>
                   </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button className="btn" onClick={() => { setGrade({ ...GRADE_DEF }); setShTint({ h: 0, s: 0 }); setHlTint({ h: 0, s: 0 }); }}>↺ Đặt lại</button>
+                    <button className="btn pri big" style={{ flex: 1 }}
+                      onClick={() => run("grade", {
+                        ...grade, sh_hue: shTint.h, sh_sat: shTint.s,
+                        hl_hue: hlTint.h, hl_sat: hlTint.s,
+                      })}>🎛️ Render bản chỉnh màu</button>
+                  </div>
+                  <div className="hint">Xem thử CSS chưa gồm nhuộm Tối/Sáng — bản render ffmpeg mới có.</div>
                 </>
               )}
 

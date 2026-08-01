@@ -258,6 +258,35 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;bac
 .field.gr{margin-bottom:4px}
 .field.gr input[type=range]{width:100%}
 
+/* ============ Timeline cắt trực tiếp (TrimBar) ============ */
+.trimwrap{display:flex;flex-direction:column;gap:5px}
+.trimtrack{position:relative;height:52px;border-radius:8px;overflow:hidden;
+  border:1px solid var(--line2);background:var(--p2);cursor:crosshair;user-select:none;touch-action:none}
+.trimstrip{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none}
+.trimdim{position:absolute;top:0;bottom:0;background:rgba(0,0,0,.62);pointer-events:none}
+.trimhandle{position:absolute;top:0;bottom:0;width:6px;margin-left:-3px;background:var(--amber);
+  cursor:ew-resize;pointer-events:none;border-radius:2px}
+.trimhandle.out{background:var(--ice)}
+.trimhandle::after{content:"";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  width:14px;height:22px;border-radius:5px;background:inherit;opacity:.95}
+.trimph{position:absolute;top:0;bottom:0;width:2px;background:#fff;pointer-events:none;
+  box-shadow:0 0 6px rgba(255,255,255,.8)}
+.trimbar-foot{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.segchips{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:1}
+.segchip{font-family:var(--mono);font-size:10.5px;background:var(--p2);border:1px solid var(--line2);
+  border-radius:7px;padding:3px 7px;display:inline-flex;align-items:center;gap:5px}
+.segchip button{color:var(--warn);font-size:10px;padding:0}
+
+/* ============ Bánh xe nhuộm màu ============ */
+.cwheels{display:flex;gap:18px;justify-content:center;padding:6px 0}
+.cwheel-wrap{display:flex;flex-direction:column;align-items:center;gap:5px}
+.cwheel{position:relative;width:86px;height:86px;border-radius:50%;cursor:crosshair;touch-action:none;
+  background:radial-gradient(circle,#8a8a94 0%,rgba(138,138,148,0) 68%),
+    conic-gradient(from 90deg,#f33,#ff3 60deg,#3f3 120deg,#3ff 180deg,#33f 240deg,#f3f 300deg,#f33 360deg);
+  border:2px solid var(--line2);box-shadow:inset 0 0 18px rgba(0,0,0,.35)}
+.cwheel i{position:absolute;width:12px;height:12px;border-radius:50%;border:2px solid #fff;
+  transform:translate(-50%,-50%);box-shadow:0 0 5px rgba(0,0,0,.8);pointer-events:none}
+
 /* ============ MODAL (Settings) ============ */
 .modal-bg{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.6);display:grid;place-items:center;padding:20px}
 .modal-card{width:min(440px,94vw);max-height:88vh;overflow:auto;background:var(--p1);

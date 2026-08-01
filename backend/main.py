@@ -2,6 +2,7 @@
 Local Studio - Backend AI service
 100% local: FastAPI + FFmpeg + faster-whisper + auto-editor + Real-ESRGAN (ncnn-vulkan)
 """
+import colorsys
 import hashlib
 import hmac
 import json
@@ -1453,7 +1454,28 @@ def job_grade(job_id: str, src: Path, p: dict):
     sharp = min(5.0, max(0.0, _safe_float(p.get("sharp"), 0)))
     zoom = min(2.0, max(1.0, _safe_float(p.get("zoom"), 1)))
 
+    def tint_offsets(hue_key, sat_key):
+        """Bánh xe nhuộm màu (hue 0-360 + độ đậm 0-1) → offset r/g/b cho colorbalance."""
+        hh = _safe_float(p.get(hue_key), 0) % 360
+        ss = min(1.0, max(0.0, _safe_float(p.get(sat_key), 0)))
+        if ss < 0.01:
+            return None
+        r, g, b = colorsys.hsv_to_rgb(hh / 360.0, 1.0, 1.0)
+        m = (r + g + b) / 3.0
+        k = ss * 0.4  # trần 0.4 để không cháy màu
+        return tuple(round(min(1, max(-1, (c - m) * k)), 3) for c in (r, g, b))
+
+    sh = tint_offsets("sh_hue", "sh_sat")   # Nhuộm Tối (shadows)
+    hl = tint_offsets("hl_hue", "hl_sat")   # Nhuộm Sáng (highlights)
+
     vf = []
+    if sh or hl:
+        cb = []
+        if sh:
+            cb += [f"rs={sh[0]}", f"gs={sh[1]}", f"bs={sh[2]}"]
+        if hl:
+            cb += [f"rh={hl[0]}", f"gh={hl[1]}", f"bh={hl[2]}"]
+        vf.append("colorbalance=" + ":".join(cb))
     if exposure:
         vf.append(f"exposure=exposure={exposure:.2f}")
     if bright or contrast != 1 or sat != 1 or gamma != 1:
@@ -1479,6 +1501,35 @@ def job_grade(job_id: str, src: Path, p: dict):
             "-c:v", "libx264", "-crf", "18", "-preset", "medium",
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(out)]
     run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: cutlist (cắt trên timeline)
+def job_cutlist(job_id: str, src: Path, p: dict):
+    """Cắt trên timeline: giữ danh sách đoạn [{start,end}...] theo ĐÚNG thứ tự
+    người dùng xếp → nối thành 1 video (re-encode từng đoạn rồi concat)."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình để cắt")
+    dur = info["duration"] or 0
+    raw = p.get("segments")
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError("Chưa có đoạn nào để giữ — kéo chọn trên timeline trước")
+    keep = []
+    for s in raw[:50]:
+        if not isinstance(s, dict):
+            continue
+        a = min(dur, max(0.0, _safe_float(s.get("start"), 0)))
+        b = min(dur, max(0.0, _safe_float(s.get("end"), 0)))
+        if b - a >= 0.15:
+            keep.append((a, b))
+    if not keep:
+        raise RuntimeError("Các đoạn chọn quá ngắn (cần ≥ 0.15s)")
+    total = sum(b - a for a, b in keep)
+    _set(job_id, message=f"Cắt & nối {len(keep)} đoạn (tổng {total:.1f}s)...")
+    out = unique_out(f"{src.stem}_timeline", ".mp4")
+    _cut_and_concat(job_id, src, keep, out, bool(info["has_audio"]))
+    _set(job_id, message=f"Xong — giữ {len(keep)} đoạn, {total:.1f}s / {dur:.1f}s gốc")
     return [out_entry(out)]
 
 
@@ -3652,7 +3703,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "1.4.0",
+        "version": "1.5.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -3674,6 +3725,7 @@ def health():
             "speed": ffmpeg_ok,
             "color": ffmpeg_ok,
             "grade": ffmpeg_ok,
+            "cutlist": ffmpeg_ok,
             "music": ffmpeg_ok,
             "stabilize": ffmpeg_ok,
             "merge": ffmpeg_ok,
@@ -3773,6 +3825,10 @@ def _run_step(job_id: str, jtype: str, src: Path, p: dict) -> Path:
         outs = job_speed(job_id, src, min(4.0, max(0.25, _safe_float(p.get("factor"), 2.0))))
     elif jtype == "color":
         outs = job_color(job_id, src, p.get("filter") if p.get("filter") in COLOR_FILTERS else "vivid")
+    elif jtype == "grade":
+        outs = job_grade(job_id, src, dict(p))
+    elif jtype == "cutlist":
+        outs = job_cutlist(job_id, src, dict(p))
     elif jtype == "stabilize":
         outs = job_stabilize(job_id, src)
     elif jtype == "reframe":
@@ -3830,9 +3886,9 @@ def _run_step(job_id: str, jtype: str, src: Path, p: dict) -> Path:
 
 
 PIPELINE_STEP_TYPES = {
-    "silence_cut", "speed", "color", "stabilize", "reframe", "rife", "upscale",
-    "bg_remove", "audio_enhance", "face_blur", "brand", "export", "transcribe",
-    "viral_caption", "broll", "music",
+    "silence_cut", "speed", "color", "grade", "cutlist", "stabilize", "reframe",
+    "rife", "upscale", "bg_remove", "audio_enhance", "face_blur", "brand",
+    "export", "transcribe", "viral_caption", "broll", "music",
 }
 
 
@@ -3878,6 +3934,7 @@ def job_pipeline(job_id: str, src: Path, p: dict):
 
 STEP_LABELS = {
     "silence_cut": "cắt lặng", "speed": "tốc độ", "color": "filter màu",
+    "grade": "chỉnh màu PRO", "cutlist": "cắt timeline",
     "stabilize": "chống rung", "reframe": "khung 9:16", "rife": "nội suy",
     "upscale": "upscale", "bg_remove": "tách nền", "audio_enhance": "chuẩn âm",
     "face_blur": "che mặt", "brand": "logo/tiêu đề", "export": "xuất preset",
@@ -3974,6 +4031,8 @@ def create_job(req: JobRequest):
         return submit_job("stabilize", src.name, job_stabilize, src, stab_str)
     if req.type == "grade":
         return submit_job("grade", src.name, job_grade, src, dict(p))
+    if req.type == "cutlist":
+        return submit_job("cutlist", src.name, job_cutlist, src, dict(p))
     if req.type == "merge":
         extra_names = list(p.get("files") or [])
         if len(extra_names) > 7:
@@ -4122,6 +4181,7 @@ DIRECTOR_ALLOWED_TYPES = {
     "auto_edit", "reframe", "speed", "color", "music", "stabilize", "merge",
     "beatsync", "audio_enhance", "brand", "audiogram", "highlights", "content",
     "face_blur", "tts", "lesson", "broll", "viral_caption", "pipeline",
+    "grade", "cutlist",
 }
 
 DIRECTOR_CATALOG = """\
@@ -4148,7 +4208,9 @@ DIRECTOR_CATALOG = """\
 - lesson: bài giảng → giáo án + câu hỏi quiz (.md). params: quiz(số câu 3-15), push_lms(bool đẩy sang AI-LMS), level(1-4), department, ai(local/claude)
 - broll: tự chèn B-roll (cảnh minh hoạ) tải từ Pexels đè lên video người nói. params: count(1-6 số đoạn), ai(local/claude)
 - tts: đọc văn bản (KHÔNG cần file). params: text(chuỗi), voice(vi/en), speed(0.6-1.5)
-- pipeline: CHUỖI NỐI TIẾP nhiều bước trên 1 video (output bước này làm input bước sau). DÙNG KHI người dùng muốn "A rồi B rồi C" trên CÙNG video. params: steps=[{"type":"<loại>","params":{...}}, ...]. Loại nối được: silence_cut, speed, color, stabilize, reframe, rife, upscale, bg_remove, audio_enhance, face_blur, brand, export, transcribe, viral_caption, broll, music. VD "cắt lặng rồi tăng tốc rồi xuất tiktok" → 1 action pipeline steps=[{type:silence_cut},{type:speed,params:{factor:1.5}},{type:export,params:{preset:tiktok}}]"""
+- grade: bảng chỉnh màu chuyên nghiệp. params: exposure(-3..3), brightness(-1..1), contrast(0..3, mặc định 1), saturation(0..3, mặc định 1), temperature(-100 ấm..100 lạnh), hue(-180..180), vibrance(-2..2), gamma(0.3..3), sharp(0..5), zoom(1..2), sh_hue+sh_sat(nhuộm vùng tối), hl_hue+hl_sat(nhuộm vùng sáng)
+- cutlist: cắt giữ các đoạn theo mốc giây rồi nối lại (dùng khi người dùng nêu mốc thời gian cần giữ/cắt bỏ). params: segments=[{"start":giây,"end":giây}, ...] — các đoạn GIỮ LẠI, theo thứ tự
+- pipeline: CHUỖI NỐI TIẾP nhiều bước trên 1 video (output bước này làm input bước sau). DÙNG KHI người dùng muốn "A rồi B rồi C" trên CÙNG video. params: steps=[{"type":"<loại>","params":{...}}, ...]. Loại nối được: silence_cut, speed, color, grade, cutlist, stabilize, reframe, rife, upscale, bg_remove, audio_enhance, face_blur, brand, export, transcribe, viral_caption, broll, music. VD "cắt lặng rồi tăng tốc rồi xuất tiktok" → 1 action pipeline steps=[{type:silence_cut},{type:speed,params:{factor:1.5}},{type:export,params:{preset:tiktok}}]"""
 
 
 class DirectorReq(BaseModel):
