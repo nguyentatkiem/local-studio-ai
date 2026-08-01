@@ -1,14 +1,18 @@
 # 📜 Nhật ký cập nhật — Local Studio
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.8.1-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-44-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-1.9.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-45-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/100%25-local--first-7ACB6B?style=for-the-badge" alt="local">
 </p>
 
 > **Local Studio** — trình dựng video AI chạy **100% trên máy bạn**. Không cloud, không credit, không watermark. Footage không bao giờ rời máy.
 
 ---
+
+## 📁 v1.9 — Edit hàng loạt cả THƯ MỤC · <sub>02/08/2026</sub>
+
+- **📁 Xử lý cả thư mục trong ổ cứng** — trỏ vào folder bất kỳ trên máy (quét cả thư mục con), xếp chuỗi bước (chỉnh màu → phụ đề → xuất preset...), chạy cho **mọi video/audio** trong đó. Kết quả vào thư mục con `LocalStudio_Xuat` cạnh file gốc — file gốc giữ nguyên; file lỗi tự bỏ qua, cuối job có báo cáo chi tiết.
 
 ## 🛡️ v1.8.1 — Bản "thép" · <sub>02/08/2026</sub>
 

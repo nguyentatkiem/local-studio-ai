@@ -3,7 +3,7 @@ import {
   askDirector, authStatus, cancelJob, clipSearch, createJob, deleteMedia,
   deleteProject, fetchCuesJson, fmtDur, fmtSize, getClaudeSettings, getHealth,
   getJobs, getMedia, listProjects, loadProject, login, logout, openOutputs,
-  resetDirector, saveClaudeSettings, saveProject, stopDirector, testClaude,
+  resetDirector, saveClaudeSettings, saveProject, scanFolder, stopDirector, testClaude,
   uploadFile, viralAnalyze,
   type Health, type Job, type MediaItem, type ProjectInfo, type ViralCluster,
 } from "./api";
@@ -20,7 +20,7 @@ const TOOL_CATS: Record<string, ToolCat> = {
   pipeline: "ai", viral: "ai", director: "ai", highlights: "ai", broll: "ai",
   translate: "ai", social_pack: "ai", dub: "ai", qc: "ai", script: "ai",
   thumbnail: "ai", auto_edit: "ai", transcribe: "ai", content: "ai", lesson: "ai",
-  clipsearch: "ai",
+  clipsearch: "ai", folder: "ai",
   merge: "edit", beatsync: "edit", silence_cut: "edit", upscale: "edit",
   rife: "edit", bg_remove: "edit", reframe: "edit", speed: "edit", color: "edit",
   grade: "edit", track: "edit", stabilize: "edit", face_blur: "edit", brand: "edit",
@@ -41,7 +41,7 @@ const FEAT_KEY: Record<string, string> = {
   translate: "translate", social_pack: "social_pack", dub: "dub", qc: "qc",
   script: "script", thumbnail: "thumbnail", viral: "viral_caption",
   pipeline: "export", export: "export", grade: "grade", track: "track",
-  clipsearch: "clipsearch",
+  clipsearch: "clipsearch", folder: "folder",
   reframe: "ffmpeg", speed: "ffmpeg", color: "ffmpeg", music: "ffmpeg",
   stabilize: "ffmpeg", merge: "ffmpeg", audio_enhance: "ffmpeg",
   brand: "ffmpeg", audiogram: "ffmpeg",
@@ -116,7 +116,7 @@ type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" |
   | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
   | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll" | "viral"
   | "translate" | "social_pack" | "dub" | "qc" | "script" | "thumbnail"
-  | "grade" | "track" | "clipsearch" | "pipeline";
+  | "grade" | "track" | "clipsearch" | "folder" | "pipeline";
 
 // Lớp phủ multi-track (đè lên video nền theo mốc thời gian)
 type Layer = {
@@ -152,6 +152,7 @@ const PIPE_PALETTE: { type: string; label: string; def: Record<string, unknown> 
 
 const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: boolean }[] = [
   { key: "pipeline", icon: "🔗", name: "Chuỗi tự động (nối nhiều bước)", desc: "xếp nhiều tính năng chạy nối tiếp trên 1 video", gpu: false },
+  { key: "folder", icon: "📁", name: "Edit hàng loạt cả THƯ MỤC", desc: "trỏ vào folder trong ổ cứng → chạy chuỗi bước cho mọi video", gpu: false },
   { key: "viral", icon: "🔥", name: "Phụ đề Viral 1 chạm", desc: "nhận dạng → tách cụm → cháy preset viral + chuẩn âm", gpu: true },
   { key: "director", icon: "🎬", name: "Đạo diễn AI (Claude)", desc: "ra lệnh bằng lời — Claude tự xếp job", gpu: false },
   { key: "highlights", icon: "🎯", name: "AI cắt Shorts từ video dài", desc: "AI chọn khoảnh khắc → shorts 9:16", gpu: true },
@@ -443,6 +444,11 @@ export default function App() {
   const [projName, setProjName] = useState("");
   const [projList, setProjList] = useState<ProjectInfo[]>([]);
   const [projPick, setProjPick] = useState("");
+  // Edit hàng loạt cả thư mục ổ cứng
+  const [fdPath, setFdPath] = useState("");
+  const [fdRec, setFdRec] = useState(false);
+  const [fdScan, setFdScan] = useState<{ dir: string; files: { name: string; rel: string; size: number }[]; truncated: boolean } | null>(null);
+  const [fdBusy, setFdBusy] = useState(false);
   const [trackPt, setTrackPt] = useState<{ x: number; y: number } | null>(null);
   const [trackFx, setTrackFx] = useState("blur");
   const [trackStr, setTrackStr] = useState(1.0);
@@ -789,7 +795,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v1.8 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v1.9 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -2295,6 +2301,66 @@ export default function App() {
                   <button className="btn pri big" disabled={!trackPt}
                     onClick={() => trackPt && run("track", { x: trackPt.x, y: trackPt.y, effect: trackFx, strength: trackStr })}>
                     🎯 Track & áp hiệu ứng
+                  </button>
+                </>
+              )}
+
+              {tool === "folder" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    📁 Trỏ vào một THƯ MỤC trong ổ cứng máy chủ → chạy chuỗi bước cho
+                    MỌI video/audio trong đó. Kết quả xuất vào thư mục con
+                    <b> LocalStudio_Xuat</b> ngay cạnh file gốc (file gốc giữ nguyên).
+                  </div>
+                  <div className="field"><label>Đường dẫn thư mục (tuyệt đối)</label>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <input className="lytext" style={{ flex: 1, maxWidth: "none" }}
+                        placeholder="/Users/ban/Movies/can-xu-ly" value={fdPath}
+                        onChange={(e) => { setFdPath(e.target.value); setFdScan(null); }} />
+                      <button className="btn" disabled={fdBusy || !fdPath.trim()} onClick={async () => {
+                        setFdBusy(true);
+                        try { setFdScan(await scanFolder(fdPath.trim(), fdRec)); }
+                        catch (e) { setFdScan(null); showToast("❌ " + String((e as Error).message)); }
+                        finally { setFdBusy(false); }
+                      }}>{fdBusy ? "⏳" : "🔍 Quét"}</button>
+                    </div>
+                  </div>
+                  <label className="chk"><input type="checkbox" checked={fdRec}
+                    onChange={(e) => { setFdRec(e.target.checked); setFdScan(null); }} />Quét cả thư mục con</label>
+                  {fdScan && (
+                    <div className="hint" style={{ marginTop: 6 }}>
+                      ✅ Tìm thấy <b>{fdScan.files.length}</b> file media{fdScan.truncated ? " (chạm trần 300)" : ""}:
+                      {" "}{fdScan.files.slice(0, 8).map((f) => f.name).join(" · ")}
+                      {fdScan.files.length > 8 ? ` …+${fdScan.files.length - 8}` : ""}
+                    </div>
+                  )}
+                  <div className="field" style={{ marginTop: 8 }}><label>Chuỗi bước áp cho từng file (bấm để thêm)</label>
+                    <div className="segchips">
+                      {PIPE_PALETTE.map((s) => (
+                        <button key={s.type} className="btn sm" onClick={() => addStep(s.type)}>{s.label}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {pipe.length > 0 && (
+                    <div className="segchips" style={{ marginBottom: 8 }}>
+                      {pipe.map((st, i) => (
+                        <span key={i} className="segchip">{i + 1}. {PIPE_PALETTE.find((x) => x.type === st.type)?.label || st.type}
+                          <button onClick={() => setPipe((s) => s.filter((_, j) => j !== i))}>✕</button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div className="hint">⚙ Tham số từng bước chỉnh trong tool 🔗 Chuỗi tự động (dùng chung danh sách bước).
+                    File lỗi tự bỏ qua — cuối job có báo cáo chi tiết.</div>
+                  <button className="btn pri big" disabled={!fdScan || fdScan.files.length === 0 || pipe.length === 0}
+                    onClick={async () => {
+                      try {
+                        await createJob("folder_batch", "", { path: fdPath.trim(), recursive: fdRec, steps: pipe });
+                        setJobs(await getJobs()); setRightTab("jobs");
+                        showToast(`📁 Đang xử lý ${fdScan!.files.length} file — kết quả vào LocalStudio_Xuat`);
+                      } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                    }}>
+                    📁 Chạy {fdScan ? fdScan.files.length : 0} file × {pipe.length} bước
                   </button>
                 </>
               )}

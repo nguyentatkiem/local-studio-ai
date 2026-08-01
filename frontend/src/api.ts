@@ -179,6 +179,18 @@ export async function clipSearch(query: string): Promise<{
   return d;
 }
 
+export async function scanFolder(path: string, recursive: boolean): Promise<{
+  dir: string; files: { name: string; rel: string; size: number }[]; truncated: boolean;
+}> {
+  const r = await fetch("/api/folder/scan", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, recursive }),
+  });
+  const d = await r.json().catch(() => ({ detail: r.statusText }));
+  if (!r.ok) throw new Error(d.detail || "Quét thất bại");
+  return d;
+}
+
 export type ProjectInfo = { name: string; file: string; layers: number; mtime: number };
 
 export async function listProjects(): Promise<ProjectInfo[]> {

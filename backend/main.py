@@ -4222,7 +4222,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "1.8.1",
+        "version": "1.9.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -4246,6 +4246,7 @@ def health():
             "grade": ffmpeg_ok,
             "cutlist": ffmpeg_ok,
             "composite": ffmpeg_ok,
+            "folder": ffmpeg_ok,
             "track": sam2_available() and ffmpeg_ok,
             "clipsearch": clip_available() and ffmpeg_ok,
             "music": ffmpeg_ok,
@@ -4483,6 +4484,12 @@ def create_job(req: JobRequest):
         speed = min(1.5, max(0.6, _safe_float(p.get("speed"), 1.0)))
         label = text[:40] + ("…" if len(text) > 40 else "")
         return submit_job("tts", label, job_tts, text, voice, speed)
+
+    if req.type == "folder_batch":  # edit hàng loạt cả thư mục ổ cứng — không cần file trong kho
+        d = Path(str(p.get("path") or "").strip()).expanduser()
+        if not d.is_absolute() or not d.is_dir():
+            raise HTTPException(400, "Đường dẫn không phải thư mục có thật trên máy")
+        return submit_job("folder_batch", f"📁 {d.name}", job_folder_batch, dict(p))
 
     if req.type == "clip_index":  # lập chỉ mục CLIP toàn kho — không cần file
         if not clip_available():
@@ -4973,6 +4980,106 @@ class WorkersReq(BaseModel):
 def set_workers(req: WorkersReq):
     """Chỉnh số job chạy song song (1-4)."""
     return {"workers": set_worker_limit(req.workers)}
+
+
+# ---------------------------------------------------------------- Xử lý cả THƯ MỤC trong ổ cứng
+FOLDER_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v",
+               ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+FOLDER_OUT_NAME = "LocalStudio_Xuat"
+FOLDER_MAX_FILES = 300
+
+
+def _folder_scan(d: Path, recursive: bool) -> list:
+    """Liệt kê file media trong thư mục (bỏ file ẩn + thư mục kết quả của chính app)."""
+    files, scanned = [], 0
+    it = d.rglob("*") if recursive else d.iterdir()
+    for f in it:
+        scanned += 1
+        if scanned > 8000 or len(files) >= FOLDER_MAX_FILES:
+            break
+        try:
+            if (f.is_file() and f.suffix.lower() in FOLDER_EXTS
+                    and not f.name.startswith(".")
+                    and FOLDER_OUT_NAME not in f.parts):
+                files.append(f)
+        except OSError:
+            continue
+    return sorted(files)
+
+
+class FolderScanReq(BaseModel):
+    path: str
+    recursive: bool = False
+
+
+@app.post("/api/folder/scan")
+def folder_scan(req: FolderScanReq):
+    d = Path(str(req.path or "").strip()).expanduser()
+    if not d.is_absolute() or not d.is_dir():
+        raise HTTPException(400, "Đường dẫn không phải THƯ MỤC có thật trên máy (cần đường dẫn tuyệt đối)")
+    files = _folder_scan(d, bool(req.recursive))
+    return {"dir": str(d),
+            "files": [{"name": f.name, "rel": str(f.relative_to(d)),
+                       "size": f.stat().st_size} for f in files],
+            "truncated": len(files) >= FOLDER_MAX_FILES}
+
+
+def job_folder_batch(job_id: str, p: dict):
+    """Edit hàng loạt cả THƯ MỤC trong ổ cứng: chạy chuỗi bước cho từng file media,
+    kết quả xuất vào <thư mục>/LocalStudio_Xuat. File lỗi bỏ qua, có báo cáo."""
+    d = Path(str(p.get("path") or "").strip()).expanduser()
+    if not d.is_absolute() or not d.is_dir():
+        raise RuntimeError("Đường dẫn không phải thư mục có thật trên máy")
+    steps = [s for s in (p.get("steps") or [])
+             if isinstance(s, dict) and s.get("type") in PIPELINE_STEP_TYPES][:8]
+    if not steps:
+        raise RuntimeError("Chưa xếp bước nào — thêm ít nhất 1 bước xử lý")
+    files = _folder_scan(d, bool(p.get("recursive")))
+    if not files:
+        raise RuntimeError(f"Không tìm thấy file media nào trong {d}")
+    outdir = d / FOLDER_OUT_NAME
+    outdir.mkdir(exist_ok=True)
+
+    chain = " → ".join(STEP_LABELS.get(s["type"], s["type"]) for s in steps)
+    ok, fail, lines = 0, 0, [f"Thư mục: {d}", f"Chuỗi bước: {chain}",
+                             f"Số file: {len(files)}", ""]
+    for i, f in enumerate(files):
+        _cancel_point(job_id)
+        _set(job_id, progress=int(i / len(files) * 100),
+             message=f"[{i + 1}/{len(files)}] {f.name} — {chain}")
+        cur, produced = f, []
+        try:
+            for st in steps:
+                primary, outs = _run_step(job_id, st["type"], cur,
+                                          st.get("params") or {})
+                produced.extend(outs)
+                cur = primary
+            dest = outdir / f"{f.stem}_LS{cur.suffix}"
+            n = 1
+            while dest.exists():
+                dest = outdir / f"{f.stem}_LS_{n}{cur.suffix}"
+                n += 1
+            shutil.move(str(cur), str(dest))
+            for x in produced:  # dọn file trung gian + file phụ trong OUTPUTS
+                if x != cur:
+                    x.unlink(missing_ok=True)
+            ok += 1
+            lines.append(f"✅ {f.relative_to(d)}  →  {dest.name}")
+        except JobCancelled:
+            for x in produced:
+                x.unlink(missing_ok=True)
+            raise
+        except Exception as e:  # noqa: BLE001 - 1 file hỏng không chặn cả lô
+            for x in produced:
+                x.unlink(missing_ok=True)
+            fail += 1
+            lines.append(f"❌ {f.relative_to(d)}  —  {str(e)[:160]}")
+    report = unique_out(f"{d.name}_batch_baocao", ".txt")
+    report.write_text("\n".join(lines) + f"\n\nXong: {ok} OK · {fail} lỗi\n",
+                      encoding="utf-8")
+    _set(job_id, message=f"Xong — {ok}/{len(files)} file → {outdir}"
+         + (f" · {fail} lỗi (xem báo cáo)" if fail else ""))
+    return [out_entry(report)]
 
 
 # ---------------------------------------------------------------- Dự án lớp phủ (save/load)

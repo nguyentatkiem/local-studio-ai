@@ -1,8 +1,8 @@
 # 🎬 Local Studio — AI Video Editor chạy 100% trên máy
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.8.1-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-44-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-1.9.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-45-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/cloud-0%25-FF6B57?style=for-the-badge" alt="no cloud">
   <img src="https://img.shields.io/badge/watermark-kh%C3%B4ng-7ACB6B?style=for-the-badge" alt="no watermark">
 </p>
@@ -28,7 +28,7 @@
 > 🌐 **Phát hành web tạm qua Cloudflare Tunnel:** xem `DEPLOY-WEB.md`.
 > 🎯 **Track đối tượng SAM 2** cần thêm: `pip install ultralytics` · **Tìm cảnh CLIP** cần: `pip install open_clip_torch` (trong venv backend).
 
-## ✨ 44 tính năng (v1.8.1)
+## ✨ 45 tính năng (v1.9)
 
 ### 🎞️ Studio dựng — timeline & lớp phủ
 | Tính năng | Mô tả |
@@ -39,6 +39,7 @@
 | 💾 **Dự án** | lưu nguyên timeline, mở lại làm tiếp |
 | 🎛️ **Bảng chỉnh màu PRO** | 10 thanh trượt + 2 bánh xe **Nhuộm Tối/Sáng** · xem trước tức thì |
 | 🔗 **Chuỗi tự động** | xếp nhiều tính năng chạy nối tiếp 1 job · 1–4 luồng song song |
+| 📁 **Edit hàng loạt cả THƯ MỤC** | trỏ folder trong ổ cứng → chạy chuỗi bước cho mọi video → xuất `LocalStudio_Xuat` |
 
 ### 🤖 AI thị giác & âm thanh (local)
 | Tính năng | Engine |
