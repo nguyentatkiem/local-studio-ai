@@ -314,14 +314,20 @@ def _ff_escape_path(p) -> str:
     return s
 
 
+_UNIQUE_LOCK = threading.Lock()
+
+
 def unique_out(stem: str, suffix: str) -> Path:
-    """Collision-free output path in OUTPUTS."""
+    """Collision-free output path in OUTPUTS. Touch ngay trong lock — 2 job song
+    song cùng stem không bao giờ được cấp trùng path (TOCTOU)."""
     base = re.sub(r"[^\w\-.]+", "_", stem)
-    p = OUTPUTS / f"{base}{suffix}"
-    i = 1
-    while p.exists():
-        p = OUTPUTS / f"{base}_{i}{suffix}"
-        i += 1
+    with _UNIQUE_LOCK:
+        p = OUTPUTS / f"{base}{suffix}"
+        i = 1
+        while p.exists():
+            p = OUTPUTS / f"{base}_{i}{suffix}"
+            i += 1
+        p.touch()  # giữ chỗ; ffmpeg -y / write_text sẽ ghi đè nội dung
     return p
 
 
@@ -789,7 +795,7 @@ def job_transcribe(job_id: str, src: Path, p: dict):
     txt_path.write_text("\n".join(lines), encoding="utf-8")
     outputs = [out_entry(srt_path), out_entry(ass_path), out_entry(txt_path)]
 
-    if burn and chunks:
+    if burn and chunks and info["width"]:  # file audio thuần → chỉ xuất srt/ass/txt
         _set(job_id, message="Đang ghi phụ đề vào video...", progress=93)
         burned = unique_out(src.stem + "_sub", ".mp4")
         # cwd trick: tên file .ass tương đối để né escape đường dẫn Windows
@@ -1235,7 +1241,7 @@ def job_auto_edit(job_id: str, src: Path, p: dict):
     try:
         if do_cut:
             _set(job_id, progress=2, message="Bước 1/3 — cắt khoảng lặng...")
-            margin = min(2.0, max(0.0, float(p.get("margin", 0.2))))
+            margin = min(2.0, max(0.0, _safe_float(p.get("margin"), 0.2)))
             cut_out = TMP / f"auto_cut_{job_id}.mp4"
             cmd = [sys.executable, "-m", "auto_editor", str(src),
                    "--margin", f"{margin}sec", "--no-open", "--output", str(cut_out)]
@@ -1407,6 +1413,8 @@ def job_color(job_id: str, src: Path, name: str):
 def job_music(job_id: str, src: Path, music: Path, vol: float, duck: bool,
               mute: bool = False):
     info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần VIDEO có hình để trộn nhạc nền — file này chỉ có âm thanh")
     dur = info["duration"] or 1
     out = unique_out(f"{src.stem}_music", ".mp4")
     _set(job_id, message="Trộn nhạc nền" + (" (tắt tiếng gốc)" if mute else "")
@@ -1524,7 +1532,9 @@ def job_cutlist(job_id: str, src: Path, p: dict):
         if b - a >= 0.15:
             keep.append((a, b))
     if not keep:
-        raise RuntimeError("Các đoạn chọn quá ngắn (cần ≥ 0.15s)")
+        raise RuntimeError(
+            "Không có đoạn hợp lệ để giữ — kiểm tra: start phải NHỎ hơn end, "
+            f"các mốc nằm trong 0–{dur:.1f}s, và mỗi đoạn dài ≥ 0.15s")
     total = sum(b - a for a, b in keep)
     _set(job_id, message=f"Cắt & nối {len(keep)} đoạn (tổng {total:.1f}s)...")
     out = unique_out(f"{src.stem}_timeline", ".mp4")
@@ -1793,6 +1803,11 @@ def clip_search(req: ClipSearchReq):
         try:
             d = np.load(idx)
             sims = d["e"].astype(np.float32) @ te
+        except Exception:  # noqa: BLE001 - npz hỏng/ghi dở → bỏ qua video này, KHÔNG sập cả search
+            idx.unlink(missing_ok=True)  # xoá index hỏng để lần lập chỉ mục sau tạo lại
+            unindexed.append(f.name)
+            continue
+        try:
             # lấy tối đa 3 mốc tốt nhất mỗi video, cách nhau ≥ 4s
             order = np.argsort(-sims)
             picked = []
@@ -1874,9 +1889,19 @@ def job_composite(job_id: str, src: Path, p: dict):
             y2 = min(1.0, max(0.0, _safe_float(l.get("y2"), y)))
             has_kf = (l.get("x2") is not None or l.get("y2") is not None) \
                 and (abs(x2 - x) > 0.003 or abs(y2 - y) > 0.003)
+
+            def _layer_file(name):
+                """Resolve file của lớp; tên rỗng/chứa / → None (BỎ QUA lớp,
+                không HTTPException làm chết cả job)."""
+                try:
+                    ff = safe_upload_path(str(name or ""))
+                    return ff if ff.is_file() else None
+                except HTTPException:
+                    return None
+
             if kind == "image":
-                f = safe_upload_path(str(l.get("file", "")))
-                if not f.is_file() or f.suffix.lower() not in IMAGE_EXT:
+                f = _layer_file(l.get("file"))
+                if f is None or f.suffix.lower() not in IMAGE_EXT:
                     continue
                 scale = min(1.5, max(0.03, _safe_float(l.get("scale"), 0.25)))
                 op = min(1.0, max(0.05, _safe_float(l.get("opacity"), 1.0)))
@@ -1904,8 +1929,8 @@ def job_composite(job_id: str, src: Path, p: dict):
                 n_img += 1
             elif kind == "video":
                 # PiP video-trong-video: phát từ đầu clip nguồn tại mốc a, cửa sổ a→b
-                f = safe_upload_path(str(l.get("file", "")))
-                if not f.is_file():
+                f = _layer_file(l.get("file"))
+                if f is None:
                     continue
                 finfo = media_info(f)
                 if not finfo["width"]:
@@ -1917,9 +1942,12 @@ def job_composite(job_id: str, src: Path, p: dict):
                 n_in += 1
                 inputs += ["-i", str(f)]
                 lab = f"pv{li}"
+                fade_v = (f",fade=t=in:st={a:.3f}:d=0.45:alpha=1"
+                          f",fade=t=out:st={max(a, b - 0.45):.3f}:d=0.45:alpha=1"
+                          if anim == "fade" else "")
                 vparts.append(
                     f"[{n_in}:v]trim=0:{b - a:.3f},setpts=PTS-STARTPTS+{a:.3f}/TB,"
-                    f"scale={pw}:-2,format=rgba,colorchannelmixer=aa={op:.2f}[{lab}]")
+                    f"scale={pw}:-2,format=rgba,colorchannelmixer=aa={op:.2f}{fade_v}[{lab}]")
                 if has_kf:
                     ox = _kf_expr(f"(W-w)*{x:.3f}", f"(W-w)*{x2:.3f}", a, b)
                     oy = _kf_expr(f"(H-h)*{y:.3f}", f"(H-h)*{y2:.3f}", a, b)
@@ -1941,7 +1969,10 @@ def job_composite(job_id: str, src: Path, p: dict):
                 if not text:
                     continue
                 size = min(0.2, max(0.02, _safe_float(l.get("size"), 0.055)))
-                color = re.sub(r"[^#0-9A-Fa-f]", "", str(l.get("color") or "#FFFFFF"))[:7] or "#FFFFFF"
+                # chỉ nhận đúng #RRGGBB — "red"/"#FFF" lọt qua sẽ làm ffmpeg vỡ cả job
+                color = str(l.get("color") or "").strip()
+                if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
+                    color = "#FFFFFF"
                 # textfile= né toàn bộ vấn đề escape ký tự trong drawtext
                 tf = TMP / f"cmp_{job_id}_{li}.txt"
                 tf.write_text(text, encoding="utf-8")
@@ -1960,6 +1991,8 @@ def job_composite(job_id: str, src: Path, p: dict):
                 nxt = f"v{li}"
                 vparts.append(
                     f"{vcur}drawtext=textfile='{_ff_escape_path(tf)}'"
+                    # expansion=none: chữ chứa % không bị nuốt thành chuỗi %{...}
+                    + ":expansion=none"
                     + (f":fontfile='{_ff_escape_path(font)}'" if font.exists() else "")
                     + f":fontsize={fs}:fontcolor={color}"
                     f":borderw={max(1, fs // 14)}:bordercolor=black@0.75"
@@ -1968,14 +2001,16 @@ def job_composite(job_id: str, src: Path, p: dict):
                 vcur = f"[{nxt}]"
                 n_txt += 1
             elif kind == "audio":
-                f = safe_upload_path(str(l.get("file", "")))
-                if not f.is_file() or not media_info(f)["has_audio"]:
+                f = _layer_file(l.get("file"))
+                if f is None or not media_info(f)["has_audio"]:
                     continue
                 vol = min(2.0, max(0.05, _safe_float(l.get("volume"), 0.5)))
                 n_in += 1
                 inputs += ["-i", str(f)]
                 lab = f"au{li}"
-                aparts.append(f"[{n_in}:a]volume={vol:.2f},"
+                # atrim theo cửa sổ a→b: nhạc DỪNG đúng chỗ người dùng kéo trên timeline
+                aparts.append(f"[{n_in}:a]atrim=0:{max(0.1, b - a):.3f},"
+                              f"asetpts=PTS-STARTPTS,volume={vol:.2f},"
                               f"adelay={int(a * 1000)}:all=1[{lab}]")
                 n_aud += 1
 
@@ -1983,12 +2018,16 @@ def job_composite(job_id: str, src: Path, p: dict):
             raise RuntimeError("Không có lớp hợp lệ nào (kiểm tra file/nội dung từng lớp)")
         _set(job_id, message=f"Ghép lớp: {n_img} ảnh · {n_txt} chữ · {n_vid} PiP · {n_aud} nhạc...")
 
-        # âm thanh: nền (nếu có) + các lớp nhạc → amix kết thúc theo NỀN
+        # âm thanh: nền im lặng ĐÚNG thời lượng video làm mốc duration=first —
+        # audio gốc có thể NGẮN hơn video (mic tắt sớm) → không được lấy nó làm mốc,
+        # nếu không nhạc/PiP thêm vào sau điểm đó bị cắt/mất lặng lẽ
         amaps = []
         if n_aud:
-            base_a = "[0:a]" if info["has_audio"] else None
-            # nhãn [auN] theo đúng thứ tự đã tạo trong aparts; nền đứng đầu (duration=first)
-            labs = ([base_a] if base_a else []) + re.findall(r"\[au\d+\]", ";".join(aparts))
+            n_in += 1
+            inputs += ["-f", "lavfi", "-t", f"{dur:.3f}",
+                       "-i", "anullsrc=r=48000:cl=stereo"]
+            labs = [f"[{n_in}:a]"] + (["[0:a]"] if info["has_audio"] else []) \
+                + re.findall(r"\[au\d+\]", ";".join(aparts))
             aparts.append("".join(labs) + f"amix=inputs={len(labs)}:duration=first:"
                           "normalize=0,alimiter=limit=0.95[aout]")
             amaps = ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k",
@@ -2282,7 +2321,7 @@ def job_audio_enhance(job_id: str, src: Path, denoise: bool, loudness: bool,
     _set(job_id, progress=96, message="Đo âm lượng sau xử lý...")
     lufs_out = _measure_lufs(job_id, out)
     note = ""
-    if lufs_in == lufs_in and lufs_out == lufs_out:  # not NaN
+    if math.isfinite(lufs_in) and math.isfinite(lufs_out):  # chặn cả NaN lẫn ±inf (video im lặng)
         note = f" · LUFS {lufs_in:.1f} → {lufs_out:.1f}"
     _set(job_id, message="Xong — âm thanh đã xử lý" + note)
     return [out_entry(out)]
@@ -2789,9 +2828,9 @@ REFRAME916_FC = ("[0:v]split[a][b];"
 def job_highlights(job_id: str, src: Path, p: dict):
     """AI tìm khoảnh khắc hay trong video dài → tự cắt thành shorts hoàn chỉnh
     (caption karaoke + khung dọc 9:16 nền mờ) — kiểu Opus Clip nhưng 100% local."""
-    count = min(6, max(1, int(p.get("count", 3))))
-    smin = min(60.0, max(5.0, float(p.get("min_dur", 15))))
-    smax = min(120.0, max(smin + 5, float(p.get("max_dur", 60))))
+    count = min(6, max(1, _safe_int(p.get("count"), 3)))
+    smin = min(60.0, max(5.0, _safe_float(p.get("min_dur"), 15)))
+    smax = min(120.0, max(smin + 5, _safe_float(p.get("max_dur"), 60)))
     make = bool(p.get("make_shorts", True))
     info = media_info(src)
     dur = info["duration"] or 1
@@ -4183,7 +4222,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "1.8.0",
+        "version": "1.8.1",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -4441,7 +4480,7 @@ def create_job(req: JobRequest):
         if len(text) > 5000:
             raise HTTPException(400, "Văn bản quá dài (tối đa 5000 ký tự)")
         voice = p.get("voice") if p.get("voice") in PIPER_VOICE_MAP else "vi"
-        speed = min(1.5, max(0.6, float(p.get("speed", 1.0))))
+        speed = min(1.5, max(0.6, _safe_float(p.get("speed"), 1.0)))
         label = text[:40] + ("…" if len(text) > 40 else "")
         return submit_job("tts", label, job_tts, text, voice, speed)
 
@@ -4463,13 +4502,13 @@ def create_job(req: JobRequest):
             p["engine"] = None
         return submit_job("transcribe", src.name, job_transcribe, src, p)
     if req.type == "silence_cut":
-        margin = min(2.0, max(0.0, float(p.get("margin", 0.2))))
+        margin = min(2.0, max(0.0, _safe_float(p.get("margin"), 0.2)))
         return submit_job("silence_cut", src.name, job_silence_cut, src, margin)
     if req.type == "upscale":
         mode = p.get("mode", "ai")
         if mode not in ("ai", "fast"):
             mode = "ai"
-        scale = int(p.get("scale", 2))
+        scale = _safe_int(p.get("scale"), 2)
         if scale not in (2, 3, 4):
             scale = 2
         model = p.get("model", "realesr-animevideov3")
@@ -4499,7 +4538,7 @@ def create_job(req: JobRequest):
             mode = "blur"
         return submit_job("reframe", src.name, job_reframe, src, mode)
     if req.type == "speed":
-        factor = min(4.0, max(0.25, float(p.get("factor", 2.0))))
+        factor = min(4.0, max(0.25, _safe_float(p.get("factor"), 2.0)))
         return submit_job("speed", src.name, job_speed, src, factor)
     if req.type == "color":
         name = p.get("filter", "vivid")
@@ -4538,14 +4577,14 @@ def create_job(req: JobRequest):
         transition = p.get("transition", "fade")
         if transition not in XFADE_TRANSITIONS:
             transition = "fade"
-        tdur = min(2.0, max(0.2, float(p.get("duration", 0.6))))
+        tdur = min(2.0, max(0.2, _safe_float(p.get("duration"), 0.6)))
         target = p.get("target") if p.get("target") in FRAME_SIZES else "169"
         music = None
         if p.get("music"):
             music = safe_upload_path(str(p["music"]))
             if not music.is_file():
                 raise HTTPException(404, "Không tìm thấy file nhạc")
-        vol = min(1.0, max(0.05, float(p.get("volume", 0.6))))
+        vol = min(1.0, max(0.05, _safe_float(p.get("volume"), 0.6)))
         label = f"{src.name} +{len(files) - 1} clip"
         return submit_job("merge", label, job_merge, files, transition, tdur,
                           target, music, vol)
@@ -4558,7 +4597,7 @@ def create_job(req: JobRequest):
         if not music.is_file():
             raise HTTPException(404, "Cần chọn file nhạc trong kho media")
         target = p.get("target") if p.get("target") in FRAME_SIZES else "916"
-        max_seg = min(120, max(10, int(p.get("max_segments", 60))))
+        max_seg = min(120, max(10, _safe_int(p.get("max_segments"), 60)))
         label = f"{src.name} × nhạc {music.name}"
         return submit_job("beatsync", label, job_beatsync, files, music, target, max_seg)
     if req.type == "audio_enhance":
@@ -4580,8 +4619,8 @@ def create_job(req: JobRequest):
         if not title and not sign and logo is None:
             raise HTTPException(400, "Cần ít nhất tiêu đề, chữ ký hoặc logo")
         corner = p.get("corner") if p.get("corner") in LOGO_CORNERS else "br"
-        opacity = min(1.0, max(0.1, float(p.get("opacity", 0.7))))
-        title_dur = min(10.0, max(1.0, float(p.get("title_dur", 3.0))))
+        opacity = min(1.0, max(0.1, _safe_float(p.get("opacity"), 0.7)))
+        title_dur = min(10.0, max(1.0, _safe_float(p.get("title_dur"), 3.0)))
         return submit_job("brand", src.name, job_brand, src, title, sign, logo,
                           corner, opacity, title_dur)
     if req.type == "audiogram":
@@ -4636,7 +4675,7 @@ def create_job(req: JobRequest):
         mode = p.get("mode", "blur")
         if mode not in ("blur", "pixelate"):
             mode = "blur"
-        strength = min(2.0, max(0.5, float(p.get("strength", 1.0))))
+        strength = min(2.0, max(0.5, _safe_float(p.get("strength"), 1.0)))
         return submit_job("face_blur", src.name, job_face_blur, src, mode, strength)
     if req.type == "lesson":
         if not llm_available() and not claude_available():
@@ -4722,13 +4761,15 @@ def director_stop():
     DIRECTOR_STOP["flag"] = True
     with JOBS_LOCK:
         procs = list(JOB_PROCS.get("__director__", []))
+    stopped = 0
     for pr in procs:
-        if pr.poll() is None:
+        if pr.poll() is None:  # chỉ đếm proc THẬT SỰ đang chạy
             try:
                 pr.kill()
+                stopped += 1
             except OSError:
                 pass
-    return {"stopped": len(procs)}
+    return {"stopped": stopped}
 
 
 # Bộ nhớ hội thoại của Đạo diễn (app cá nhân 1 người — 1 luồng chung, có khoá)
@@ -4760,8 +4801,12 @@ def director(req: DirectorReq):
     if len(msg) > 2000:
         raise HTTPException(400, "Yêu cầu quá dài (tối đa 2000 ký tự)")
     DIRECTOR_STOP["flag"] = False
-    with JOBS_LOCK:  # dọn proc director cũ (đã xong/bị kill) khỏi bảng theo dõi
-        JOB_PROCS.pop("__director__", None)
+    with JOBS_LOCK:  # chỉ dọn proc ĐÃ CHẾT — request song song vẫn Stop được proc đang chạy
+        alive = [pr for pr in JOB_PROCS.get("__director__", []) if pr.poll() is None]
+        if alive:
+            JOB_PROCS["__director__"] = alive
+        else:
+            JOB_PROCS.pop("__director__", None)
 
     # file đang chọn trong app → Claude tự hiểu khi người dùng không nêu tên file
     sel_desc = ""
@@ -4968,8 +5013,10 @@ def save_project(req: ProjectSaveReq):
     blob = json.dumps(payload, ensure_ascii=False)
     if len(blob) > 300_000:
         raise HTTPException(400, "Dự án quá lớn")
-    _proj_path(req.name).write_text(blob, encoding="utf-8")
-    return {"ok": True, "name": req.name}
+    path = _proj_path(req.name)
+    path.write_text(blob, encoding="utf-8")
+    # trả về tên THẬT sau sanitize — client dùng đúng tên này để load/delete
+    return {"ok": True, "name": path.stem}
 
 
 @app.get("/api/projects/{name}")
@@ -5083,7 +5130,13 @@ def thumb(name: str):
 
 PREVIEWS = TMP / "previews"
 PREVIEWS.mkdir(exist_ok=True)
-_PREVIEW_LOCK = threading.Lock()  # tránh 2 request transcode trùng 1 file
+_PREVIEW_LOCKS: dict = {}          # name -> Lock: khoá THEO TỪNG FILE (file to không chặn file khác)
+_PREVIEW_LOCKS_GUARD = threading.Lock()
+
+
+def _preview_lock(name: str) -> threading.Lock:
+    with _PREVIEW_LOCKS_GUARD:
+        return _PREVIEW_LOCKS.setdefault(name, threading.Lock())
 
 
 @app.delete("/api/media/{name}")
@@ -5094,6 +5147,7 @@ def delete_media(name: str):
         raise HTTPException(404, "Không tìm thấy file")
     src.unlink()
     (THUMBS / (name + ".jpg")).unlink(missing_ok=True)
+    (CLIP_DIR / (name + ".npz")).unlink(missing_ok=True)  # chỉ mục tìm cảnh của file này
     for c in PREVIEWS.glob(name + ".*"):
         c.unlink(missing_ok=True)
     return {"ok": True, "deleted": name}
@@ -5110,11 +5164,12 @@ def preview_media(name: str):
     if not info["width"]:
         raise HTTPException(415, "File không có hình")
     out = PREVIEWS / (name + ".mp4")
-    with _PREVIEW_LOCK:
+    with _preview_lock(name):
         if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
             cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
                    "-i", str(src),
-                   "-vf", "scale='min(1280,iw)':-2",
+                   # trunc(../2)*2: nguồn kích thước LẺ (mkv 321x181...) vẫn encode được
+                   "-vf", "scale='trunc(min(1280,iw)/2)*2':-2",
                    "-c:v", "libx264", "-crf", "26", "-preset", "veryfast",
                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                    "-c:a", "aac", "-b:a", "128k", str(out)]

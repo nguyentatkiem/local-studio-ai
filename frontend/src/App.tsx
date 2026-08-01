@@ -187,7 +187,12 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "stabilize", icon: "🧷", name: "Chống rung", desc: "deshake · video quay tay", gpu: false },
   { key: "export", icon: "📤", name: "Xuất preset mạng xã hội", desc: "TikTok · YouTube · 4:5 · GIF · MP3", gpu: false },
 ];
-const TOOL_NAMES = Object.fromEntries(TOOLS.map((t) => [t.key, t.name]));
+const TOOL_NAMES: Record<string, string> = {
+  ...Object.fromEntries(TOOLS.map((t) => [t.key, t.name])),
+  // job type không có nút tool riêng (gọi từ timeline/panel khác) — tránh toast "undefined"
+  cutlist: "Cắt timeline", composite: "Lớp phủ multi-track",
+  clip_index: "Lập chỉ mục tìm cảnh", viral_caption: "Phụ đề Viral",
+};
 
 const FONTS = ["Arial", "Arial Black", "Impact", "Segoe UI", "Verdana", "Tahoma",
   "Georgia", "Times New Roman", "Comic Sans MS", "Consolas", "Bahnschrift"];
@@ -514,6 +519,18 @@ export default function App() {
     } catch (e) { showToast("❌ " + String(e)); }
   };
 
+  // chạy job LUÔN trên video đang chọn — cho thao tác timeline (cắt/lớp phủ),
+  // vì IN/OUT + lớp thuộc về đúng video này, KHÔNG theo chế độ "Chọn nhiều"
+  const runOne = async (type: string, params: Record<string, unknown>) => {
+    if (!selected) { showToast("⚠️ Chọn video trước"); return; }
+    try {
+      await createJob(type, selected.name, params);
+      setJobs(await getJobs());
+      setRightTab("jobs");
+      showToast(`🚀 "${TOOL_NAMES[type] ?? type}" — ${selected.name}`);
+    } catch (e) { showToast("❌ " + String(e)); }
+  };
+
   const sendDirector = async () => {
     const m = dirMsg.trim();
     if (!m || dirBusy) return;
@@ -665,9 +682,9 @@ export default function App() {
     };
     v.addEventListener("timeupdate", onT);
     return () => v.removeEventListener("timeupdate", onT);
-    // KHÔNG đưa stageSrc vào deps: nó khai báo bằng const bên dưới → đọc ở đây gây
-    // TDZ ReferenceError làm React sập trắng/đen màn hình. Chỉ cần tool + vcClusters.
-  }, [tool, vcClusters]);
+    // KHÔNG đưa stageSrc vào deps (TDZ sập app) — dùng các state gốc để re-attach
+    // khi video remount (đổi video/preview), tránh listener nằm trên element cũ
+  }, [tool, vcClusters, selected, preview, ab, previewFb]);
 
   // seed kích thước khung từ video đang chọn → "1 chạm" (không analyze) tính cỡ chữ đúng
   useEffect(() => {
@@ -994,6 +1011,7 @@ export default function App() {
                 onPointerMove={(e) => {
                   const g = ovDrag.current;
                   if (!g) return;
+                  if (!e.buttons) { ovDrag.current = null; return; }  // thả chuột ngoài canvas → không "dính"
                   const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
                   const nx = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
                   const ny = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
@@ -1134,13 +1152,13 @@ export default function App() {
               <TrimBar vidRef={vidElRef} dur={selected.info.duration}
                 name={selected.name} srcKey={previewFb ?? stageSrc ?? ""}
                 onSeek={(t) => { if (vidElRef.current) vidElRef.current.currentTime = t; }}
-                onKeep={(a, b) => run("cutlist", { segments: [{ start: a, end: b }] })}
+                onKeep={(a, b) => runOne("cutlist", { segments: [{ start: a, end: b }] })}
                 onDrop={(a, b) => {
                   const d = selected.info.duration;
                   const keep = [{ start: 0, end: a }, { start: b, end: d }]
                     .filter((s) => s.end - s.start > 0.2);
                   if (!keep.length) { showToast("⚠️ Cắt bỏ hết thì không còn gì"); return; }
-                  run("cutlist", { segments: keep });
+                  runOne("cutlist", { segments: keep });
                 }}
                 onAdd={(a, b) => { setSegs((s) => [...s, { start: a, end: b }]); showToast("➕ Đã thêm đoạn vào danh sách ghép"); }} />
               {segs.length > 0 && (
@@ -1152,7 +1170,7 @@ export default function App() {
                         <button onClick={() => setSegs((x) => x.filter((_, j) => j !== i))}>✕</button>
                       </span>
                     ))}
-                    <button className="btn sm pri" onClick={() => { run("cutlist", { segments: segs }); setSegs([]); }}>
+                    <button className="btn sm pri" onClick={() => { runOne("cutlist", { segments: segs }); setSegs([]); }}>
                       🎬 Render {segs.length} đoạn
                     </button>
                     <button className="btn sm" onClick={() => setSegs([])}>Xoá hết</button>
@@ -1282,7 +1300,7 @@ export default function App() {
                   <button className="btn sm" onClick={() => addLayer("audio")}>🎵 Nhạc</button>
                   <button className="btn sm" onClick={() => addLayer("video")}>📹 Video PiP</button>
                   {layers.length > 0 && (
-                    <button className="btn sm pri" onClick={() => run("composite", {
+                    <button className="btn sm pri" onClick={() => runOne("composite", {
                       layers: layers.map(({ id, ...rest }) => rest),
                     })}>🎬 Render {layers.length} lớp phủ</button>
                   )}
@@ -2321,9 +2339,15 @@ export default function App() {
                       <button key={i} className="cliphit" onClick={() => {
                         const item = media.find((m) => m.name === r.file);
                         if (!item) { showToast("File không còn trong kho"); return; }
-                        seekRef.current = r.t;
-                        setPreview(null); setSelected(item);
-                        if (vidElRef.current && selected?.name === r.file) vidElRef.current.currentTime = r.t;
+                        setPreview(null);
+                        if (selected?.name === r.file && vidElRef.current) {
+                          // video đang mở sẵn → tua thẳng, KHÔNG cắm seekRef (tránh
+                          // video mở SAU đó bị nhảy mốc oan)
+                          vidElRef.current.currentTime = r.t;
+                        } else {
+                          seekRef.current = r.t;
+                          setSelected(item);
+                        }
                         showToast(`▶ ${r.file} @ ${fmtDur(r.t)}`);
                       }}>
                         <img src={`/api/thumb/${encodeURIComponent(r.file)}`} alt="" loading="lazy" />
@@ -2341,12 +2365,12 @@ export default function App() {
                   <div className="field"><label>Nhạc nền (tệp audio trong kho media)</label>
                     <select value={musicFile} onChange={(e) => setMusicFile(e.target.value)}>
                       <option value="">— chọn tệp nhạc —</option>
-                      {media.filter((m) => !m.info.width).map((m) => (
+                      {audioFiles.map((m) => (
                         <option key={m.name} value={m.name}>{m.name}</option>
                       ))}
                     </select>
                   </div>
-                  {media.filter((m) => !m.info.width).length === 0 &&
+                  {audioFiles.length === 0 &&
                     <div className="hint">Chưa có tệp nhạc — kéo thả file .mp3/.wav vào kho media trước.</div>}
                   <div className="field">
                     <div className="sl-h"><span>Âm lượng nhạc</span><b>{Math.round(musicVol * 100)}%</b></div>
