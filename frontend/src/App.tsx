@@ -20,7 +20,8 @@ const TOOL_CATS: Record<string, ToolCat> = {
   pipeline: "ai", viral: "ai", director: "ai", highlights: "ai", broll: "ai",
   translate: "ai", social_pack: "ai", dub: "ai", qc: "ai", script: "ai",
   thumbnail: "ai", auto_edit: "ai", transcribe: "ai", content: "ai", lesson: "ai",
-  clipsearch: "ai", folder: "ai",
+  clipsearch: "ai", folder: "ai", autoframe: "edit", filler_cut: "ai",
+  enhance: "edit", retouch: "edit", voicefx: "audio",
   merge: "edit", beatsync: "edit", silence_cut: "edit", upscale: "edit",
   rife: "edit", bg_remove: "edit", reframe: "edit", speed: "edit", color: "edit",
   grade: "edit", track: "edit", stabilize: "edit", face_blur: "edit", brand: "edit",
@@ -41,7 +42,8 @@ const FEAT_KEY: Record<string, string> = {
   translate: "translate", social_pack: "social_pack", dub: "dub", qc: "qc",
   script: "script", thumbnail: "thumbnail", viral: "viral_caption",
   pipeline: "export", export: "export", grade: "grade", track: "track",
-  clipsearch: "clipsearch", folder: "folder",
+  clipsearch: "clipsearch", folder: "folder", autoframe: "autoframe",
+  voicefx: "voicefx", enhance: "enhance", filler_cut: "filler_cut", retouch: "retouch",
   reframe: "ffmpeg", speed: "ffmpeg", color: "ffmpeg", music: "ffmpeg",
   stabilize: "ffmpeg", merge: "ffmpeg", audio_enhance: "ffmpeg",
   brand: "ffmpeg", audiogram: "ffmpeg",
@@ -71,6 +73,9 @@ const TOOL_REQS: Record<string, string> = {
   viral: "cần whisper + font trong binaries/fonts (setup-binaries.sh)",
   track: "cần pip install ultralytics + model sam2.1_t.pt trong binaries/sam2",
   clipsearch: "cần pip install open_clip_torch (model tự tải lần đầu)",
+  autoframe: "cần opencv + model YuNet (chạy ./setup-binaries.sh)",
+  retouch: "cần opencv + model YuNet (chạy ./setup-binaries.sh)",
+  filler_cut: "cần faster-whisper/MLX",
 };
 
 // Ngôn ngữ đích cho Dịch phụ đề AI
@@ -116,7 +121,8 @@ type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" |
   | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
   | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll" | "viral"
   | "translate" | "social_pack" | "dub" | "qc" | "script" | "thumbnail"
-  | "grade" | "track" | "clipsearch" | "folder" | "pipeline";
+  | "grade" | "track" | "clipsearch" | "folder" | "pipeline"
+  | "autoframe" | "voicefx" | "enhance" | "filler_cut" | "retouch";
 
 // Lớp phủ multi-track (đè lên video nền theo mốc thời gian)
 type Layer = {
@@ -138,6 +144,11 @@ const PIPE_PALETTE: { type: string; label: string; def: Record<string, unknown> 
   { type: "speed", label: "⏩ Tốc độ", def: { factor: 1.5 } },
   { type: "color", label: "🎨 Filter màu", def: { filter: "vivid" } },
   { type: "grade", label: "🎛️ Chỉnh màu PRO", def: { contrast: 1.1, vibrance: 0.4, temperature: -15 } },
+  { type: "enhance", label: "✨ Đẹp màu 1 chạm", def: { mode: "natural" } },
+  { type: "autoframe", label: "📱 Auto reframe bám mặt", def: { ratio: "916" } },
+  { type: "filler_cut", label: "🧹 Cắt từ đệm", def: { model: "base" } },
+  { type: "retouch", label: "💆 Mịn da", def: { strength: 1 } },
+  { type: "voicefx", label: "🎭 Đổi giọng", def: { effect: "deep" } },
   { type: "stabilize", label: "🧷 Chống rung", def: {} },
   { type: "reframe", label: "📐 Khung 9:16", def: { mode: "blur" } },
   { type: "rife", label: "🎞️ Nội suy mượt", def: { mode: "smooth" } },
@@ -178,6 +189,11 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "grade", icon: "🎛️", name: "Bảng chỉnh màu PRO", desc: "phơi sáng · tương phản · nhiệt độ · vibrance · nét", gpu: false },
   { key: "track", icon: "🎯", name: "Track đối tượng (SAM 2)", desc: "bấm vào vật/người → AI bám theo → mờ/spotlight/tách nền", gpu: true },
   { key: "clipsearch", icon: "🔎", name: "Tìm cảnh bằng AI (CLIP)", desc: "gõ mô tả → tìm đúng khoảnh khắc trong cả kho video", gpu: true },
+  { key: "autoframe", icon: "📱", name: "Auto Reframe bám chủ thể", desc: "AI dò mặt → khung dọc LIA THEO người nói (CapCut Pro)", gpu: false },
+  { key: "filler_cut", icon: "🧹", name: "Tự cắt từ đệm (ừm, à...)", desc: "AI nghe → cắt sạch ừm/à/uh khỏi video", gpu: false },
+  { key: "enhance", icon: "✨", name: "Đẹp màu 1 chạm", desc: "tự cân bằng trắng + màu sống động + nét", gpu: false },
+  { key: "retouch", icon: "💆", name: "Làm mịn da (retouch)", desc: "AI dò mặt → mịn da vùng mặt, nền giữ nét", gpu: false },
+  { key: "voicefx", icon: "🎭", name: "Đổi giọng (voice FX)", desc: "sóc chuột · trầm · robot · điện thoại · vang · hang", gpu: false },
   { key: "music", icon: "🎵", name: "Nhạc nền + ducking", desc: "tự nén nhạc khi có giọng nói", gpu: false },
   { key: "face_blur", icon: "🫥", name: "Làm mờ mặt tự động", desc: "YuNet AI · che mặt học sinh/người lạ", gpu: false },
   { key: "content", icon: "📝", name: "AI viết nội dung", desc: "tiêu đề · mô tả · hashtags · chapters", gpu: true },
@@ -444,6 +460,11 @@ export default function App() {
   const [projName, setProjName] = useState("");
   const [projList, setProjList] = useState<ProjectInfo[]>([]);
   const [projPick, setProjPick] = useState("");
+  // Gói CapCut-parity
+  const [afRatio, setAfRatio] = useState("916");
+  const [vfxFx, setVfxFx] = useState("deep");
+  const [enhMode, setEnhMode] = useState("natural");
+  const [rtStr, setRtStr] = useState(1.0);
   // Edit hàng loạt cả thư mục ổ cứng
   const [fdPath, setFdPath] = useState("");
   const [fdRec, setFdRec] = useState(false);
@@ -795,7 +816,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v1.9 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v2.0 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -2270,6 +2291,98 @@ export default function App() {
                       })}>🎛️ Render bản chỉnh màu</button>
                   </div>
                   <div className="hint">Xem thử CSS chưa gồm nhuộm Tối/Sáng — bản render ffmpeg mới có.</div>
+                </>
+              )}
+
+              {tool === "autoframe" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    📱 Auto Reframe kiểu CapCut Pro: AI dò khuôn mặt từng khung hình,
+                    khung dọc <b>lia mượt theo người nói</b> — không phải crop giữa cứng.
+                  </div>
+                  <div className="field"><label>Khung đích</label>
+                    <div className="seg">
+                      {[["916", "9:16 TikTok"], ["45", "4:5 Feed"], ["11", "1:1 Vuông"]].map(([v, l]) => (
+                        <button key={v} className={afRatio === v ? "on" : ""} onClick={() => setAfRatio(v)}>{l}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <button className="btn pri big" onClick={() => run("autoframe", { ratio: afRatio })}>
+                    📱 Auto reframe bám chủ thể
+                  </button>
+                </>
+              )}
+
+              {tool === "filler_cut" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🧹 Audio Cleanup kiểu CapCut: AI nghe từng từ → tự cắt sạch
+                    "ừm", "à", "ờ", "uh", "um"... và nối mượt phần còn lại.
+                  </div>
+                  <div className="field"><label>Model Whisper</label>
+                    <div className="seg">
+                      {["tiny", "base", "small", "large-v3-turbo"].map((m) => (
+                        <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <button className="btn pri big" onClick={() => run("filler_cut", { model: whModel })}>
+                    🧹 Cắt sạch từ đệm
+                  </button>
+                </>
+              )}
+
+              {tool === "enhance" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    ✨ Đẹp màu 1 chạm: tự cân bằng trắng + màu sống động (vibrance) +
+                    tăng nét nhẹ — như nút "Enhance" của CapCut.
+                  </div>
+                  <div className="field"><label>Phong cách</label>
+                    <div className="seg">
+                      <button className={enhMode === "natural" ? "on" : ""} onClick={() => setEnhMode("natural")}>🌿 Tự nhiên</button>
+                      <button className={enhMode === "vivid" ? "on" : ""} onClick={() => setEnhMode("vivid")}>🌈 Rực rỡ</button>
+                    </div>
+                  </div>
+                  <button className="btn pri big" onClick={() => run("enhance", { mode: enhMode })}>
+                    ✨ Đẹp màu 1 chạm
+                  </button>
+                </>
+              )}
+
+              {tool === "retouch" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    💆 Retouch kiểu CapCut: AI dò mặt → làm mịn da CHỈ vùng mặt
+                    (mắt/môi/nền vẫn nét), bám mặt chống nhấp nháy.
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Độ mịn</span><b>{rtStr.toFixed(1)}</b></div>
+                    <input type="range" min={0.3} max={2} step={0.1} value={rtStr}
+                      onChange={(e) => setRtStr(parseFloat(e.target.value))} />
+                  </div>
+                  <button className="btn pri big" onClick={() => run("retouch", { strength: rtStr })}>
+                    💆 Làm mịn da
+                  </button>
+                </>
+              )}
+
+              {tool === "voicefx" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎭 Đổi giọng kiểu CapCut — áp cho video hoặc file audio, giữ nguyên hình.
+                  </div>
+                  <div className="field"><label>Hiệu ứng giọng</label>
+                    <div className="fgrid">
+                      {[["chipmunk", "🐿 Sóc chuột"], ["deep", "🐻 Trầm ấm"], ["robot", "🤖 Robot"],
+                        ["phone", "📞 Điện thoại"], ["echo", "🎤 Vang sân khấu"], ["cave", "🕳 Hang động"]].map(([v, l]) => (
+                        <button key={v} className={"fcard" + (vfxFx === v ? " on" : "")} onClick={() => setVfxFx(v)}>{l}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <button className="btn pri big" onClick={() => run("voicefx", { effect: vfxFx })}>
+                    🎭 Đổi giọng
+                  </button>
                 </>
               )}
 

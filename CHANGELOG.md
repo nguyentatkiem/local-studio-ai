@@ -1,14 +1,26 @@
 # 📜 Nhật ký cập nhật — Local Studio
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.9.0-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-45-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-2.0.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-50-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/100%25-local--first-7ACB6B?style=for-the-badge" alt="local">
 </p>
 
 > **Local Studio** — trình dựng video AI chạy **100% trên máy bạn**. Không cloud, không credit, không watermark. Footage không bao giờ rời máy.
 
 ---
+
+## 🎬 v2.0 — Gói CapCut-parity · <sub>02/08/2026</sub>
+
+5 tính năng đinh của CapCut 2026 — bản local, không phí thuê bao:
+
+- **📱 Auto Reframe bám chủ thể** — AI dò mặt từng khung, khung 9:16/4:5/1:1 *lia mượt theo người nói* (CapCut Pro).
+- **🧹 Tự cắt từ đệm** — nghe từng từ, cắt sạch "ừm/à/uh/um" và nối mượt (CapCut Audio Cleanup).
+- **💆 Làm mịn da (retouch)** — mịn CHỈ vùng mặt, mắt/môi/nền giữ nét, bám mặt chống nhấp nháy.
+- **✨ Đẹp màu 1 chạm** — tự cân bằng trắng + vibrance + nét (CapCut Enhance), 2 phong cách.
+- **🎭 Đổi giọng** — sóc chuột · trầm · robot · điện thoại · vang · hang động.
+
+Tất cả nối được vào 🔗 Chuỗi tự động + 📁 Edit cả thư mục + 🎬 Đạo diễn AI ra lệnh miệng.
 
 ## 📁 v1.9 — Edit hàng loạt cả THƯ MỤC · <sub>02/08/2026</sub>
 

@@ -1,8 +1,8 @@
 # 🎬 Local Studio — AI Video Editor chạy 100% trên máy
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.9.0-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-45-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-2.0.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-50-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/cloud-0%25-FF6B57?style=for-the-badge" alt="no cloud">
   <img src="https://img.shields.io/badge/watermark-kh%C3%B4ng-7ACB6B?style=for-the-badge" alt="no watermark">
 </p>
@@ -28,7 +28,7 @@
 > 🌐 **Phát hành web tạm qua Cloudflare Tunnel:** xem `DEPLOY-WEB.md`.
 > 🎯 **Track đối tượng SAM 2** cần thêm: `pip install ultralytics` · **Tìm cảnh CLIP** cần: `pip install open_clip_torch` (trong venv backend).
 
-## ✨ 45 tính năng (v1.9)
+## ✨ 50 tính năng (v2.0)
 
 ### 🎞️ Studio dựng — timeline & lớp phủ
 | Tính năng | Mô tả |
@@ -51,6 +51,7 @@
 | 🫥 Làm mờ mặt (chống nhấp nháy) · 🪄 tách nền người (webm alpha) | YuNet · RVM |
 | 🔍 Upscale ×2–4 · 🎞️ nội suy 60fps/slow-mo | Real-ESRGAN · RIFE (GPU) |
 | 🗣️ TTS **5 giọng** (2 Việt + 3 Anh) · 📻 audiogram · 🥁 beat-sync · 🎚️ chuẩn âm (đo LUFS) | Piper · librosa · FFmpeg |
+| 📱 **Auto Reframe bám chủ thể** (9:16/4:5/1:1 lia theo mặt) · 💆 **mịn da retouch** · 🧹 **tự cắt từ đệm** ừm/uh · ✨ đẹp màu 1 chạm · 🎭 đổi giọng 6 kiểu | YuNet · Whisper · FFmpeg |
 
 ### 🧠 Não Claude (gói sub — tuỳ chọn, có công tắc trong ⚙)
 | Tính năng | Mô tả |

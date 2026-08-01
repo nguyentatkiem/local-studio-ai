@@ -672,9 +672,11 @@ def _best_cached_mlx(prefer: str):
 
 
 def _speech_recognize(job_id: str, src: Path, model_size: str, language,
-                      engine, dur: float, lo: float = 0, hi: float = 90):
+                      engine, dur: float, lo: float = 0, hi: float = 90,
+                      initial_prompt: str = None, vad: bool = True):
     """Chạy Whisper (MLX Metal hoặc faster-whisper CPU) → (seg_list, lines, lang).
-    Tiến trình được ánh xạ vào khoảng [lo, hi]."""
+    Tiến trình ánh xạ vào [lo, hi]. initial_prompt: mồi để giữ từ đệm (ừm/uh) —
+    Whisper mặc định hay TỰ lược filler words khỏi transcript."""
     # chỉ chấp nhận mlx/faster; giá trị khác (vd aiEngine "local"/"claude") → tự chọn
     if engine not in ("mlx", "faster"):
         engine = None
@@ -695,7 +697,8 @@ def _speech_recognize(job_id: str, src: Path, model_size: str, language,
                 try:
                     res = mlx_whisper.transcribe(
                         str(src), path_or_hf_repo=repo, language=language,
-                        word_timestamps=True, verbose=None)
+                        word_timestamps=True, verbose=None,
+                        initial_prompt=initial_prompt)
                 except Exception:  # noqa: BLE001 - mạng lỗi/không có → dùng model cache
                     m2, d2 = _best_cached_mlx(model_size)
                     if not d2:
@@ -710,7 +713,8 @@ def _speech_recognize(job_id: str, src: Path, model_size: str, language,
             if path not in (None, "__done__"):
                 res = mlx_whisper.transcribe(
                     str(src), path_or_hf_repo=path, language=language,
-                    word_timestamps=True, verbose=None)
+                    word_timestamps=True, verbose=None,
+                    initial_prompt=initial_prompt)
             _cancel_point(job_id)
             seg_list = [_MlxSeg(s) for s in res["segments"]]
             lines = [s.text.strip() for s in seg_list]
@@ -722,8 +726,8 @@ def _speech_recognize(job_id: str, src: Path, model_size: str, language,
 
             _set(job_id, message="Đang nhận dạng giọng nói (word-level)...")
             segments, tr_info = model.transcribe(
-                str(src), language=language, vad_filter=True, beam_size=5,
-                word_timestamps=True,
+                str(src), language=language, vad_filter=vad, beam_size=5,
+                word_timestamps=True, initial_prompt=initial_prompt,
             )
 
             seg_list = []
@@ -1509,6 +1513,348 @@ def job_grade(job_id: str, src: Path, p: dict):
             "-c:v", "libx264", "-crf", "18", "-preset", "medium",
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(out)]
     run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: Auto Reframe bám chủ thể
+def job_autoframe(job_id: str, src: Path, p: dict):
+    """Auto Reframe kiểu CapCut: YuNet dò khuôn mặt từng khung → làm mượt EMA →
+    cửa sổ crop 9:16 / 1:1 / 4:5 BÁM THEO chủ thể (không phải crop giữa tĩnh)."""
+    import cv2
+    import numpy as np
+
+    if not YUNET_ONNX.exists():
+        raise RuntimeError("Chưa có model YuNet trong binaries/yunet")
+    info = media_info(src)
+    w, h = info["width"], info["height"]
+    if not w or not h:
+        raise RuntimeError("Cần video có hình")
+    fps = info["fps"] or 30
+    total = max(1, int((info["duration"] or 1) * fps))
+    ratio = p.get("ratio") if p.get("ratio") in ("916", "11", "45") else "916"
+    rw, rh = {"916": (9, 16), "11": (1, 1), "45": (4, 5)}[ratio]
+    cw = min(w, int(h * rw / rh)) // 2 * 2
+    if cw >= w - 4:
+        raise RuntimeError("Video đã hẹp hơn khung đích — không cần auto reframe")
+
+    dw = min(480, w)
+    dh = max(1, int(h * dw / w))
+    det = cv2.FaceDetectorYN.create(str(YUNET_ONNX), "", (dw, dh), 0.7, 0.3, 500)
+    sx = w / dw
+
+    out_v = TMP / f"af_{job_id}.mp4"
+    dec = subprocess.Popen(
+        [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+         "-i", str(src), "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    _track_proc(job_id, dec)
+    enc_log = TMP / f"afenc_{job_id}.log"
+    enc_ef = open(enc_log, "wb")
+    enc = subprocess.Popen(
+        [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{cw}x{h}",
+         "-r", str(fps), "-i", "pipe:0",
+         "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
+         "-pix_fmt", "yuv420p", str(out_v)],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=enc_ef)
+    _track_proc(job_id, enc)
+
+    frame_bytes = w * h * 3
+    cx = w / 2.0          # tâm crop hiện tại (EMA)
+    target = w / 2.0
+    i = found = 0
+    try:
+        while True:
+            if job_id in CANCEL_REQUESTED:
+                dec.kill()
+                enc.kill()
+                raise JobCancelled()
+            buf = dec.stdout.read(frame_bytes)
+            if not buf or len(buf) < frame_bytes:
+                break
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
+            if i % 2 == 0:  # dò mặt mỗi 2 khung cho nhanh
+                small = cv2.resize(frame, (dw, dh))
+                _ok, faces = det.detect(small)
+                if faces is not None and len(faces):
+                    # mặt to nhất = chủ thể chính
+                    fbig = max(faces, key=lambda fc: fc[2] * fc[3])
+                    target = (fbig[0] + fbig[2] / 2) * sx
+                    found += 1
+            cx += (target - cx) * 0.12          # EMA — lia máy mượt, không giật
+            x0 = int(min(w - cw, max(0, cx - cw / 2)))
+            try:
+                enc.stdin.write(np.ascontiguousarray(frame[:, x0:x0 + cw]).tobytes())
+            except BrokenPipeError:
+                break
+            i += 1
+            if i % 15 == 0:
+                _set(job_id, progress=min(94, i / total * 90),
+                     message=f"Auto reframe {rw}:{rh} — {i}/{total} khung, bám {found} lần")
+    finally:
+        dec.stdout.close()
+        dec.wait()
+        if enc.stdin:
+            try:
+                enc.stdin.close()
+            except BrokenPipeError:
+                pass
+        enc.wait()
+        enc_ef.close()
+    _cancel_point(job_id)
+    enc_ok = enc.returncode == 0 and out_v.exists()
+    err = "" if enc_ok or not enc_log.exists() else enc_log.read_text(encoding="utf-8", errors="replace")
+    enc_log.unlink(missing_ok=True)
+    if not enc_ok:
+        out_v.unlink(missing_ok=True)
+        raise RuntimeError(f"Encode failed: {err[-400:]}")
+    out = unique_out(f"{src.stem}_frame{ratio}", ".mp4")
+    if info["has_audio"]:
+        r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                  "-i", str(out_v), "-i", str(src), "-map", "0:v",
+                                  "-map", "1:a?", "-c:v", "copy", "-c:a", "aac",
+                                  "-b:a", "192k", "-shortest", str(out)])
+        out_v.unlink(missing_ok=True)
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Mux audio failed: {r.stderr_text[-300:]}")
+    else:
+        shutil.move(str(out_v), str(out))
+    _set(job_id, message=f"Xong — auto reframe {rw}:{rh}, bám chủ thể {found} lần / {i} khung")
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: voice effects (đổi giọng)
+VOICEFX = {
+    "chipmunk": ("Sóc chuột", "aresample=48000,asetrate=48000*1.35,aresample=48000,atempo=0.7407"),
+    "deep": ("Trầm ấm", "aresample=48000,asetrate=48000*0.8,aresample=48000,atempo=1.25"),
+    "robot": ("Robot", "afftfilt=real='hypot(re,im)*cos(0)':imag='hypot(re,im)*sin(0)':win_size=512:overlap=0.75"),
+    "phone": ("Điện thoại", "highpass=f=300,lowpass=f=3000,acrusher=bits=10:mode=log:aa=1"),
+    "echo": ("Vang sân khấu", "aecho=0.8:0.7:60|120:0.4|0.3"),
+    "cave": ("Hang động", "aecho=0.8:0.9:500|1000:0.3|0.2"),
+}
+
+
+def job_voicefx(job_id: str, src: Path, p: dict):
+    """Đổi giọng kiểu CapCut: sóc chuột / trầm / robot / điện thoại / vang / hang động."""
+    info = media_info(src)
+    if not info["has_audio"]:
+        raise RuntimeError("Tệp không có âm thanh để đổi giọng")
+    dur = info["duration"] or 1
+    fx = p.get("effect") if p.get("effect") in VOICEFX else "chipmunk"
+    label, af = VOICEFX[fx]
+    _set(job_id, message=f"Đổi giọng: {label}...")
+    if info["width"]:
+        out = unique_out(f"{src.stem}_voice_{fx}", ".mp4")
+        vcopy = (info.get("vcodec") or "") in ("h264", "hevc", "mpeg4", "av1")
+        vopts = ["-c:v", "copy"] if vcopy else \
+            ["-c:v", "libx264", "-crf", "19", "-preset", "medium", "-pix_fmt", "yuv420p"]
+        args = ["-i", str(src), "-af", af] + vopts + ["-c:a", "aac", "-b:a", "192k", str(out)]
+    else:
+        out = unique_out(f"{src.stem}_voice_{fx}", ".mp3")
+        args = ["-i", str(src), "-af", af, "-c:a", "libmp3lame", "-b:a", "256k", str(out)]
+    run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
+    _set(job_id, message=f"Xong — giọng {label}")
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: đẹp màu 1 chạm (AI enhance)
+def job_enhance(job_id: str, src: Path, p: dict):
+    """Đẹp màu 1 chạm kiểu CapCut Enhance: tự cân bằng trắng + tăng sức sống màu
+    + nét nhẹ. mode natural (tinh tế) / vivid (rực)."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình")
+    dur = info["duration"] or 1
+    vivid = p.get("mode") == "vivid"
+    vf = ("colorcorrect=analyze=median,"
+          + ("vibrance=intensity=0.55,eq=contrast=1.09:saturation=1.1:brightness=0.015,"
+             "unsharp=5:5:0.8" if vivid else
+             "vibrance=intensity=0.3,eq=contrast=1.05:saturation=1.04,unsharp=5:5:0.5"))
+    out = unique_out(f"{src.stem}_dep", ".mp4")
+    _set(job_id, message="Đẹp màu 1 chạm (" + ("rực rỡ" if vivid else "tự nhiên")
+         + "): cân bằng trắng + vibrance + nét...")
+    args = ["-i", str(src), "-vf", vf, "-c:v", "libx264", "-crf", "18",
+            "-preset", "medium", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", str(out)]
+    run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: tự cắt từ đệm (ừm, à...)
+FILLER_WORDS = {
+    "ừm", "ừmm", "ưm", "ậm", "ừ", "ờ", "ơ", "à", "hử", "hừm", "ừa",
+    "um", "umm", "uh", "uhm", "uhh", "erm", "err", "hmm", "hmmm", "mmm", "ah", "eh",
+}
+
+
+def job_filler_cut(job_id: str, src: Path, p: dict):
+    """Audio Cleanup kiểu CapCut: Whisper word-level tìm từ đệm (ừm, à, uh...) →
+    tự cắt bỏ khỏi video, nối mượt phần còn lại."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình (file audio dùng tính năng khác)")
+    dur = info["duration"] or 1
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    language = p.get("language") if p.get("language") in ("vi", "en") else None
+    # mồi filler words — không có thì Whisper TỰ lược ừm/uh khỏi transcript
+    prompt = ("Ừm, à, ờ... để tôi nghĩ đã. Umm, uh, like, hmm."
+              if language != "en" else "Umm, uh, er, like, you know, hmm... let me think.")
+    seg_list, _l, _lang = _speech_recognize(
+        job_id, src, model_size, language, p.get("engine"), dur, 3, 70,
+        initial_prompt=prompt, vad=False)
+    _cancel_point(job_id)
+
+    cuts = []
+    for seg in seg_list:
+        for wd in (getattr(seg, "words", None) or []):
+            t = re.sub(r"[^\wàáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợ"
+                       r"ùúủũụưứừửữựỳýỷỹỵđ]", "", wd.word.lower().strip())
+            if t in FILLER_WORDS and (wd.end - wd.start) < 1.5:
+                cuts.append((max(0, wd.start - 0.03), min(dur, wd.end + 0.03)))
+    if not cuts:
+        raise RuntimeError("Không phát hiện từ đệm (ừm/à/uh...) nào — video đã sạch 👍")
+    # gộp khoảng chồng nhau → lấy phần bù (đoạn GIỮ)
+    cuts.sort()
+    merged = []
+    for a, b in cuts:
+        if merged and a <= merged[-1][1] + 0.04:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    keep, pos = [], 0.0
+    for a, b in merged:
+        if a - pos > 0.15:
+            keep.append((pos, a))
+        pos = max(pos, b)
+    if dur - pos > 0.15:
+        keep.append((pos, dur))
+    saved = sum(b - a for a, b in merged)
+    _set(job_id, progress=75, message=f"Cắt {len(merged)} từ đệm (tiết kiệm {saved:.1f}s)...")
+    out = unique_out(f"{src.stem}_sach", ".mp4")
+    _cut_and_concat(job_id, src, keep, out, bool(info["has_audio"]))
+    _set(job_id, message=f"Xong — cắt {len(merged)} từ đệm, gọn {saved:.1f}s")
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: làm mịn da (retouch)
+def job_retouch(job_id: str, src: Path, strength: float = 1.0):
+    """Retouch kiểu CapCut: YuNet dò mặt → làm mịn da bilateral CHỈ vùng mặt
+    (nền giữ nét), bám mặt chống nhấp nháy."""
+    import cv2
+    import numpy as np
+
+    if not YUNET_ONNX.exists():
+        raise RuntimeError("Chưa có model YuNet trong binaries/yunet")
+    info = media_info(src)
+    w, h = info["width"], info["height"]
+    if not w or not h:
+        raise RuntimeError("Cần video có hình")
+    fps = info["fps"] or 30
+    total = max(1, int((info["duration"] or 1) * fps))
+    dw = min(640, w)
+    dh = max(1, int(h * dw / w))
+    det = cv2.FaceDetectorYN.create(str(YUNET_ONNX), "", (dw, dh), 0.7, 0.3, 500)
+    sx, sy = w / dw, h / dh
+
+    out_v = TMP / f"rt_{job_id}.mp4"
+    dec = subprocess.Popen(
+        [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+         "-i", str(src), "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    _track_proc(job_id, dec)
+    enc_log = TMP / f"rtenc_{job_id}.log"
+    enc_ef = open(enc_log, "wb")
+    enc = subprocess.Popen(
+        [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
+         "-r", str(fps), "-i", "pipe:0",
+         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+         "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
+         "-pix_fmt", "yuv420p", str(out_v)],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=enc_ef)
+    _track_proc(job_id, enc)
+
+    frame_bytes = w * h * 3
+    blend = min(0.85, 0.45 + 0.2 * strength)
+    active = []  # [x1,y1,x2,y2,ttl]
+    i = faces_n = 0
+    try:
+        while True:
+            if job_id in CANCEL_REQUESTED:
+                dec.kill()
+                enc.kill()
+                raise JobCancelled()
+            buf = dec.stdout.read(frame_bytes)
+            if not buf or len(buf) < frame_bytes:
+                break
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3).copy()
+            small = cv2.resize(frame, (dw, dh))
+            _ok, faces = det.detect(small)
+            for bx in active:
+                bx[4] -= 1
+            active = [bx for bx in active if bx[4] > 0]
+            if faces is not None:
+                for fc in faces:
+                    x, y, fw2, fh2 = fc[0] * sx, fc[1] * sy, fc[2] * sx, fc[3] * sy
+                    if fw2 * fh2 > 0.35 * w * h:
+                        continue
+                    x1 = int(max(0, x - fw2 * 0.1))
+                    y1 = int(max(0, y - fh2 * 0.15))
+                    x2 = int(min(w, x + fw2 * 1.1))
+                    y2 = int(min(h, y + fh2 * 1.2))
+                    if x2 > x1 and y2 > y1:
+                        active = [bx for bx in active
+                                  if not (x1 <= (bx[0] + bx[2]) // 2 <= x2
+                                          and y1 <= (bx[1] + bx[3]) // 2 <= y2)]
+                        active.append([x1, y1, x2, y2, 6])
+                        faces_n += 1
+            for x1, y1, x2, y2, _t in active:
+                roi = frame[y1:y2, x1:x2]
+                if roi.size == 0:
+                    continue
+                # bilateral giữ cạnh (mắt/môi) nhưng mịn da; blend theo cường độ
+                sm = cv2.bilateralFilter(roi, 0, int(30 * strength) + 10, 9)
+                frame[y1:y2, x1:x2] = cv2.addWeighted(sm, blend, roi, 1 - blend, 0)
+            try:
+                enc.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                break
+            i += 1
+            if i % 15 == 0:
+                _set(job_id, progress=min(94, i / total * 90),
+                     message=f"Làm mịn da: {i}/{total} khung · {faces_n} lượt bám mặt")
+    finally:
+        dec.stdout.close()
+        dec.wait()
+        if enc.stdin:
+            try:
+                enc.stdin.close()
+            except BrokenPipeError:
+                pass
+        enc.wait()
+        enc_ef.close()
+    _cancel_point(job_id)
+    enc_ok = enc.returncode == 0 and out_v.exists()
+    err = "" if enc_ok or not enc_log.exists() else enc_log.read_text(encoding="utf-8", errors="replace")
+    enc_log.unlink(missing_ok=True)
+    if not enc_ok:
+        out_v.unlink(missing_ok=True)
+        raise RuntimeError(f"Encode failed: {err[-400:]}")
+    if faces_n == 0:
+        out_v.unlink(missing_ok=True)
+        raise RuntimeError("Không phát hiện khuôn mặt nào trong video để làm mịn")
+    out = unique_out(f"{src.stem}_retouch", ".mp4")
+    if info["has_audio"]:
+        r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                  "-i", str(out_v), "-i", str(src), "-map", "0:v",
+                                  "-map", "1:a?", "-c:v", "copy", "-c:a", "aac",
+                                  "-b:a", "192k", "-shortest", str(out)])
+        out_v.unlink(missing_ok=True)
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Mux audio failed: {r.stderr_text[-300:]}")
+    else:
+        shutil.move(str(out_v), str(out))
+    _set(job_id, message=f"Xong — làm mịn da, {faces_n} lượt bám mặt trên {i} khung")
     return [out_entry(out)]
 
 
@@ -4222,7 +4568,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "1.9.0",
+        "version": "2.0.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -4247,6 +4593,11 @@ def health():
             "cutlist": ffmpeg_ok,
             "composite": ffmpeg_ok,
             "folder": ffmpeg_ok,
+            "autoframe": cv2_available() and YUNET_ONNX.exists() and ffmpeg_ok,
+            "voicefx": ffmpeg_ok,
+            "enhance": ffmpeg_ok,
+            "filler_cut": whisper_ok and ffmpeg_ok,
+            "retouch": cv2_available() and YUNET_ONNX.exists() and ffmpeg_ok,
             "track": sam2_available() and ffmpeg_ok,
             "clipsearch": clip_available() and ffmpeg_ok,
             "music": ffmpeg_ok,
@@ -4352,6 +4703,16 @@ def _run_step(job_id: str, jtype: str, src: Path, p: dict) -> Path:
         outs = job_grade(job_id, src, dict(p))
     elif jtype == "cutlist":
         outs = job_cutlist(job_id, src, dict(p))
+    elif jtype == "enhance":
+        outs = job_enhance(job_id, src, dict(p))
+    elif jtype == "voicefx":
+        outs = job_voicefx(job_id, src, dict(p))
+    elif jtype == "autoframe":
+        outs = job_autoframe(job_id, src, dict(p))
+    elif jtype == "filler_cut":
+        outs = job_filler_cut(job_id, src, dict(p))
+    elif jtype == "retouch":
+        outs = job_retouch(job_id, src, min(2.0, max(0.3, _safe_float(p.get("strength"), 1.0))))
     elif jtype == "stabilize":
         outs = job_stabilize(job_id, src)
     elif jtype == "reframe":
@@ -4412,6 +4773,7 @@ PIPELINE_STEP_TYPES = {
     "silence_cut", "speed", "color", "grade", "cutlist", "stabilize", "reframe",
     "rife", "upscale", "bg_remove", "audio_enhance", "face_blur", "brand",
     "export", "transcribe", "viral_caption", "broll", "music",
+    "enhance", "voicefx", "autoframe", "filler_cut", "retouch",
 }
 
 
@@ -4458,6 +4820,8 @@ def job_pipeline(job_id: str, src: Path, p: dict):
 STEP_LABELS = {
     "silence_cut": "cắt lặng", "speed": "tốc độ", "color": "filter màu",
     "grade": "chỉnh màu PRO", "cutlist": "cắt timeline",
+    "enhance": "đẹp màu 1 chạm", "voicefx": "đổi giọng", "autoframe": "auto reframe",
+    "filler_cut": "cắt từ đệm", "retouch": "mịn da",
     "stabilize": "chống rung", "reframe": "khung 9:16", "rife": "nội suy",
     "upscale": "upscale", "bg_remove": "tách nền", "audio_enhance": "chuẩn âm",
     "face_blur": "che mặt", "brand": "logo/tiêu đề", "export": "xuất preset",
@@ -4569,6 +4933,23 @@ def create_job(req: JobRequest):
         return submit_job("cutlist", src.name, job_cutlist, src, dict(p))
     if req.type == "composite":
         return submit_job("composite", src.name, job_composite, src, dict(p))
+    if req.type == "autoframe":
+        if not cv2_available() or not YUNET_ONNX.exists():
+            raise HTTPException(400, "Cần opencv + model YuNet (chạy setup-binaries.sh)")
+        return submit_job("autoframe", src.name, job_autoframe, src, dict(p))
+    if req.type == "voicefx":
+        return submit_job("voicefx", src.name, job_voicefx, src, dict(p))
+    if req.type == "enhance":
+        return submit_job("enhance", src.name, job_enhance, src, dict(p))
+    if req.type == "filler_cut":
+        if not whisper_available_any():
+            raise HTTPException(400, "Cần whisper (faster/MLX) để nhận dạng lời nói")
+        return submit_job("filler_cut", src.name, job_filler_cut, src, dict(p))
+    if req.type == "retouch":
+        if not cv2_available() or not YUNET_ONNX.exists():
+            raise HTTPException(400, "Cần opencv + model YuNet (chạy setup-binaries.sh)")
+        rt_str = min(2.0, max(0.3, _safe_float(p.get("strength"), 1.0)))
+        return submit_job("retouch", src.name, job_retouch, src, rt_str)
     if req.type == "track":
         if not sam2_available():
             raise HTTPException(400, "Chưa cài SAM 2 — pip install ultralytics + tải sam2.1_t.pt vào binaries/sam2")
@@ -4721,7 +5102,7 @@ DIRECTOR_ALLOWED_TYPES = {
     "auto_edit", "reframe", "speed", "color", "music", "stabilize", "merge",
     "beatsync", "audio_enhance", "brand", "audiogram", "highlights", "content",
     "face_blur", "tts", "lesson", "broll", "viral_caption", "pipeline",
-    "grade", "cutlist",
+    "grade", "cutlist", "enhance", "voicefx", "autoframe", "filler_cut", "retouch",
 }
 
 DIRECTOR_CATALOG = """\
@@ -4749,6 +5130,11 @@ DIRECTOR_CATALOG = """\
 - broll: tự chèn B-roll (cảnh minh hoạ) tải từ Pexels đè lên video người nói. params: count(1-6 số đoạn), ai(local/claude)
 - tts: đọc văn bản (KHÔNG cần file). params: text(chuỗi), voice(vi/en), speed(0.6-1.5)
 - grade: bảng chỉnh màu chuyên nghiệp. params: exposure(-3..3), brightness(-1..1), contrast(0..3, mặc định 1), saturation(0..3, mặc định 1), temperature(-100 ấm..100 lạnh), hue(-180..180), vibrance(-2..2), gamma(0.3..3), sharp(0..5), zoom(1..2), sh_hue+sh_sat(nhuộm vùng tối), hl_hue+hl_sat(nhuộm vùng sáng)
+- enhance: đẹp màu 1 chạm (tự cân bằng trắng + vibrance). params: mode(natural/vivid)
+- voicefx: đổi giọng. params: effect(chipmunk/deep/robot/phone/echo/cave)
+- autoframe: auto reframe BÁM CHỦ THỂ (AI dò mặt, crop dọc lia theo người). params: ratio(916/11/45)
+- filler_cut: tự cắt từ đệm ừm/à/uh khỏi video. params: model(tiny/base/small)
+- retouch: làm mịn da vùng mặt. params: strength(0.3-2)
 - cutlist: cắt giữ các đoạn theo mốc giây rồi nối lại (dùng khi người dùng nêu mốc thời gian cần giữ/cắt bỏ). params: segments=[{"start":giây,"end":giây}, ...] — các đoạn GIỮ LẠI, theo thứ tự
 - pipeline: CHUỖI NỐI TIẾP nhiều bước trên 1 video (output bước này làm input bước sau). DÙNG KHI người dùng muốn "A rồi B rồi C" trên CÙNG video. params: steps=[{"type":"<loại>","params":{...}}, ...]. Loại nối được: silence_cut, speed, color, grade, cutlist, stabilize, reframe, rife, upscale, bg_remove, audio_enhance, face_blur, brand, export, transcribe, viral_caption, broll, music. VD "cắt lặng rồi tăng tốc rồi xuất tiktok" → 1 action pipeline steps=[{type:silence_cut},{type:speed,params:{factor:1.5}},{type:export,params:{preset:tiktok}}]"""
 
