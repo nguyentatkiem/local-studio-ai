@@ -5005,7 +5005,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,

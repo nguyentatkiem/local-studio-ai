@@ -1,7 +1,7 @@
 # 📜 Nhật ký cập nhật — Local Studio
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.1.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/version-2.2.0-FFB23F?style=for-the-badge" alt="version">
   <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-60-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/100%25-local--first-7ACB6B?style=for-the-badge" alt="local">
 </p>
@@ -9,6 +9,12 @@
 > **Local Studio** — trình dựng video AI chạy **100% trên máy bạn**. Không cloud, không credit, không watermark. Footage không bao giờ rời máy.
 
 ---
+
+## 💅 v2.2 — Giao diện CapCut toàn diện · <sub>02/08/2026</sub>
+
+- Theme tối sâu tương phản cao, **accent cyan** kiểu CapCut cho mọi nút hành động.
+- **Lưới công cụ dạng thẻ 2 cột** (icon to + tên) thay danh sách dài · **ô tìm công cụ** 🔍 · tab nhóm dính đầu khi cuộn.
+- Khung xem lớn hơn, panel tuỳ chọn có tiêu đề icon, timeline/chip/segment đồng bộ màu mới.
 
 ## 🤖 v2.1 — Tự động hoá TỐI ĐA · <sub>02/08/2026</sub>
 

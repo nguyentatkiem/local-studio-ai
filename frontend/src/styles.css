@@ -1,9 +1,11 @@
 /* LOCAL STUDIO — theme theo file mẫu thiết kế (amber/dark), font hệ thống để giữ 100% offline */
 :root{
-  --bg:#0F0F12; --p1:#17171C; --p2:#1E1E25; --p3:#26262F; --p4:#2F2F3A;
-  --line:#2C2C36; --line2:#383843;
-  --ink:#EDEEF2; --dim:#9A9AA8; --faint:#63636F;
+  /* theme v2.2 — tối sâu kiểu CapCut, tương phản cao, accent cyan */
+  --bg:#0A0A0D; --p1:#131318; --p2:#1B1B22; --p3:#24242D; --p4:#2E2E39;
+  --line:#26262F; --line2:#34343F;
+  --ink:#F2F3F7; --dim:#A3A4B2; --faint:#6B6C78;
   --amber:#FFB23F; --amber2:#C77A15; --amberg:rgba(255,178,63,.14);
+  --acc:#00E5D1; --acc2:#00A8FF; --accg:rgba(0,229,209,.13);
   --ice:#46D6C6; --iceg:rgba(70,214,198,.14); --warn:#FF6B57;
   --mono:'Cascadia Mono','JetBrains Mono',ui-monospace,Consolas,monospace;
   --ui:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,sans-serif;
@@ -399,3 +401,72 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;bac
 .pipebtns button:disabled{opacity:.3}
 .pipedel:hover{color:var(--warn)!important;border-color:rgba(255,107,87,.5)!important}
 .pipebody select{width:100%;font-size:12px}
+
+/* ================================================================
+   v2.2 — ĐẠI TU GIAO DIỆN KIỂU CAPCUT (override cuối file)
+   ================================================================ */
+
+/* nút hành động chính: gradient cyan CapCut, to rõ */
+.btn.pri{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#04131A;
+  font-weight:700;border:none}
+.btn.pri:hover{filter:brightness(1.12);transform:translateY(-1px)}
+.btn.pri.big{padding:12px 16px;font-size:13.5px;border-radius:10px;letter-spacing:.01em}
+.btn{border-radius:9px;transition:background .12s,transform .12s,filter .12s}
+.btn:hover{background:var(--p3)}
+
+/* ô tìm công cụ */
+.toolsearch{width:100%;background:var(--p2);border:1px solid var(--line);color:var(--ink);
+  border-radius:9px;padding:8px 11px;font-size:12px;margin:2px 0 8px}
+.toolsearch:focus{outline:none;border-color:var(--acc)}
+.toolsearch::placeholder{color:var(--faint)}
+
+/* LƯỚI CÔNG CỤ dạng thẻ 2 cột kiểu CapCut: icon to, tên dưới */
+.toolgrid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:10px}
+.toolgrid .aitool{position:relative;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:5px;min-height:74px;padding:10px 7px 8px;margin:0;
+  background:var(--p2);border:1px solid var(--line);border-radius:11px;text-align:center;
+  transition:transform .1s,border-color .12s,background .12s}
+.toolgrid .aitool:hover{background:var(--p3);border-color:var(--line2);transform:translateY(-1px)}
+.toolgrid .aitool.sel{border-color:var(--acc);background:var(--accg);
+  box-shadow:0 0 0 1px var(--acc) inset}
+.toolgrid .aitool .ai-ic{font-size:21px;line-height:1}
+.toolgrid .aitool .ai-n{font-size:10.5px;line-height:1.35;color:var(--ink);font-weight:600;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.toolgrid .aitool .ai-num{position:absolute;top:5px;left:5px;min-width:17px;height:17px;
+  font-size:8.5px;border-radius:5px;margin:0}
+.toolgrid .aitool .ai-g{position:absolute;top:5px;right:5px;font-size:7.5px;padding:2px 4px;
+  border-radius:4px;background:var(--accg);color:var(--acc);font-family:var(--mono)}
+.toolgrid .aitool .ai-g.cpu{background:var(--p3);color:var(--faint)}
+.toolgrid .aitool.disabled{opacity:.38}
+
+/* tab nhóm: thoáng + dính đầu khi cuộn */
+.cattabs{position:sticky;top:0;z-index:5;background:var(--p1);padding:6px 0;margin:0 0 6px}
+.cattabs button{font-size:11.5px;padding:6px 11px;border-radius:8px}
+.cattabs button.on{background:var(--accg);border-color:var(--acc);color:var(--acc)}
+
+/* khung xem: to hơn, nổi bật */
+.canvas video{max-height:calc(100vh - 225px)}
+.canvas{box-shadow:0 14px 60px rgba(0,0,0,.75);border-radius:10px}
+
+/* panel phải: header tool có icon */
+.rsec-t{font-size:12.5px;font-weight:700;color:var(--ink);display:flex;align-items:center;
+  gap:7px;padding-bottom:8px;border-bottom:1px solid var(--line);margin-bottom:10px}
+.rsec-ic{font-size:17px}
+
+/* seg control bo mềm, chọn = accent */
+.seg button.on,.seg.sm button.on{background:var(--accg);color:var(--acc);
+  box-shadow:0 0 0 1px var(--acc) inset}
+
+/* thanh chọn media, chip, timeline đồng bộ nền mới */
+.mitem.sel{outline:2px solid var(--acc)}
+.tlbox{box-shadow:0 6px 24px rgba(0,0,0,.4)}
+.trimhandle{background:var(--acc)}
+.trimhandle.out{background:var(--acc2)}
+.fabchat{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#04131A}
+
+/* thanh cuộn mảnh kiểu CapCut */
+::-webkit-scrollbar{width:7px;height:7px}
+::-webkit-scrollbar-thumb{background:#33333E;border-radius:8px}
+
+/* toast + modal bo lớn */
+.modal-card{border-radius:16px}

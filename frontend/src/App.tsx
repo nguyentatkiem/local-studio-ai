@@ -455,6 +455,7 @@ export default function App() {
   const [thumbCount, setThumbCount] = useState(6);
   // Đợt góp ý nhân viên + UI TTM
   const [toolCat, setToolCat] = useState<ToolCat | "all">("all");
+  const [toolQ, setToolQ] = useState("");   // ô tìm công cụ kiểu CapCut
   const [muteMusic, setMuteMusic] = useState(false);
   const [spellfix, setSpellfix] = useState(false);
   const [aeStrong, setAeStrong] = useState(false);
@@ -852,7 +853,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v2.0 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v2.2 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -1052,25 +1053,30 @@ export default function App() {
                     onClick={() => setToolCat(c)}>{l}</button>
                 ))}
               </div>
-              <div className="lp-title">Bấm để mở tuỳ chọn · chạy trên máy</div>
-              {TOOLS.map((t, ti) => ({ t, n: ti + 1 }))
-                .filter(({ t }) => toolCat === "all" || TOOL_CATS[t.key] === toolCat)
-                .map(({ t, n }) => {
-                const fk = FEAT_KEY[t.key];
-                const off = fk ? !feats[fk] : false;
-                return (
-                <button key={t.key}
-                  title={off ? `Chưa sẵn sàng — ${TOOL_REQS[t.key] || "thiếu thành phần trên máy chủ"}` : t.desc}
-                  className={"aitool cat-" + (TOOL_CATS[t.key] || "edit")
-                    + (tool === t.key ? " sel" : "") + (off ? " disabled" : "")}
-                  onClick={() => { setTool(t.key); setRightTab("tool"); }}>
-                  <span className="ai-num">{n}</span>
-                  <span className="ai-ic">{t.icon}</span>
-                  <span className="ai-t"><span className="ai-n">{t.name}</span><span className="ai-d">{t.desc}</span></span>
-                  <span className={"ai-g" + (t.gpu ? "" : " cpu")}>{t.gpu ? "GPU" : "CPU"}</span>
-                </button>
-                );
-              })}
+              <input className="toolsearch" placeholder="🔍 Tìm công cụ... (vd: phụ đề, zoom, giọng)"
+                value={toolQ} onChange={(e) => setToolQ(e.target.value)} />
+              <div className="toolgrid">
+                {TOOLS.map((t, ti) => ({ t, n: ti + 1 }))
+                  .filter(({ t }) => toolCat === "all" || TOOL_CATS[t.key] === toolCat)
+                  .filter(({ t }) => !toolQ.trim()
+                    || (t.name + " " + t.desc).toLowerCase().includes(toolQ.trim().toLowerCase()))
+                  .map(({ t, n }) => {
+                  const fk = FEAT_KEY[t.key];
+                  const off = fk ? !feats[fk] : false;
+                  return (
+                  <button key={t.key}
+                    title={off ? `Chưa sẵn sàng — ${TOOL_REQS[t.key] || "thiếu thành phần trên máy chủ"}` : t.desc}
+                    className={"aitool cat-" + (TOOL_CATS[t.key] || "edit")
+                      + (tool === t.key ? " sel" : "") + (off ? " disabled" : "")}
+                    onClick={() => { setTool(t.key); setRightTab("tool"); }}>
+                    <span className="ai-num">{n}</span>
+                    <span className={"ai-g" + (t.gpu ? "" : " cpu")}>{t.gpu ? "GPU" : "CPU"}</span>
+                    <span className="ai-ic">{t.icon}</span>
+                    <span className="ai-n">{t.name}</span>
+                  </button>
+                  );
+                })}
+              </div>
               <div className="hint">💡 Job xếp hàng chạy nền — cứ thêm nhiều việc rồi để máy tự xử lý. 0 credit, không giới hạn.</div>
             </div>
           )}
@@ -1444,7 +1450,7 @@ export default function App() {
 
           {rightTab === "tool" && (
             <div className="rbody">
-              <div className="rsec-t">{TOOL_NAMES[tool]} — {
+              <div className="rsec-t"><span className="rsec-ic">{TOOLS.find((x) => x.key === tool)?.icon}</span> {TOOL_NAMES[tool]} — {
                 tool === "tts" ? "không cần tệp nguồn"
                 : batch && batchSel.length > 0 ? `${batchSel.length} tệp (hàng loạt)`
                 : selected ? selected.name : "chưa chọn tệp"}</div>
