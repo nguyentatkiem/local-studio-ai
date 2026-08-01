@@ -1,75 +1,97 @@
 # 🎬 Local Studio — AI Video Editor chạy 100% trên máy
 
-> v1.1 — Không cloud · Không credit · Không watermark · Footage không bao giờ rời máy bạn.
+<p align="center">
+  <img src="https://img.shields.io/badge/version-1.8.1-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-44-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/cloud-0%25-FF6B57?style=for-the-badge" alt="no cloud">
+  <img src="https://img.shields.io/badge/watermark-kh%C3%B4ng-7ACB6B?style=for-the-badge" alt="no watermark">
+</p>
 
-**Máy mới clone repo:** chạy `./setup-binaries.sh` một lần để tải engine AI (~350MB), rồi `./start.sh`.
+<p align="center">
+  <b>Không cloud · Không credit · Không watermark · Footage không bao giờ rời máy bạn</b><br>
+  <sub>Whisper · SAM 2 · CLIP · Qwen3 · Piper TTS · Real-ESRGAN · RIFE · FFmpeg — tất cả chạy local trên GPU của bạn.<br>
+  Tuỳ chọn nối <b>gói sub Claude</b> làm "não cao cấp" (chỉ văn bản rời máy, video thì không).</sub>
+</p>
 
-## Chạy ứng dụng
+---
 
-- **Windows**: nháy đúp `start.bat` → trình duyệt tự mở `http://127.0.0.1:8765`
-- **macOS/Linux**: chạy `./start.sh` (hoặc mở **Local Studio.app** trong /Applications — tự khởi động backend)
+## 🚀 Chạy ứng dụng
 
-**Tắt mật khẩu đăng nhập** (máy cá nhân, server chỉ bind 127.0.0.1): ghi `{"disabled": true}`
-vào `backend/auth_config.json` rồi khởi động lại. Muốn bật lại: xoá file đó — mật khẩu mới
-sẽ được sinh vào `backend/ADMIN-PASSWORD.txt`.
+| Bước | Lệnh |
+|---|---|
+| 1️⃣ Máy mới clone repo | `./setup-binaries.sh` — tải engine AI một lần (~500MB) |
+| 2️⃣ macOS / Linux | `./start.sh` (hoặc mở **Local Studio.app**) |
+| 2️⃣ Windows | nháy đúp `start.bat` |
+| 3️⃣ Trình duyệt | `http://127.0.0.1:8765` — mật khẩu trong `backend/ADMIN-PASSWORD.txt` |
 
-## Tính năng v1.1
+> 💡 **Máy cá nhân muốn bỏ đăng nhập:** ghi `{"disabled": true}` vào `backend/auth_config.json` rồi khởi động lại (an toàn vì server chỉ bind 127.0.0.1 — **đừng** tắt khi mở ra internet qua tunnel).
+> 🌐 **Phát hành web tạm qua Cloudflare Tunnel:** xem `DEPLOY-WEB.md`.
+> 🎯 **Track đối tượng SAM 2** cần thêm: `pip install ultralytics` · **Tìm cảnh CLIP** cần: `pip install open_clip_torch` (trong venv backend).
 
-| Tính năng | Engine | Ghi chú |
-|---|---|---|
-| 🔗 Chuỗi tự động (Pipeline) | nội bộ | xếp nhiều tính năng chạy nối tiếp trên 1 video, 1 job; Đạo diễn AI nối được bằng lời |
-| 🔥 Phụ đề Viral 1 chạm | Whisper large-v3 + libass | nhận dạng → tách cụm → cháy preset viral + chuẩn âm -14LUFS, xuất mp4+ass+srt |
-| 🎬 Đạo diễn AI | Claude (gói sub, qua CLI) | ra lệnh bằng lời → tự lập kế hoạch & xếp job, backend validate |
-| 🎯 AI cắt Shorts từ video dài | Whisper + Qwen3 4B / Claude | LLM chọn khoảnh khắc → shorts 9:16 + caption, kiểu Opus Clip |
-| 🎞️ Ghép B-roll tự động | Whisper + AI + Pexels API | AI chọn đoạn+từ khoá → tải cảnh stock chèn theo lời nói (cần key) |
-| 📝 AI viết nội dung | Qwen3 4B local / Claude sub | 3 tiêu đề hook · mô tả SEO · hashtags · chapters |
-| 📚 Bài giảng → Giáo án + Quiz | Whisper + Qwen/Claude | soạn giáo án + câu hỏi, đẩy thẳng vào AI-LMS |
-| 🫥 Làm mờ mặt tự động | YuNet ONNX | blur/pixelate mọi khuôn mặt, chống nhấp nháy |
-| ✨ Tự động dựng AI 1 chạm | pipeline | cắt lặng → caption karaoke → preset/9:16 · chạy batch qua đêm |
-| 📝 Caption tự động (+ burn-in, .srt/.ass/.txt) | faster-whisper CPU · **MLX GPU Metal (Mac)** | tiny/base/small/medium, karaoke/6 hiệu ứng |
-| ✂️ Cắt khoảng lặng / jump-cut | auto-editor | Chỉnh biên an toàn (margin) |
-| 🔍 AI Upscale ×2/×3/×4 | Real-ESRGAN ncnn-vulkan (**GPU**) | Chế độ "Nhanh" (lanczos) cho video dài |
-| 🎞️ Nội suy khung hình ×2 / slow-motion | RIFE ncnn-vulkan (**GPU**) | 30→60fps hoặc quay chậm 2× |
-| 🪄 Tách nền video | RVM (ONNX CoreML/CPU) | nền xanh/đen/trắng + webm alpha trong suốt |
-| 🗣️ Đọc văn bản TTS offline | Piper | giọng Việt + Anh, tốc độ 0.6–1.5×, wav+mp3 |
-| 📐 Đổi khung 9:16 kiểu CapCut | FFmpeg | nền chính video làm mờ hoặc crop giữa |
-| ⏩ Tốc độ 0.5–3× | FFmpeg | giữ cao độ âm thanh (atempo) |
-| 🎨 6 filter màu | FFmpeg | vivid · warm · cool · B&W · film · sharp |
-| 🎵 Nhạc nền + ducking | FFmpeg sidechain | tự nén nhạc khi có giọng nói |
-| 🧷 Chống rung | FFmpeg deshake | video quay tay |
-| 🎬 Ghép clip + chuyển cảnh | FFmpeg xfade | 2-8 clip · 10 hiệu ứng · thay nhạc nền |
-| 🥁 Cắt theo nhịp nhạc (beat-sync) | librosa | kiểu template CapCut, xoay vòng nhiều clip |
-| 🎚️ Chuẩn hoá âm thanh | FFmpeg | khử ồn + loudnorm -16 LUFS chuẩn MXH |
-| 🏷️ Tiêu đề & Logo watermark | libass + overlay | title fade · chữ ký · PNG 4 góc |
-| 📻 Audiogram sóng nhạc | FFmpeg showwaves | audio/TTS → video đăng MXH |
-| 📤 Xuất preset | FFmpeg | TikTok 9:16 · YouTube · 1:1 · 4:5 · GIF · MP3 |
-| ⚙️ Hàng đợi 40 job + hủy job + batch | ThreadPool | chọn nhiều tệp chạy hàng loạt |
+## ✨ 44 tính năng (v1.8.1)
 
-## Kiến trúc
+### 🎞️ Studio dựng — timeline & lớp phủ
+| Tính năng | Mô tả |
+|---|---|
+| ✂️ **Cắt trên timeline** | kéo IN/OUT trên dải khung hình · giữ / cắt bỏ / ghép nhiều đoạn |
+| 🎬 **Multi-track xếp lớp** | đè 🖼 ảnh/logo · 🔤 chữ · 🎵 nhạc · 📹 **video PiP** theo mốc thời gian, kéo vị trí ngay trên player |
+| ⤳ **Keyframe vị trí** | lớp bay từ điểm A → B · hiệu ứng bay vào (mờ dần, trượt 4 hướng) |
+| 💾 **Dự án** | lưu nguyên timeline, mở lại làm tiếp |
+| 🎛️ **Bảng chỉnh màu PRO** | 10 thanh trượt + 2 bánh xe **Nhuộm Tối/Sáng** · xem trước tức thì |
+| 🔗 **Chuỗi tự động** | xếp nhiều tính năng chạy nối tiếp 1 job · 1–4 luồng song song |
+
+### 🤖 AI thị giác & âm thanh (local)
+| Tính năng | Engine |
+|---|---|
+| 🎯 **Track đối tượng** — bấm vào vật/người → bám suốt video → mờ/che ô/spotlight/tách nền | **SAM 2** (Meta) · MPS |
+| 🔎 **Tìm cảnh bằng mô tả** — gõ tiếng Việt, tìm đúng khoảnh khắc cả kho | **CLIP** ViT-B-32 |
+| 🔥 **Phụ đề Viral 1 chạm** — cụm 2 dòng, tô từ khoá, karaoke, 3 hiệu ứng chữ, chuẩn âm -14 LUFS | Whisper large-v3 MLX + libass |
+| 💬 Caption tự động (6 hiệu ứng + AI soát chính tả) · ✂️ cắt lặng · 🎯 AI cắt Shorts | Whisper + Qwen3/Claude |
+| 🫥 Làm mờ mặt (chống nhấp nháy) · 🪄 tách nền người (webm alpha) | YuNet · RVM |
+| 🔍 Upscale ×2–4 · 🎞️ nội suy 60fps/slow-mo | Real-ESRGAN · RIFE (GPU) |
+| 🗣️ TTS **5 giọng** (2 Việt + 3 Anh) · 📻 audiogram · 🥁 beat-sync · 🎚️ chuẩn âm (đo LUFS) | Piper · librosa · FFmpeg |
+
+### 🧠 Não Claude (gói sub — tuỳ chọn, có công tắc trong ⚙)
+| Tính năng | Mô tả |
+|---|---|
+| 🎬 **Đạo diễn AI** | ra lệnh bằng lời → tự xếp job/chuỗi · nhớ hội thoại · hiểu video đang chọn · chat nổi mọi màn hình |
+| 🌐 **Dịch phụ đề** (12 ngôn ngữ) · 🎙️ **Lồng tiếng AI** | giữ mốc thời gian · Piper đọc tiếng đích |
+| 🔍 **QC video** (soi lỗi + tự cắt) · ✍️ **Bác sĩ kịch bản** (viết lại + teleprompter) | chấm điểm + timestamp |
+| 🖼️ **Claude Vision chọn thumbnail** · 📢 **Tái chế nội dung** · 📝 viết tiêu đề/SEO · 📚 giáo án + quiz → AI-LMS · 🎞️ B-roll Pexels | hết hạn mức → tự chuyển AI local |
+
+### 🛠️ Dựng cơ bản
+📐 9:16 nền mờ CapCut · ⏩ tốc độ 0.5–3× · 🎨 6 filter màu · 🎵 nhạc nền + ducking (+🔇 tắt tiếng gốc) · 🧷 chống rung 2 mức · 🎬 ghép clip xfade 10 hiệu ứng · 🏷️ tiêu đề & logo · 📤 xuất preset TikTok/YouTube/1:1/4:5/GIF/MP3 · 🗑 quản lý kho media · hàng đợi 40 job + hủy + batch
+
+📜 **Chi tiết từng bản cập nhật:** [CHANGELOG.md](CHANGELOG.md)
+
+## 🏗️ Kiến trúc
 
 ```
 frontend/   React + Vite (build sẵn vào frontend/dist, backend serve luôn)
 backend/    FastAPI (main.py) + venv riêng — cổng 8765, chỉ bind 127.0.0.1
-binaries/   realesrgan · rife · rvm (onnx) · piper/voices · ffmpeg static (libass)
+binaries/   ffmpeg static (libass) · realesrgan · rife · rvm · sam2 · clip · piper/voices · fonts
 desktop/    Tauri v2 shell → Local Studio.app (tự spawn backend)
-workspace/  uploads / outputs / tmp
-samples/    sample.mp4 — video test có giọng nói + khoảng lặng
+workspace/  uploads / outputs / projects / clipidx / tmp
 ```
 
-- Whisper model tải về 1 lần đầu (base ≈ 74MB) vào cache HuggingFace, sau đó offline hoàn toàn.
-- API chỉ bind `127.0.0.1` — không máy nào khác truy cập được.
+- Model AI tải 1 lần đầu (Whisper/Qwen vào cache HuggingFace) → sau đó **offline hoàn toàn**.
+- API chỉ bind `127.0.0.1`; Claude CLI gọi với **toàn bộ tool bị vô hiệu** (chống prompt-injection).
 
-## Dev
+## 👨‍💻 Dev
 
-```powershell
+```bash
 # backend (hot reload)
-backend\.venv\Scripts\python.exe -m uvicorn main:app --reload --port 8765 --app-dir backend
+backend/.venv/bin/python -m uvicorn main:app --reload --port 8765 --app-dir backend
 # frontend (dev server, proxy sẵn về 8765)
-cd frontend; npm run dev
+cd frontend && npm run dev
 # build frontend
-cd frontend; npm run build
+cd frontend && npm run build
 ```
 
-## Roadmap
+## 🗺️ Roadmap
 
-Xem `ROADMAP.md` — tiếp theo: Tauri desktop shell (GĐ3), SAM 2 object tracking, tách nền, TTS/voice (GĐ4), sinh video local FramePack/Wan (GĐ5), Agent panel (GĐ6).
+Xem `ROADMAP.md` — tiếp theo: multi-keyframe, trim clip PiP, LLM agent panel, sinh video local (FramePack/Wan).
+
+---
+
+<p align="center"><sub>🤖 Xây dựng cùng <a href="https://claude.com/claude-code">Claude Code</a> · Tối ưu cho Apple Silicon</sub></p>
