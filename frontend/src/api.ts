@@ -165,6 +165,20 @@ export async function testClaude(): Promise<{ ok: boolean; model: string; ms: nu
   return d;
 }
 
+export type ClipHit = { file: string; t: number; score: number };
+
+export async function clipSearch(query: string): Promise<{
+  query_en: string; results: ClipHit[]; unindexed: string[];
+}> {
+  const r = await fetch("/api/clip/search", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+  });
+  const d = await r.json().catch(() => ({ detail: r.statusText }));
+  if (!r.ok) throw new Error(d.detail || "Tìm thất bại");
+  return d;
+}
+
 export async function deleteMedia(name: string): Promise<void> {
   const r = await fetch(`/api/media/${encodeURIComponent(name)}`, { method: "DELETE" });
   if (!r.ok) {

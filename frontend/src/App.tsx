@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import {
-  askDirector, authStatus, cancelJob, createJob, deleteMedia, fetchCuesJson,
+  askDirector, authStatus, cancelJob, clipSearch, createJob, deleteMedia, fetchCuesJson,
   fmtDur, fmtSize, getClaudeSettings, getHealth, getJobs, getMedia, login,
   logout, openOutputs, resetDirector, saveClaudeSettings, stopDirector, testClaude,
   uploadFile, viralAnalyze, type Health, type Job, type MediaItem, type ViralCluster,
@@ -18,6 +18,7 @@ const TOOL_CATS: Record<string, ToolCat> = {
   pipeline: "ai", viral: "ai", director: "ai", highlights: "ai", broll: "ai",
   translate: "ai", social_pack: "ai", dub: "ai", qc: "ai", script: "ai",
   thumbnail: "ai", auto_edit: "ai", transcribe: "ai", content: "ai", lesson: "ai",
+  clipsearch: "ai",
   merge: "edit", beatsync: "edit", silence_cut: "edit", upscale: "edit",
   rife: "edit", bg_remove: "edit", reframe: "edit", speed: "edit", color: "edit",
   grade: "edit", track: "edit", stabilize: "edit", face_blur: "edit", brand: "edit",
@@ -38,6 +39,7 @@ const FEAT_KEY: Record<string, string> = {
   translate: "translate", social_pack: "social_pack", dub: "dub", qc: "qc",
   script: "script", thumbnail: "thumbnail", viral: "viral_caption",
   pipeline: "export", export: "export", grade: "grade", track: "track",
+  clipsearch: "clipsearch",
   reframe: "ffmpeg", speed: "ffmpeg", color: "ffmpeg", music: "ffmpeg",
   stabilize: "ffmpeg", merge: "ffmpeg", audio_enhance: "ffmpeg",
   brand: "ffmpeg", audiogram: "ffmpeg",
@@ -66,6 +68,7 @@ const TOOL_REQS: Record<string, string> = {
   dub: "cần whisper + Piper TTS + Claude/Qwen",
   viral: "cần whisper + font trong binaries/fonts (setup-binaries.sh)",
   track: "cần pip install ultralytics + model sam2.1_t.pt trong binaries/sam2",
+  clipsearch: "cần pip install open_clip_torch (model tự tải lần đầu)",
 };
 
 // Ngôn ngữ đích cho Dịch phụ đề AI
@@ -111,15 +114,19 @@ type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" |
   | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
   | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll" | "viral"
   | "translate" | "social_pack" | "dub" | "qc" | "script" | "thumbnail"
-  | "grade" | "track" | "pipeline";
+  | "grade" | "track" | "clipsearch" | "pipeline";
 
 // Lớp phủ multi-track (đè lên video nền theo mốc thời gian)
 type Layer = {
-  id: number; kind: "image" | "text" | "audio";
-  file?: string; text?: string; color?: string;
+  id: number; kind: "image" | "text" | "audio" | "video";
+  file?: string; text?: string; color?: string; anim?: string;
   start: number; end: number; x: number; y: number;
   scale: number; opacity: number; size: number; volume: number;
 };
+const ANIMS: [string, string][] = [
+  ["none", "Không"], ["fade", "Mờ dần"], ["slide_l", "Trượt ← trái"],
+  ["slide_r", "Trượt phải →"], ["slide_t", "Trượt ↓ trên"], ["slide_b", "Trượt ↑ dưới"],
+];
 
 // Các bước có thể xếp vào Chuỗi tự động (nối tiếp output→input)
 type PipeStep = { type: string; params: Record<string, unknown> };
@@ -166,6 +173,7 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "color", icon: "🎨", name: "Filter màu", desc: "vivid · warm · film · B&W · sharp", gpu: false },
   { key: "grade", icon: "🎛️", name: "Bảng chỉnh màu PRO", desc: "phơi sáng · tương phản · nhiệt độ · vibrance · nét", gpu: false },
   { key: "track", icon: "🎯", name: "Track đối tượng (SAM 2)", desc: "bấm vào vật/người → AI bám theo → mờ/spotlight/tách nền", gpu: true },
+  { key: "clipsearch", icon: "🔎", name: "Tìm cảnh bằng AI (CLIP)", desc: "gõ mô tả → tìm đúng khoảnh khắc trong cả kho video", gpu: true },
   { key: "music", icon: "🎵", name: "Nhạc nền + ducking", desc: "tự nén nhạc khi có giọng nói", gpu: false },
   { key: "face_blur", icon: "🫥", name: "Làm mờ mặt tự động", desc: "YuNet AI · che mặt học sinh/người lạ", gpu: false },
   { key: "content", icon: "📝", name: "AI viết nội dung", desc: "tiêu đề · mô tả · hashtags · chapters", gpu: true },
@@ -428,6 +436,12 @@ export default function App() {
   const [trackFx, setTrackFx] = useState("blur");
   const [trackStr, setTrackStr] = useState(1.0);
   const layerIdRef = useRef(1);
+  // Tìm cảnh CLIP
+  const [clipQ, setClipQ] = useState("");
+  const [clipRes, setClipRes] = useState<{ file: string; t: number; score: number }[]>([]);
+  const [clipUnidx, setClipUnidx] = useState<string[]>([]);
+  const [clipBusy, setClipBusy] = useState(false);
+  const seekRef = useRef<number | null>(null);   // tua tới mốc sau khi video nạp
   // Settings — gói sub Claude
   const [csEnabled, setCsEnabled] = useState(true);
   const [csModel, setCsModel] = useState("sonnet");
@@ -677,13 +691,19 @@ export default function App() {
     const d = selected.info.duration;
     if (kind === "image" && imageFiles.length === 0) { showToast("⚠️ Kéo 1 ảnh (png/jpg) vào kho media trước"); return; }
     if (kind === "audio" && audioFiles.length === 0) { showToast("⚠️ Kéo 1 file nhạc vào kho media trước"); return; }
+    const vidFiles = media.filter((m) => m.info.width && m.info.duration > 0.2 && m.name !== selected.name);
+    if (kind === "video" && vidFiles.length === 0) { showToast("⚠️ Cần thêm 1 video khác trong kho để làm PiP"); return; }
     const l: Layer = {
-      id: layerIdRef.current++, kind,
-      file: kind === "image" ? imageFiles[0].name : kind === "audio" ? audioFiles[0].name : undefined,
+      id: layerIdRef.current++, kind, anim: "none",
+      file: kind === "image" ? imageFiles[0].name
+        : kind === "audio" ? audioFiles[0].name
+        : kind === "video" ? vidFiles[0].name : undefined,
       text: kind === "text" ? "Chữ của bạn" : undefined, color: "#FFD400",
       start: 0, end: Math.min(d, kind === "audio" ? d : Math.max(3, d * 0.4)),
-      x: kind === "image" ? 0.92 : 0.5, y: kind === "image" ? 0.06 : 0.82,
-      scale: 0.22, opacity: 1, size: 0.06, volume: 0.5,
+      x: kind === "image" ? 0.92 : kind === "video" ? 0.9 : 0.5,
+      y: kind === "image" ? 0.06 : kind === "video" ? 0.1 : 0.82,
+      scale: kind === "video" ? 0.35 : 0.22, opacity: 1, size: 0.06,
+      volume: kind === "video" ? 0 : 0.5,
     };
     setLayers((ls) => [...ls, l]); setLaySel(layers.length);
   };
@@ -746,7 +766,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v1.6 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v1.7 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -985,7 +1005,11 @@ export default function App() {
                 <video ref={vidElRef} key={previewFb ?? stageSrc} src={previewFb ?? stageSrc}
                   controls autoPlay={!!preview}
                   style={tool === "grade" ? { filter: gradeCss } : undefined}
-                  onLoadedMetadata={(e) => { (e.target as HTMLVideoElement).playbackRate = pbRate; }}
+                  onLoadedMetadata={(e) => {
+                    const v = e.target as HTMLVideoElement;
+                    v.playbackRate = pbRate;
+                    if (seekRef.current != null) { v.currentTime = seekRef.current; seekRef.current = null; }
+                  }}
                   onError={() => {
                     // trình duyệt không phát được (mkv/avi/hevc...) → bản xem thử H.264
                     if (!previewFb && selected && stageSrc === selected.url && selected.info.width) {
@@ -1017,9 +1041,12 @@ export default function App() {
                     transform: `translate(-${l.x * 100}%, -${l.y * 100}%)`,
                     outline: laySel === i ? "1.5px dashed var(--amber)" : undefined,
                   } as const;
-                  return l.kind === "image" ? (
-                    <img key={l.id} className="ovlayer" draggable={false} alt=""
-                      src={`/files/uploads/${encodeURIComponent(l.file || "")}`}
+                  return l.kind === "image" || l.kind === "video" ? (
+                    <img key={l.id} className={"ovlayer" + (l.kind === "video" ? " ovpip" : "")}
+                      draggable={false} alt=""
+                      src={l.kind === "video"
+                        ? `/api/thumb/${encodeURIComponent(l.file || "")}`
+                        : `/files/uploads/${encodeURIComponent(l.file || "")}`}
                       style={{ ...common, width: `${l.scale * 100}%`, opacity: l.opacity }}
                       onPointerDown={(e) => { e.stopPropagation(); setLaySel(i); ovDrag.current = i; }} />
                   ) : (
@@ -1120,7 +1147,7 @@ export default function App() {
                 return (
                   <div className="tlrow" key={l.id}>
                     <span className="tllab" style={{ cursor: "pointer" }} onClick={() => setLaySel(laySel === i ? -1 : i)}>
-                      {l.kind === "image" ? "🖼" : l.kind === "text" ? "🔤" : "🎵"} Lớp {i + 1}
+                      {l.kind === "image" ? "🖼" : l.kind === "text" ? "🔤" : l.kind === "video" ? "📹" : "🎵"} Lớp {i + 1}
                     </span>
                     <div className="lytrack"
                       onPointerDown={(e) => {
@@ -1176,6 +1203,16 @@ export default function App() {
                       <label>Cỡ <input type="range" min={0.03} max={0.15} step={0.005} value={l.size}
                         onChange={(e) => patchLayer(laySel, { size: parseFloat(e.target.value) })} /></label>
                     </>)}
+                    {l.kind === "video" && (<>
+                      <select value={l.file} onChange={(e) => patchLayer(laySel, { file: e.target.value })}>
+                        {media.filter((m) => m.info.width && m.info.duration > 0.2 && m.name !== selected.name)
+                          .map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                      </select>
+                      <label>Cỡ <input type="range" min={0.1} max={0.7} step={0.01} value={l.scale}
+                        onChange={(e) => patchLayer(laySel, { scale: parseFloat(e.target.value) })} /></label>
+                      <label>Tiếng PiP <input type="range" min={0} max={1.5} step={0.05} value={l.volume}
+                        onChange={(e) => patchLayer(laySel, { volume: parseFloat(e.target.value) })} /></label>
+                    </>)}
                     {l.kind === "audio" && (<>
                       <select value={l.file} onChange={(e) => patchLayer(laySel, { file: e.target.value })}>
                         {audioFiles.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
@@ -1183,6 +1220,13 @@ export default function App() {
                       <label>Âm lượng <input type="range" min={0.05} max={2} step={0.05} value={l.volume}
                         onChange={(e) => patchLayer(laySel, { volume: parseFloat(e.target.value) })} /></label>
                     </>)}
+                    {l.kind !== "audio" && (
+                      <label>Bay vào
+                        <select value={l.anim || "none"} onChange={(e) => patchLayer(laySel, { anim: e.target.value })}>
+                          {ANIMS.map(([v, lb]) => <option key={v} value={v}>{lb}</option>)}
+                        </select>
+                      </label>
+                    )}
                     {l.kind !== "audio" && <span className="tllab">kéo trực tiếp trên video để đặt vị trí</span>}
                     <button className="btn sm" style={{ color: "var(--warn)" }}
                       onClick={() => { setLayers((ls) => ls.filter((_, j) => j !== laySel)); setLaySel(-1); }}>🗑 Xoá lớp</button>
@@ -1195,6 +1239,7 @@ export default function App() {
                   <button className="btn sm" onClick={() => addLayer("image")}>🖼 Ảnh/Logo</button>
                   <button className="btn sm" onClick={() => addLayer("text")}>🔤 Chữ</button>
                   <button className="btn sm" onClick={() => addLayer("audio")}>🎵 Nhạc</button>
+                  <button className="btn sm" onClick={() => addLayer("video")}>📹 Video PiP</button>
                   {layers.length > 0 && (
                     <button className="btn sm pri" onClick={() => run("composite", {
                       layers: layers.map(({ id, ...rest }) => rest),
@@ -2142,6 +2187,61 @@ export default function App() {
                     onClick={() => trackPt && run("track", { x: trackPt.x, y: trackPt.y, effect: trackFx, strength: trackStr })}>
                     🎯 Track & áp hiệu ứng
                   </button>
+                </>
+              )}
+
+              {tool === "clipsearch" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🔎 CLIP (OpenAI) chạy local: gõ mô tả cảnh — "người đứng bảng trắng",
+                    "hoàng hôn", "con thằn lằn"... → tìm đúng khoảnh khắc trong CẢ kho video.
+                    Tiếng Việt tự dịch sang EN cho AI hiểu.
+                  </div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <input className="lytext" style={{ flex: 1, maxWidth: "none" }} value={clipQ}
+                      placeholder="Mô tả cảnh cần tìm..." maxLength={300}
+                      onChange={(e) => setClipQ(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter" && clipQ.trim() && !clipBusy) (document.getElementById("clipgo") as HTMLButtonElement)?.click(); }} />
+                    <button id="clipgo" className="btn pri" disabled={clipBusy || !clipQ.trim()}
+                      onClick={async () => {
+                        setClipBusy(true);
+                        try {
+                          const r = await clipSearch(clipQ.trim());
+                          setClipRes(r.results); setClipUnidx(r.unindexed);
+                          if (!r.results.length && !r.unindexed.length) showToast("Không tìm thấy cảnh khớp");
+                        } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                        finally { setClipBusy(false); }
+                      }}>{clipBusy ? "⏳" : "🔎 Tìm"}</button>
+                  </div>
+                  {clipUnidx.length > 0 && (
+                    <div className="hint" style={{ marginTop: 8 }}>
+                      ⚠ {clipUnidx.length} video chưa lập chỉ mục →{" "}
+                      <button className="btn sm pri" onClick={async () => {
+                        try {
+                          await createJob("clip_index", "", {});
+                          setJobs(await getJobs()); setRightTab("jobs");
+                          showToast("📚 Đang lập chỉ mục kho — xong thì tìm lại nhé");
+                        } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                      }}>📚 Lập chỉ mục kho</button>
+                    </div>
+                  )}
+                  <div className="cliphits">
+                    {clipRes.map((r, i) => (
+                      <button key={i} className="cliphit" onClick={() => {
+                        const item = media.find((m) => m.name === r.file);
+                        if (!item) { showToast("File không còn trong kho"); return; }
+                        seekRef.current = r.t;
+                        setPreview(null); setSelected(item);
+                        if (vidElRef.current && selected?.name === r.file) vidElRef.current.currentTime = r.t;
+                        showToast(`▶ ${r.file} @ ${fmtDur(r.t)}`);
+                      }}>
+                        <img src={`/api/thumb/${encodeURIComponent(r.file)}`} alt="" loading="lazy" />
+                        <span className="ch-t">{fmtDur(r.t)}</span>
+                        <span className="ch-n">{r.file}</span>
+                        <span className="ch-s">{Math.round(r.score * 100)}%</span>
+                      </button>
+                    ))}
+                  </div>
                 </>
               )}
 

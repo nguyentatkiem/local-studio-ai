@@ -1661,10 +1661,182 @@ def job_track(job_id: str, src: Path, p: dict):
     return [out_entry(out)]
 
 
+# ---------------------------------------------------------------- CLIP: tìm cảnh bằng mô tả
+CLIP_DIR = WORKSPACE / "clipidx"
+CLIP_DIR.mkdir(exist_ok=True)
+_clip_cache = None
+_clip_lock = threading.Lock()
+
+
+def clip_available() -> bool:
+    try:
+        import open_clip  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _clip_model():
+    """Nạp ViT-B-32 1 lần (MPS), cache module-level."""
+    global _clip_cache
+    with _clip_lock:
+        if _clip_cache is None:
+            import torch
+            import open_clip
+            dev = "mps" if torch.backends.mps.is_available() else "cpu"
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                "ViT-B-32", pretrained="openai", cache_dir=str(BINARIES / "clip"))
+            tok = open_clip.get_tokenizer("ViT-B-32")
+            _clip_cache = (model.to(dev).eval(), preprocess, tok, dev)
+        return _clip_cache
+
+
+def job_clip_index(job_id: str, p: dict):
+    """Lập chỉ mục CLIP cho TOÀN kho video: trích 1 khung/2s → embedding →
+    lưu .npz. Chạy 1 lần, các lần sau chỉ index video mới/đổi."""
+    import numpy as np
+    import torch
+    from PIL import Image
+    if not clip_available():
+        raise RuntimeError("Chưa cài open_clip (pip install open_clip_torch)")
+    model, preprocess, _tok, dev = _clip_model()
+    vids = []
+    for f in sorted(UPLOADS.iterdir()):
+        if not f.is_file():
+            continue
+        inf = media_info(f)
+        if inf["width"] and (inf["duration"] or 0) > 1:
+            idx = CLIP_DIR / (f.name + ".npz")
+            if not idx.exists() or idx.stat().st_mtime < f.stat().st_mtime:
+                vids.append((f, inf["duration"]))
+    if not vids:
+        _set(job_id, message="Xong — chỉ mục đã đầy đủ (không có video mới)")
+        return []
+    done_n = 0
+    for vi, (f, dur) in enumerate(vids):
+        _cancel_point(job_id)
+        step = max(2.0, dur / 90)  # ≤ ~90 khung/video
+        fdir = TMP / f"clip_{job_id}"
+        fdir.mkdir(exist_ok=True)
+        try:
+            _set(job_id, progress=int(vi / len(vids) * 100),
+                 message=f"CLIP {vi + 1}/{len(vids)}: {f.name} — trích khung...")
+            r = _run_tracked(job_id, [
+                FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(f), "-vf", f"fps=1/{step:.3f},scale=256:256",
+                "-q:v", "5", str(fdir / "f%04d.jpg")])
+            if r.returncode != 0:
+                continue
+            frames = sorted(fdir.glob("f*.jpg"))
+            if not frames:
+                continue
+            embs, times = [], []
+            with torch.no_grad():
+                for bi in range(0, len(frames), 16):
+                    _cancel_point(job_id)
+                    batch = frames[bi:bi + 16]
+                    ims = torch.stack([preprocess(Image.open(x).convert("RGB"))
+                                       for x in batch]).to(dev)
+                    e = model.encode_image(ims)
+                    e = e / e.norm(dim=-1, keepdim=True)
+                    embs.append(e.cpu().float().numpy())
+                    times += [(bi + k) * step + step / 2 for k in range(len(batch))]
+            np.savez(CLIP_DIR / (f.name + ".npz"),
+                     e=np.concatenate(embs).astype(np.float16),
+                     t=np.array(times, dtype=np.float32))
+            done_n += 1
+        finally:
+            shutil.rmtree(fdir, ignore_errors=True)
+    _set(job_id, message=f"Xong — lập chỉ mục {done_n} video (tìm cảnh sẵn sàng)")
+    return []
+
+
+class ClipSearchReq(BaseModel):
+    query: str
+    top: int = 12
+
+
+@app.post("/api/clip/search")
+def clip_search(req: ClipSearchReq):
+    """Tìm cảnh trong kho bằng mô tả. Query tiếng Việt được dịch sang EN
+    (CLIP hiểu tiếng Anh tốt hơn hẳn) qua Claude/Qwen nếu có."""
+    import numpy as np
+    import torch
+    if not clip_available():
+        raise HTTPException(400, "Chưa cài open_clip trên máy chủ")
+    q = (req.query or "").strip()[:300]
+    if not q:
+        raise HTTPException(400, "Nhập mô tả cảnh cần tìm")
+    q_en = q
+    if re.search(r"[àáảãạăâđèéêìíòóôơùúưýỳỹỵ]", q.lower()) and (claude_available() or llm_available()):
+        try:  # dịch nhanh vi→en cho CLIP; lỗi thì dùng nguyên văn
+            q_en = llm_generate(
+                f'Dịch sang tiếng Anh NGẮN GỌN (chỉ trả về bản dịch): "{q}"',
+                max_tokens=60, engine="claude" if claude_available() else "local",
+            ).strip().strip('"')[:200] or q
+        except Exception:  # noqa: BLE001
+            q_en = q
+    model, _pre, tok, dev = _clip_model()
+    with torch.no_grad():
+        te = model.encode_text(tok([q_en]).to(dev))
+        te = (te / te.norm(dim=-1, keepdim=True)).cpu().float().numpy()[0]
+    results, unindexed = [], []
+    for f in sorted(UPLOADS.iterdir()):
+        if not f.is_file():
+            continue
+        idx = CLIP_DIR / (f.name + ".npz")
+        if not idx.exists():
+            inf = media_info(f)
+            if inf["width"] and (inf["duration"] or 0) > 1:
+                unindexed.append(f.name)
+            continue
+        try:
+            d = np.load(idx)
+            sims = d["e"].astype(np.float32) @ te
+            # lấy tối đa 3 mốc tốt nhất mỗi video, cách nhau ≥ 4s
+            order = np.argsort(-sims)
+            picked = []
+            for k in order:
+                t = float(d["t"][k])
+                if all(abs(t - pt) >= 4 for pt, _ in picked):
+                    picked.append((t, float(sims[k])))
+                if len(picked) >= 3:
+                    break
+            for t, s in picked:
+                results.append({"file": f.name, "t": round(t, 1), "score": round(s, 3)})
+        except (OSError, ValueError, KeyError):
+            continue
+    results.sort(key=lambda r: -r["score"])
+    return {"query_en": q_en, "results": results[:max(1, min(30, req.top))],
+            "unindexed": unindexed}
+
+
 # ---------------------------------------------------------------- job: composite (multi-track)
+COMP_ANIMS = {"none", "fade", "slide_l", "slide_r", "slide_t", "slide_b"}
+
+
+def _anim_xy(anim: str, a: float, fx: str, fy: str, off_l: str, off_r: str,
+             off_t: str, off_b: str, d: float = 0.6):
+    """Biểu thức x/y bay vào cho overlay/drawtext: trượt từ mép về vị trí đích
+    trong d giây kể từ t=a. fx/fy = biểu thức vị trí đích; off_* = vị trí ngoài mép."""
+    if anim == "slide_l":
+        x = f"'if(lt(t-{a:.3f},{d}),({off_l})+(({fx})-({off_l}))*max(0,(t-{a:.3f})/{d}),{fx})'"
+        return x, fy
+    if anim == "slide_r":
+        x = f"'if(lt(t-{a:.3f},{d}),({off_r})+(({fx})-({off_r}))*max(0,(t-{a:.3f})/{d}),{fx})'"
+        return x, fy
+    if anim == "slide_t":
+        y = f"'if(lt(t-{a:.3f},{d}),({off_t})+(({fy})-({off_t}))*max(0,(t-{a:.3f})/{d}),{fy})'"
+        return fx, y
+    if anim == "slide_b":
+        y = f"'if(lt(t-{a:.3f},{d}),({off_b})+(({fy})-({off_b}))*max(0,(t-{a:.3f})/{d}),{fy})'"
+        return fx, y
+    return fx, fy
+
+
 def job_composite(job_id: str, src: Path, p: dict):
-    """Multi-track xếp lớp: đè ảnh/logo + chữ + nhạc lên video nền theo mốc thời gian
-    (kéo thả trên timeline). layers=[{kind:image|text|audio, ...}] — tối đa 12 lớp."""
+    """Multi-track xếp lớp: đè ảnh/logo + chữ + nhạc + VIDEO PiP lên video nền theo
+    mốc thời gian, kèm hiệu ứng bay vào (fade/trượt 4 hướng). Tối đa 12 lớp."""
     info = media_info(src)
     if not info["width"]:
         raise RuntimeError("Cần video nền có hình")
@@ -1678,7 +1850,7 @@ def job_composite(job_id: str, src: Path, p: dict):
     vparts, aparts, tmp_files = [], [], []
     vcur = "[0:v]"
     n_in = 0          # index input ffmpeg (0 = nền)
-    n_img = n_txt = n_aud = 0
+    n_img = n_txt = n_aud = n_vid = 0
     try:
         for li, l in enumerate(raw[:12]):
             if not isinstance(l, dict):
@@ -1690,6 +1862,7 @@ def job_composite(job_id: str, src: Path, p: dict):
                 continue
             x = min(1.0, max(0.0, _safe_float(l.get("x"), 0.5)))
             y = min(1.0, max(0.0, _safe_float(l.get("y"), 0.5)))
+            anim = l.get("anim") if l.get("anim") in COMP_ANIMS else "none"
             if kind == "image":
                 f = safe_upload_path(str(l.get("file", "")))
                 if not f.is_file() or f.suffix.lower() not in IMAGE_EXT:
@@ -1700,15 +1873,50 @@ def job_composite(job_id: str, src: Path, p: dict):
                 n_in += 1
                 inputs += ["-loop", "1", "-i", str(f)]
                 lab = f"im{li}"
+                fade = (f",fade=t=in:st={a:.3f}:d=0.45:alpha=1"
+                        f",fade=t=out:st={max(a, b - 0.45):.3f}:d=0.45:alpha=1"
+                        if anim == "fade" else "")
                 vparts.append(
                     f"[{n_in}:v]scale={pw}:-1,format=rgba,"
-                    f"colorchannelmixer=aa={op:.2f}[{lab}]")
+                    f"colorchannelmixer=aa={op:.2f}{fade}[{lab}]")
+                ox, oy = _anim_xy(anim, a, f"(W-w)*{x:.3f}", f"(H-h)*{y:.3f}",
+                                  "-w", "W", "-h", "H")
                 nxt = f"v{li}"
                 vparts.append(
-                    f"{vcur}[{lab}]overlay=x=(W-w)*{x:.3f}:y=(H-h)*{y:.3f}"
+                    f"{vcur}[{lab}]overlay=x={ox}:y={oy}"
                     f":enable='between(t,{a:.3f},{b:.3f})'[{nxt}]")
                 vcur = f"[{nxt}]"
                 n_img += 1
+            elif kind == "video":
+                # PiP video-trong-video: phát từ đầu clip nguồn tại mốc a, cửa sổ a→b
+                f = safe_upload_path(str(l.get("file", "")))
+                if not f.is_file():
+                    continue
+                finfo = media_info(f)
+                if not finfo["width"]:
+                    continue
+                scale = min(1.0, max(0.08, _safe_float(l.get("scale"), 0.35)))
+                op = min(1.0, max(0.05, _safe_float(l.get("opacity"), 1.0)))
+                vol = min(2.0, max(0.0, _safe_float(l.get("volume"), 0.0)))
+                pw = max(32, int(bw * scale) // 2 * 2)
+                n_in += 1
+                inputs += ["-i", str(f)]
+                lab = f"pv{li}"
+                vparts.append(
+                    f"[{n_in}:v]trim=0:{b - a:.3f},setpts=PTS-STARTPTS+{a:.3f}/TB,"
+                    f"scale={pw}:-2,format=rgba,colorchannelmixer=aa={op:.2f}[{lab}]")
+                ox, oy = _anim_xy(anim, a, f"(W-w)*{x:.3f}", f"(H-h)*{y:.3f}",
+                                  "-w", "W", "-h", "H")
+                nxt = f"v{li}"
+                vparts.append(
+                    f"{vcur}[{lab}]overlay=x={ox}:y={oy}:eof_action=pass"
+                    f":enable='between(t,{a:.3f},{b:.3f})'[{nxt}]")
+                vcur = f"[{nxt}]"
+                if vol > 0.01 and finfo["has_audio"]:
+                    aparts.append(f"[{n_in}:a]atrim=0:{b - a:.3f},asetpts=PTS-STARTPTS,"
+                                  f"volume={vol:.2f},adelay={int(a * 1000)}:all=1[au{li}]")
+                    n_aud += 1
+                n_vid += 1
             elif kind == "text":
                 text = str(l.get("text") or "").strip()[:200]
                 if not text:
@@ -1721,13 +1929,18 @@ def job_composite(job_id: str, src: Path, p: dict):
                 tmp_files.append(tf)
                 font = FONTS_DIR / "BeVietnamPro-Bold.ttf"
                 fs = max(12, int(bh * size))
+                ox, oy = _anim_xy(anim, a, f"(w-text_w)*{x:.3f}", f"(h-text_h)*{y:.3f}",
+                                  "-text_w", "w", "-text_h", "h")
+                alpha = (f":alpha='if(lt(t,{a:.3f}+0.45),max(0,(t-{a:.3f})/0.45),"
+                         f"if(gt(t,{b:.3f}-0.45),max(0,({b:.3f}-t)/0.45),1))'"
+                         if anim == "fade" else "")
                 nxt = f"v{li}"
                 vparts.append(
                     f"{vcur}drawtext=textfile='{_ff_escape_path(tf)}'"
                     + (f":fontfile='{_ff_escape_path(font)}'" if font.exists() else "")
                     + f":fontsize={fs}:fontcolor={color}"
                     f":borderw={max(1, fs // 14)}:bordercolor=black@0.75"
-                    f":x=(w-text_w)*{x:.3f}:y=(h-text_h)*{y:.3f}"
+                    f":x={ox}:y={oy}{alpha}"
                     f":enable='between(t,{a:.3f},{b:.3f})'[{nxt}]")
                 vcur = f"[{nxt}]"
                 n_txt += 1
@@ -1743,9 +1956,9 @@ def job_composite(job_id: str, src: Path, p: dict):
                               f"adelay={int(a * 1000)}:all=1[{lab}]")
                 n_aud += 1
 
-        if not (n_img or n_txt or n_aud):
+        if not (n_img or n_txt or n_aud or n_vid):
             raise RuntimeError("Không có lớp hợp lệ nào (kiểm tra file/nội dung từng lớp)")
-        _set(job_id, message=f"Ghép lớp: {n_img} ảnh · {n_txt} chữ · {n_aud} nhạc...")
+        _set(job_id, message=f"Ghép lớp: {n_img} ảnh · {n_txt} chữ · {n_vid} PiP · {n_aud} nhạc...")
 
         # âm thanh: nền (nếu có) + các lớp nhạc → amix kết thúc theo NỀN
         amaps = []
@@ -1773,7 +1986,7 @@ def job_composite(job_id: str, src: Path, p: dict):
     finally:
         for f in tmp_files:
             f.unlink(missing_ok=True)
-    _set(job_id, message=f"Xong — {n_img} ảnh + {n_txt} chữ + {n_aud} nhạc đè lên video")
+    _set(job_id, message=f"Xong — {n_img} ảnh + {n_txt} chữ + {n_vid} PiP + {n_aud} nhạc đè lên video")
     return [out_entry(out)]
 
 
@@ -3947,7 +4160,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "1.6.0",
+        "version": "1.7.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -3972,6 +4185,7 @@ def health():
             "cutlist": ffmpeg_ok,
             "composite": ffmpeg_ok,
             "track": sam2_available() and ffmpeg_ok,
+            "clipsearch": clip_available() and ffmpeg_ok,
             "music": ffmpeg_ok,
             "stabilize": ffmpeg_ok,
             "merge": ffmpeg_ok,
@@ -4207,6 +4421,11 @@ def create_job(req: JobRequest):
         speed = min(1.5, max(0.6, float(p.get("speed", 1.0))))
         label = text[:40] + ("…" if len(text) > 40 else "")
         return submit_job("tts", label, job_tts, text, voice, speed)
+
+    if req.type == "clip_index":  # lập chỉ mục CLIP toàn kho — không cần file
+        if not clip_available():
+            raise HTTPException(400, "Chưa cài open_clip (pip install open_clip_torch)")
+        return submit_job("clip_index", "kho media", job_clip_index, dict(p))
 
     src = safe_upload_path(req.file)
     if not src.is_file():
