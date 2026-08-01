@@ -1,10 +1,71 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  askDirector, authStatus, cancelJob, createJob, fetchCuesJson, fmtDur, fmtSize,
-  getClaudeSettings, getHealth, getJobs, getMedia, login, logout, openOutputs,
-  resetDirector, saveClaudeSettings, testClaude,
+  askDirector, authStatus, cancelJob, createJob, deleteMedia, fetchCuesJson,
+  fmtDur, fmtSize, getClaudeSettings, getHealth, getJobs, getMedia, login,
+  logout, openOutputs, resetDirector, saveClaudeSettings, stopDirector, testClaude,
   uploadFile, viralAnalyze, type Health, type Job, type MediaItem, type ViralCluster,
 } from "./api";
+
+// Nhãn giọng Piper (key khớp backend PIPER_VOICE_MAP)
+const VOICE_LABELS: Record<string, string> = {
+  vi: "🇻🇳 Nữ — vais1000", vi2: "🇻🇳 Nam — 25hours",
+  en: "🇺🇸 Nữ — lessac", en2: "🇺🇸 Nữ — amy", en3: "🇺🇸 Nam — ryan (HQ)",
+};
+
+// Phân nhóm công cụ (tab lọc kiểu TTM) + màu chip đánh số
+type ToolCat = "ai" | "edit" | "audio" | "pub";
+const TOOL_CATS: Record<string, ToolCat> = {
+  pipeline: "ai", viral: "ai", director: "ai", highlights: "ai", broll: "ai",
+  translate: "ai", social_pack: "ai", dub: "ai", qc: "ai", script: "ai",
+  thumbnail: "ai", auto_edit: "ai", transcribe: "ai", content: "ai", lesson: "ai",
+  merge: "edit", beatsync: "edit", silence_cut: "edit", upscale: "edit",
+  rife: "edit", bg_remove: "edit", reframe: "edit", speed: "edit", color: "edit",
+  grade: "edit", stabilize: "edit", face_blur: "edit", brand: "edit",
+  music: "audio", audio_enhance: "audio", audiogram: "audio", tts: "audio",
+  export: "pub",
+};
+const CAT_TABS: [ToolCat | "all", string][] = [
+  ["all", "Tất cả"], ["ai", "🤖 AI"], ["edit", "✂️ Dựng"],
+  ["audio", "🎵 Âm thanh"], ["pub", "📤 Xuất"],
+];
+
+// tool key → key trong health.features quyết định bật/tắt
+const FEAT_KEY: Record<string, string> = {
+  transcribe: "transcribe", silence_cut: "silence_cut", upscale: "upscale_fast",
+  rife: "rife", bg_remove: "bg_remove", tts: "tts", auto_edit: "auto_edit",
+  beatsync: "beatsync", highlights: "highlights", content: "content",
+  face_blur: "face_blur", director: "director", lesson: "lesson",
+  translate: "translate", social_pack: "social_pack", dub: "dub", qc: "qc",
+  script: "script", thumbnail: "thumbnail", viral: "viral_caption",
+  pipeline: "export", export: "export", grade: "grade",
+  reframe: "ffmpeg", speed: "ffmpeg", color: "ffmpeg", music: "ffmpeg",
+  stabilize: "ffmpeg", merge: "ffmpeg", audio_enhance: "ffmpeg",
+  brand: "ffmpeg", audiogram: "ffmpeg",
+};
+
+// Lý do tính năng bị khoá (hiện tooltip thay vì ẩn bí hiểm — góp ý nhân viên)
+const TOOL_REQS: Record<string, string> = {
+  transcribe: "cần faster-whisper/MLX (chạy setup + requirements)",
+  silence_cut: "cần auto-editor (pip install trong requirements.txt)",
+  upscale: "cần Real-ESRGAN trong binaries/ (chạy ./setup-binaries.sh)",
+  rife: "cần RIFE trong binaries/ (chạy ./setup-binaries.sh)",
+  bg_remove: "cần model RVM trong binaries/rvm (chạy ./setup-binaries.sh)",
+  tts: "cần piper-tts + giọng trong binaries/piper/voices (setup-binaries.sh)",
+  face_blur: "cần opencv + model YuNet (chạy ./setup-binaries.sh)",
+  beatsync: "cần librosa (pip install trong requirements.txt)",
+  director: "cần Claude Code CLI đăng nhập gói sub + bật trong ⚙ Cài đặt",
+  thumbnail: "cần Claude Code CLI + bật trong ⚙ Cài đặt",
+  broll: "cần PEXELS_API_KEY trong backend/.env + Claude/Qwen",
+  highlights: "cần Claude CLI hoặc mlx-lm + whisper",
+  content: "cần Claude CLI hoặc mlx-lm + whisper",
+  lesson: "cần Claude CLI hoặc mlx-lm + whisper",
+  translate: "cần Claude CLI hoặc mlx-lm + whisper",
+  social_pack: "cần Claude CLI hoặc mlx-lm + whisper",
+  qc: "cần Claude CLI hoặc mlx-lm + whisper",
+  script: "cần Claude CLI hoặc mlx-lm + whisper",
+  dub: "cần whisper + Piper TTS + Claude/Qwen",
+  viral: "cần whisper + font trong binaries/fonts (setup-binaries.sh)",
+};
 
 // Ngôn ngữ đích cho Dịch phụ đề AI
 const TR_LANGS: [string, string][] = [
@@ -48,7 +109,8 @@ type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" |
   | "tts" | "reframe" | "speed" | "color" | "music" | "stabilize" | "export"
   | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
   | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll" | "viral"
-  | "translate" | "social_pack" | "dub" | "qc" | "script" | "thumbnail" | "pipeline";
+  | "translate" | "social_pack" | "dub" | "qc" | "script" | "thumbnail"
+  | "grade" | "pipeline";
 
 // Các bước có thể xếp vào Chuỗi tự động (nối tiếp output→input)
 type PipeStep = { type: string; params: Record<string, unknown> };
@@ -92,6 +154,7 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "reframe", icon: "📐", name: "Đổi khung 9:16", desc: "nền mờ kiểu CapCut · crop giữa", gpu: false },
   { key: "speed", icon: "⏩", name: "Tốc độ video", desc: "0.5× – 3× · giữ cao độ âm thanh", gpu: false },
   { key: "color", icon: "🎨", name: "Filter màu", desc: "vivid · warm · film · B&W · sharp", gpu: false },
+  { key: "grade", icon: "🎛️", name: "Bảng chỉnh màu PRO", desc: "phơi sáng · tương phản · nhiệt độ · vibrance · nét", gpu: false },
   { key: "music", icon: "🎵", name: "Nhạc nền + ducking", desc: "tự nén nhạc khi có giọng nói", gpu: false },
   { key: "face_blur", icon: "🫥", name: "Làm mờ mặt tự động", desc: "YuNet AI · che mặt học sinh/người lạ", gpu: false },
   { key: "content", icon: "📝", name: "AI viết nội dung", desc: "tiêu đề · mô tả · hashtags · chapters", gpu: true },
@@ -232,6 +295,18 @@ export default function App() {
   const [dubVoice, setDubVoice] = useState("vi");
   const [qcAutocut, setQcAutocut] = useState(true);
   const [thumbCount, setThumbCount] = useState(6);
+  // Đợt góp ý nhân viên + UI TTM
+  const [toolCat, setToolCat] = useState<ToolCat | "all">("all");
+  const [muteMusic, setMuteMusic] = useState(false);
+  const [spellfix, setSpellfix] = useState(false);
+  const [aeStrong, setAeStrong] = useState(false);
+  const [stabStrong, setStabStrong] = useState(true);
+  const [vcFx, setVcFx] = useState("classic");
+  const [pbRate, setPbRate] = useState(1);
+  const [previewFb, setPreviewFb] = useState<string | null>(null);
+  const [chatOpen, setChatOpen] = useState(false);
+  const GRADE_DEF = { exposure: 0, brightness: 0, contrast: 1, saturation: 1, gamma: 1, temperature: 0, hue: 0, vibrance: 0, sharp: 0, zoom: 1 };
+  const [grade, setGrade] = useState<Record<string, number>>({ ...GRADE_DEF });
   // Settings — gói sub Claude
   const [csEnabled, setCsEnabled] = useState(true);
   const [csModel, setCsModel] = useState("sonnet");
@@ -305,7 +380,8 @@ export default function App() {
     setDirMsg("");
     setDirBusy(true);
     try {
-      const res = await askDirector(m);
+      // gửi kèm file đang chọn → Claude tự hiểu khi không nêu tên file
+      const res = await askDirector(m, selected?.name || "");
       let text = res.reply || "(không có phản hồi)";
       if (res.jobs.length) text += `\n\n▶ Đã xếp ${res.jobs.length} việc vào hàng đợi.`;
       if (res.errors.length) text += `\n⚠ ${res.errors.join("; ")}`;
@@ -385,7 +461,7 @@ export default function App() {
     keyword: vcKeyword,
     keywords: vcKeyword && vcKeywords.trim()
       ? vcKeywords.split(",").map((s) => s.trim()).filter(Boolean) : [],
-    karaoke: vcKaraoke,
+    karaoke: vcKaraoke, style_fx: vcFx,
     fontsize: Math.round(vcDim.h * vcFont / 100),
     outline: Math.round(vcDim.w * vcOutline / 100 * 10) / 10,
     marginV: Math.round(vcDim.h * vcPos / 100),
@@ -458,6 +534,11 @@ export default function App() {
       setVcDim({ w: selected.info.width, h: selected.info.height });
   }, [selected]);
 
+  // đổi nguồn xem → bỏ bản xem thử fallback của nguồn cũ
+  useEffect(() => { setPreviewFb(null); }, [selected, preview, ab]);
+  // áp tốc độ phát ngay khi đổi
+  useEffect(() => { if (vidElRef.current) vidElRef.current.playbackRate = pbRate; }, [pbRate]);
+
   // merge/beatsync: NHIỀU clip vào MỘT job (thứ tự = thứ tự chọn trong batch)
   const runMulti = async (type: string, params: Record<string, unknown>) => {
     const sources = batch && batchSel.length > 0 ? batchSel
@@ -493,6 +574,15 @@ export default function App() {
     ? (ab === "goc" ? `/files/uploads/${preview.input}` : preview.url)
     : selected?.url;
 
+  // xem thử chỉnh màu GẦN ĐÚNG bằng CSS filter (render thật vẫn qua ffmpeg)
+  const gradeCss = [
+    `brightness(${(1 + grade.brightness + grade.exposure * 0.25).toFixed(2)})`,
+    `contrast(${grade.contrast.toFixed(2)})`,
+    `saturate(${(grade.saturation + grade.vibrance * 0.3).toFixed(2)})`,
+    grade.hue ? `hue-rotate(${grade.hue}deg)` : "",
+    grade.temperature ? `sepia(${Math.min(0.35, Math.abs(grade.temperature) / 300).toFixed(2)})` : "",
+  ].filter(Boolean).join(" ");
+
   if (authed === null) {
     return <div className="loginwrap"><div className="logindesc">Đang kiểm tra phiên...</div></div>;
   }
@@ -505,7 +595,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v1.3 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v1.4 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -564,6 +654,50 @@ export default function App() {
               </button>
               {csTest && <span className="logindesc" style={{ margin: 0 }}>{csTest}</span>}
             </div>
+            <div className="field" style={{ marginTop: 16 }}>
+              <label>Trạng thái hệ thống (tính năng nào tắt → xem lý do & cách cài)</label>
+              <div className="statgrid">
+                {TOOLS.map((t) => {
+                  const fk = FEAT_KEY[t.key];
+                  const ok = fk ? !!feats[fk] : true;
+                  return (
+                    <div key={t.key} className={"statrow" + (ok ? "" : " bad")}
+                      title={ok ? "sẵn sàng" : TOOL_REQS[t.key] || "thiếu thành phần"}>
+                      {ok ? "✅" : "❌"} {t.icon} {t.name}
+                      {!ok && <span className="statwhy"> — {TOOL_REQS[t.key] || "thiếu thành phần"}</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* nút chat Đạo diễn AI nổi — truy cập từ mọi màn hình (kiểu TTM "Chat Lucy AI") */}
+      {feats.director && !chatOpen && (
+        <button className="fabchat" onClick={() => setChatOpen(true)}>💬 Đạo diễn AI</button>
+      )}
+      {chatOpen && (
+        <div className="chatbox">
+          <div className="modal-head">
+            <b>🎬 Đạo diễn AI {selected ? `· ${selected.name}` : ""}</b>
+            <button className="btn" onClick={() => setChatOpen(false)}>✕</button>
+          </div>
+          <div className="chatlog">
+            {dirLog.length === 0 && <div className="hint">Ra lệnh bằng lời — vd "cắt lặng rồi làm phụ đề viral video đang chọn".</div>}
+            {dirLog.map((m, i) => (
+              <div key={i} className={"dmsg " + m.role}>{m.text}</div>
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            <textarea className="ttsbox" rows={2} maxLength={2000} value={dirMsg}
+              placeholder="Yêu cầu của bạn..." onChange={(e) => setDirMsg(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!dirBusy && dirMsg.trim()) sendDirector(); } }} />
+            <button className="btn pri" disabled={dirBusy || !dirMsg.trim()} onClick={sendDirector}>
+              {dirBusy ? "⏳" : "▶"}
+            </button>
+            {dirBusy && <button className="btn" onClick={() => stopDirector()}>⏹</button>}
           </div>
         </div>
       )}
@@ -608,6 +742,17 @@ export default function App() {
                       <span className="dur">{fmtDur(m.info.duration)}</span>
                       {batch && <span className={"bsel" + (batchSel.includes(m.name) ? " on" : "")}>
                         {batchSel.includes(m.name) ? "✓" : ""}</span>}
+                      {!batch && <button className="mdel" title="Xoá khỏi kho media"
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          if (!window.confirm(`Xoá "${m.name}" khỏi kho media?`)) return;
+                          try {
+                            await deleteMedia(m.name);
+                            if (selected?.name === m.name) setSelected(null);
+                            setMedia(await getMedia());
+                            showToast("🗑 Đã xoá " + m.name);
+                          } catch (err) { showToast("❌ " + String((err as Error).message)); }
+                        }}>🗑</button>}
                     </div>
                     <div className="nm">{m.name}</div>
                   </div>
@@ -634,40 +779,31 @@ export default function App() {
                   </div>
                 </div>
               )}
+              <div className="cattabs">
+                {CAT_TABS.map(([c, l]) => (
+                  <button key={c} className={toolCat === c ? "on" : ""}
+                    onClick={() => setToolCat(c)}>{l}</button>
+                ))}
+              </div>
               <div className="lp-title">Bấm để mở tuỳ chọn · chạy trên máy</div>
-              {TOOLS.map((t) => (
+              {TOOLS.map((t, ti) => ({ t, n: ti + 1 }))
+                .filter(({ t }) => toolCat === "all" || TOOL_CATS[t.key] === toolCat)
+                .map(({ t, n }) => {
+                const fk = FEAT_KEY[t.key];
+                const off = fk ? !feats[fk] : false;
+                return (
                 <button key={t.key}
-                  className={"aitool" + (tool === t.key ? " sel" : "") +
-                    ((t.key === "transcribe" && !feats.transcribe) ||
-                     (t.key === "silence_cut" && !feats.silence_cut) ||
-                     (t.key === "upscale" && !feats.upscale_fast) ||
-                     (t.key === "rife" && !feats.rife) ||
-                     (t.key === "bg_remove" && !feats.bg_remove) ||
-                     (t.key === "tts" && !feats.tts) ||
-                     (t.key === "auto_edit" && !feats.auto_edit) ||
-                     (t.key === "beatsync" && !feats.beatsync) ||
-                     (t.key === "highlights" && !feats.highlights) ||
-                     (t.key === "content" && !feats.content) ||
-                     (t.key === "face_blur" && !feats.face_blur) ||
-                     (t.key === "director" && !feats.director) ||
-                     (t.key === "lesson" && !feats.lesson) ||
-                     (t.key === "translate" && !feats.translate) ||
-                     (t.key === "social_pack" && !feats.social_pack) ||
-                     (t.key === "dub" && !feats.dub) ||
-                     (t.key === "qc" && !feats.qc) ||
-                     (t.key === "script" && !feats.script) ||
-                     (t.key === "thumbnail" && !feats.thumbnail) ||
-                     (t.key === "viral" && !feats.viral_caption) ||
-                     (t.key === "pipeline" && !feats.export) ||
-                     (["reframe", "speed", "color", "music", "stabilize",
-                       "merge", "audio_enhance", "brand", "audiogram"].includes(t.key) && !feats.ffmpeg) ||
-                     (t.key === "export" && !feats.export) ? " disabled" : "")}
+                  title={off ? `Chưa sẵn sàng — ${TOOL_REQS[t.key] || "thiếu thành phần trên máy chủ"}` : t.desc}
+                  className={"aitool cat-" + (TOOL_CATS[t.key] || "edit")
+                    + (tool === t.key ? " sel" : "") + (off ? " disabled" : "")}
                   onClick={() => { setTool(t.key); setRightTab("tool"); }}>
+                  <span className="ai-num">{n}</span>
                   <span className="ai-ic">{t.icon}</span>
                   <span className="ai-t"><span className="ai-n">{t.name}</span><span className="ai-d">{t.desc}</span></span>
                   <span className={"ai-g" + (t.gpu ? "" : " cpu")}>{t.gpu ? "GPU" : "CPU"}</span>
                 </button>
-              ))}
+                );
+              })}
               <div className="hint">💡 Job xếp hàng chạy nền — cứ thêm nhiều việc rồi để máy tự xử lý. 0 credit, không giới hạn.</div>
             </div>
           )}
@@ -686,7 +822,17 @@ export default function App() {
                     {ab === "sua" ? "BẢN SỬA" : "BẢN GỐC"}
                   </span>
                 )}
-                <video ref={vidElRef} key={stageSrc} src={stageSrc} controls autoPlay={!!preview} />
+                <video ref={vidElRef} key={previewFb ?? stageSrc} src={previewFb ?? stageSrc}
+                  controls autoPlay={!!preview}
+                  style={tool === "grade" ? { filter: gradeCss } : undefined}
+                  onLoadedMetadata={(e) => { (e.target as HTMLVideoElement).playbackRate = pbRate; }}
+                  onError={() => {
+                    // trình duyệt không phát được (mkv/avi/hevc...) → bản xem thử H.264
+                    if (!previewFb && selected && stageSrc === selected.url && selected.info.width) {
+                      setPreviewFb(`/api/preview/${encodeURIComponent(selected.name)}`);
+                      showToast("🎞 Đang tạo bản xem thử H.264 (lần đầu hơi lâu)...");
+                    }
+                  }} />
                 {tool === "viral" && vcNowText && !preview && (
                   <div className="vcoverlay" style={{ bottom: `${vcPos}%` }}>
                     {vcNowText.split("\n").map((ln, i) => (
@@ -722,8 +868,31 @@ export default function App() {
               </span>
             )}
             <div className="spacer" />
+            <div className="seg sm" title="Tốc độ phát xem thử">
+              {[0.5, 1, 1.5, 2].map((r) => (
+                <button key={r} className={pbRate === r ? "on" : ""}
+                  onClick={() => setPbRate(r)}>{r}×</button>))}
+            </div>
             <span className="selchip">{running > 0 ? `▶ ${running} việc đang chạy nền` : "máy đang rảnh"}</span>
           </div>
+          {selected && !preview && selected.info.width && selected.info.duration > 0.2 && (
+            <div className="tlbox">{/* timeline hiển thị kiểu NLE: filmstrip + sóng âm */}
+              <div className="tlrow">
+                <span className="tllab">🎞 Video</span>
+                <img className="tlstrip" loading="lazy" alt=""
+                  src={`/api/strip/${encodeURIComponent(selected.name)}`}
+                  onError={(e) => { (e.target as HTMLImageElement).parentElement!.style.display = "none"; }} />
+              </div>
+              {selected.info.has_audio && (
+                <div className="tlrow">
+                  <span className="tllab">🔊 Âm</span>
+                  <img className="tlwave" loading="lazy" alt=""
+                    src={`/api/wave/${encodeURIComponent(selected.name)}`}
+                    onError={(e) => { (e.target as HTMLImageElement).parentElement!.style.display = "none"; }} />
+                </div>
+              )}
+            </div>
+          )}
         </section>
 
         {/* ---------- RIGHT ---------- */}
@@ -746,7 +915,7 @@ export default function App() {
                 <>
                   <div className="field"><label>Model Whisper</label>
                     <div className="seg">
-                      {["tiny", "base", "small", "medium"].map((m) => (
+                      {["tiny", "base", "small", "medium", "large-v3-turbo"].map((m) => (
                         <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
                       ))}
                     </div>
@@ -813,10 +982,16 @@ export default function App() {
                     <label className="chk"><input type="checkbox" checked={whUpper} onChange={(e) => setWhUpper(e.target.checked)} />IN HOA</label>
                     <label className="chk"><input type="checkbox" checked={whBurn} onChange={(e) => setWhBurn(e.target.checked)} />Burn vào video</label>
                   </div>
+                  {(feats.claude || feats.llm) && (
+                    <label className="chk"><input type="checkbox" checked={spellfix} onChange={(e) => setSpellfix(e.target.checked)} />
+                      ✨ AI soát chính tả sub (không áp dụng hiệu ứng karaoke)</label>
+                  )}
+                  <div className="hint">💡 Model <b>large-v3-turbo</b> chính xác nhất (chạy GPU Metal, chính tả tốt hơn hẳn base).</div>
                   <button className="btn pri big" onClick={() => run("transcribe", {
                     model: whModel, engine: whEngine || null, burn: whBurn, language: whLang || null,
                     max_words: whMaxWords, font: whFont, effect: whEffect,
                     size: whSize, position: whPos, uppercase: whUpper,
+                    spellfix, ai: aiEngine,
                   })}>▶ Chạy trên máy</button>
                 </>
               )}
@@ -867,8 +1042,10 @@ export default function App() {
                   </div>
                   <div className="field"><label>Giọng đọc</label>
                     <div className="seg">
-                      <button className={ttsVoice === "vi" ? "on" : ""} onClick={() => setTtsVoice("vi")}>🇻🇳 Tiếng Việt</button>
-                      <button className={ttsVoice === "en" ? "on" : ""} onClick={() => setTtsVoice("en")}>🇺🇸 English</button>
+                      {(health?.piper_voices?.length ? health.piper_voices : ["vi", "en"]).map((v) => (
+                        <button key={v} className={ttsVoice === v ? "on" : ""}
+                          onClick={() => setTtsVoice(v)}>{VOICE_LABELS[v] || v}</button>
+                      ))}
                     </div>
                   </div>
                   <div className="field">
@@ -1020,6 +1197,13 @@ export default function App() {
                   <div className="optrow">
                     <label className="chk"><input type="checkbox" checked={vcKeyword} onChange={(e) => setVcKeyword(e.target.checked)} />Tô sáng từ khoá (vàng)</label>
                     <label className="chk"><input type="checkbox" checked={vcKaraoke} onChange={(e) => setVcKaraoke(e.target.checked)} />Karaoke từng từ</label>
+                    <div className="field" style={{ marginTop: 6 }}><label>Hiệu ứng chữ</label>
+                      <div className="seg sm">
+                        {[["classic", "Chuẩn"], ["pop", "Pop 💥"], ["box", "Hộp nền 🔲"]].map(([v, l]) => (
+                          <button key={v} className={vcFx === v ? "on" : ""} onClick={() => setVcFx(v)}>{l}</button>
+                        ))}
+                      </div>
+                    </div>
                   </div>
                   {vcKeyword && (
                     <div className="field"><label>Từ khoá (cách nhau dấu phẩy, để trống = AI tự chọn)</label>
@@ -1118,6 +1302,8 @@ export default function App() {
                       onClick={sendDirector}>
                       {dirBusy ? "⏳ Đang xử lý..." : "🎬 Gửi cho đạo diễn"}
                     </button>
+                    {dirBusy && <button className="btn" title="Dừng ngay lệnh Claude đang chạy"
+                      onClick={() => stopDirector()}>⏹ Dừng</button>}
                     <button className="btn" title="Xoá bộ nhớ hội thoại"
                       disabled={dirBusy || dirLog.length === 0}
                       onClick={async () => { await resetDirector(); setDirLog([]); }}>🗑 Quên</button>
@@ -1386,10 +1572,12 @@ export default function App() {
                     🎙️ Nghe lời gốc → AI dịch → Piper đọc tiếng đích → khớp thời gian
                     từng câu, thay track âm thanh (giữ nguyên hình). Giọng Piper: Việt/Anh.
                   </div>
-                  <div className="field"><label>Giọng đọc đích</label>
+                  <div className="field"><label>Giọng đọc đích (vi→dịch tiếng Việt, en→English)</label>
                     <div className="seg">
-                      <button className={dubVoice === "vi" ? "on" : ""} onClick={() => setDubVoice("vi")}>🇻🇳 Tiếng Việt</button>
-                      <button className={dubVoice === "en" ? "on" : ""} onClick={() => setDubVoice("en")}>🇺🇸 English</button>
+                      {(health?.piper_voices?.length ? health.piper_voices : ["vi", "en"]).map((v) => (
+                        <button key={v} className={dubVoice === v ? "on" : ""}
+                          onClick={() => setDubVoice(v)}>{VOICE_LABELS[v] || v}</button>
+                      ))}
                     </div>
                   </div>
                   <div className="field"><label>Model Whisper</label>
@@ -1570,6 +1758,38 @@ export default function App() {
                 </>
               )}
 
+              {tool === "grade" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎛️ Bảng chỉnh màu PRO — kéo thanh trượt, video xem thử đổi màu NGAY
+                    (gần đúng); bấm Render để ffmpeg xuất bản chuẩn.
+                  </div>
+                  {([
+                    ["exposure", "Phơi sáng", -3, 3, 0.1],
+                    ["brightness", "Độ sáng", -1, 1, 0.05],
+                    ["contrast", "Tương phản", 0, 3, 0.05],
+                    ["saturation", "Bão hoà màu", 0, 3, 0.05],
+                    ["temperature", "Nhiệt độ (ấm ↔ lạnh)", -100, 100, 5],
+                    ["hue", "Tông màu (Hue)", -180, 180, 5],
+                    ["vibrance", "Rực màu (Vibrance)", -2, 2, 0.1],
+                    ["gamma", "Gamma", 0.3, 3, 0.05],
+                    ["sharp", "Độ nét", 0, 5, 0.1],
+                    ["zoom", "Zoom (crop giữa)", 1, 2, 0.05],
+                  ] as [string, string, number, number, number][]).map(([k, label, mn, mx, st]) => (
+                    <div className="field gr" key={k}>
+                      <div className="sl-h"><span>{label}</span><b>{grade[k]}</b></div>
+                      <input type="range" min={mn} max={mx} step={st} value={grade[k]}
+                        onChange={(e) => setGrade((g) => ({ ...g, [k]: parseFloat(e.target.value) }))} />
+                    </div>
+                  ))}
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button className="btn" onClick={() => setGrade({ ...GRADE_DEF })}>↺ Đặt lại</button>
+                    <button className="btn pri big" style={{ flex: 1 }}
+                      onClick={() => run("grade", { ...grade })}>🎛️ Render bản chỉnh màu</button>
+                  </div>
+                </>
+              )}
+
               {tool === "music" && (
                 <>
                   <div className="field"><label>Nhạc nền (tệp audio trong kho media)</label>
@@ -1588,11 +1808,15 @@ export default function App() {
                       onChange={(e) => setMusicVol(parseFloat(e.target.value))} />
                   </div>
                   <div className="optrow">
-                    <label className="chk"><input type="checkbox" checked={musicDuck} onChange={(e) => setMusicDuck(e.target.checked)} />
+                    <label className="chk"><input type="checkbox" checked={musicDuck} disabled={muteMusic} onChange={(e) => setMusicDuck(e.target.checked)} />
                       Ducking — tự nén nhạc khi có giọng nói</label>
                   </div>
+                  <div className="optrow">
+                    <label className="chk"><input type="checkbox" checked={muteMusic} onChange={(e) => setMuteMusic(e.target.checked)} />
+                      🔇 Tắt tiếng video gốc — chỉ còn nhạc</label>
+                  </div>
                   <button className="btn pri big" disabled={!musicFile}
-                    onClick={() => run("music", { music: musicFile, volume: musicVol, duck: musicDuck })}>
+                    onClick={() => run("music", { music: musicFile, volume: musicVol, duck: musicDuck, mute: muteMusic })}>
                     ▶ Trộn nhạc nền
                   </button>
                 </>
@@ -1601,8 +1825,13 @@ export default function App() {
               {tool === "stabilize" && (
                 <>
                   <div className="hint">Giảm rung cho video quay tay bằng bộ lọc deshake — chạy nhanh, không cần GPU.</div>
-                  <br />
-                  <button className="btn pri big" onClick={() => run("stabilize", {})}>▶ Chạy trên máy</button>
+                  <div className="field" style={{ marginTop: 8 }}><label>Mức chống rung</label>
+                    <div className="seg">
+                      <button className={!stabStrong ? "on" : ""} onClick={() => setStabStrong(false)}>Nhẹ (giữ nguyên khung)</button>
+                      <button className={stabStrong ? "on" : ""} onClick={() => setStabStrong(true)}>Mạnh (crop 6% — rõ hơn hẳn)</button>
+                    </div>
+                  </div>
+                  <button className="btn pri big" onClick={() => run("stabilize", { strength: stabStrong ? "strong" : "normal" })}>▶ Chạy trên máy</button>
                 </>
               )}
 
@@ -1691,10 +1920,17 @@ export default function App() {
                   <div className="optrow">
                     <label className="chk"><input type="checkbox" checked={aeLoudness} onChange={(e) => setAeLoudness(e.target.checked)} />Chuẩn hoá -16 LUFS (chuẩn TikTok/YouTube)</label>
                   </div>
-                  <div className="hint">Video → giữ nguyên hình, chỉ xử lý tiếng. File audio → xuất mp3 sạch. Chạy batch được.</div>
+                  <div className="field"><label>Mức xử lý</label>
+                    <div className="seg">
+                      <button className={!aeStrong ? "on" : ""} onClick={() => setAeStrong(false)}>Chuẩn (-16 LUFS)</button>
+                      <button className={aeStrong ? "on" : ""} onClick={() => setAeStrong(true)}>Mạnh (-14 LUFS + nén)</button>
+                    </div>
+                  </div>
+                  <div className="hint">Video → giữ nguyên hình, chỉ xử lý tiếng. File audio → xuất mp3 sạch.
+                    Đo LUFS trước/sau hiện ở kết quả job. Chạy batch được.</div>
                   <br />
                   <button className="btn pri big" onClick={() => run("audio_enhance", {
-                    denoise: aeDenoise, loudness: aeLoudness,
+                    denoise: aeDenoise, loudness: aeLoudness, strength: aeStrong ? "strong" : "normal",
                   })}>▶ Xử lý âm thanh</button>
                 </>
               )}

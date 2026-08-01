@@ -461,8 +461,12 @@ def _job_wrapper(job_id: str, fn, *args):
     _set(job_id, status="running", started=time.time())
     try:
         outputs = fn(job_id, *args)
+        # giữ message tổng kết "Xong — ..." của job (LUFS, số cụm...) thay vì đè
+        with JOBS_LOCK:
+            last = str(JOBS[job_id].get("message") or "")
+        done_msg = last if last.startswith("Xong") else "Hoàn thành"
         _set(job_id, status="done", progress=100, outputs=outputs,
-             finished=time.time(), message="Hoàn thành")
+             finished=time.time(), message=done_msg)
     except JobCancelled:
         _set(job_id, status="cancelled", finished=time.time(), message="Đã hủy")
     except Exception as e:  # noqa: BLE001 - surface any job error to UI
@@ -573,6 +577,22 @@ def chunk_words(segments, max_words: int, upper: bool):
     return chunks
 
 
+def _wrap2(text: str, limit: int = 42) -> str:
+    """Câu dài quá 1 dòng → bẻ thành 2 dòng CÂN BẰNG tại ranh giới từ (\\N)."""
+    if len(text) <= limit:
+        return text
+    ws = text.split()
+    if len(ws) < 2:
+        return text
+    best, bd = None, 10 ** 9
+    for i in range(1, len(ws)):
+        a, b = " ".join(ws[:i]), " ".join(ws[i:])
+        d = abs(len(a) - len(b))
+        if d < bd:
+            best, bd = (a, b), d
+    return best[0] + r"\N" + best[1] if best else text
+
+
 def build_ass(chunks, w: int, h: int, font: str, size_key: str,
               effect: str, position: str) -> str:
     fx = SUB_EFFECTS.get(effect, SUB_EFFECTS["classic"])
@@ -617,7 +637,9 @@ def build_ass(chunks, w: int, h: int, font: str, size_key: str,
                              f"Default,,0,0,0,,{text}")
     else:
         for c in chunks:
-            text = prefix + " ".join(t for _s, _e, t in c["words"])
+            # ưu tiên bản đã soát chính tả (nếu có); câu dài → bẻ 2 dòng cân bằng
+            raw = c.get("fixed") or " ".join(t for _s, _e, t in c["words"])
+            text = prefix + _wrap2(raw)
             lines.append(f"Dialogue: 0,{ass_ts(c['start'])},{ass_ts(c['end'])},"
                          f"Default,,0,0,0,,{text}")
     return head + "\n".join(lines) + "\n"
@@ -732,12 +754,27 @@ def job_transcribe(job_id: str, src: Path, p: dict):
 
     chunks = chunk_words(seg_list, max_words, upper)
 
+    # tuỳ chọn: AI soát chính tả sub (Whisper hay nghe nhầm chính tả tiếng Việt).
+    # Lưu vào c["fixed"] — .srt + .ass thường dùng; karaoke giữ words gốc (cần timing).
+    if chunks and p.get("spellfix") and (claude_available() or llm_available()):
+        ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+        _set(job_id, progress=90, message="AI đang soát chính tả phụ đề...")
+        texts = [" ".join(t for _s, _e, t in c["words"]) for c in chunks]
+        try:
+            fixed = _ai_fix_lines(texts, ai, job_id)
+            for c, fx_text in zip(chunks, fixed):
+                c["fixed"] = fx_text
+        except JobCancelled:
+            raise
+        except Exception:  # noqa: BLE001 - soát thất bại (quota...) → dùng bản gốc
+            _set(job_id, message="⚠ Soát chính tả thất bại — dùng bản gốc")
+
     # .srt (phổ thông) + .ass (đầy đủ style) + .txt
     srt_path = unique_out(src.stem, ".srt")
     with open(srt_path, "w", encoding="utf-8") as f:
         if chunks:
             for n, c in enumerate(chunks, 1):
-                text = " ".join(t for _s, _e, t in c["words"])
+                text = c.get("fixed") or " ".join(t for _s, _e, t in c["words"])
                 f.write(f"{n}\n{srt_ts(c['start'])} --> {srt_ts(c['end'])}\n{text}\n\n")
         else:
             f.write("1\n00:00:00,000 --> 00:00:02,000\n[Không phát hiện giọng nói]\n\n")
@@ -1056,6 +1093,7 @@ def job_bg_remove(job_id: str, src: Path, bg: str):
     ep = "CoreML" if providers and providers[0].startswith("CoreML") else "CPU"
     frame_bytes = w * h * 3
     i = 0
+    alpha_sum = 0.0  # theo dõi độ phủ người — video không có người → cảnh báo
     try:
         while True:
             if job_id in CANCEL_REQUESTED:
@@ -1071,6 +1109,7 @@ def job_bg_remove(job_id: str, src: Path, bg: str):
                 "src": srcT, "r1i": rec[0], "r2i": rec[1],
                 "r3i": rec[2], "r4i": rec[3], "downsample_ratio": dsr,
             })
+            alpha_sum += float(pha[0, 0].mean())
             if channels == 4:
                 rgba = np.empty((h, w, 4), dtype=np.uint8)
                 rgba[..., :3] = (fgr[0].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
@@ -1103,14 +1142,28 @@ def job_bg_remove(job_id: str, src: Path, bg: str):
     enc_log.unlink(missing_ok=True)  # luôn dọn log dù thành công hay lỗi
     if not ok:
         raise RuntimeError(f"Encode failed: {err[-500:]}")
+    # RVM là model tách NGƯỜI — video không có người → alpha ≈ 0 → file chỉ còn
+    # màu nền (đen/xanh). Báo rõ thay vì trả file rác.
+    if i > 0 and alpha_sum / i < 0.01:
+        out.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Không phát hiện NGƯỜI trong video — tính năng tách nền (RVM) chỉ tách "
+            "được người thật trước ống kính, không áp dụng cho phong cảnh/đồ vật.")
     return [out_entry(out)]
 
 
 # ---------------------------------------------------------------- job: TTS (Piper)
 PIPER_VOICE_MAP = {
-    "vi": "vi_VN-vais1000-medium.onnx",
-    "en": "en_US-lessac-medium.onnx",
+    "vi": "vi_VN-vais1000-medium.onnx",       # Việt — nữ (vais1000)
+    "vi2": "vi_VN-25hours_single-low.onnx",   # Việt — nam (25hours)
+    "en": "en_US-lessac-medium.onnx",         # Anh — nữ (lessac)
+    "en2": "en_US-amy-medium.onnx",           # Anh — nữ (amy)
+    "en3": "en_US-ryan-high.onnx",            # Anh — nam (ryan, chất lượng cao)
 }
+
+
+def piper_installed_voices() -> list:
+    return [k for k, v in PIPER_VOICE_MAP.items() if (PIPER_VOICES_DIR / v).exists()]
 
 
 def piper_available() -> bool:
@@ -1350,12 +1403,16 @@ def job_color(job_id: str, src: Path, name: str):
 
 
 # ---------------------------------------------------------------- job: background music
-def job_music(job_id: str, src: Path, music: Path, vol: float, duck: bool):
+def job_music(job_id: str, src: Path, music: Path, vol: float, duck: bool,
+              mute: bool = False):
     info = media_info(src)
     dur = info["duration"] or 1
     out = unique_out(f"{src.stem}_music", ".mp4")
-    _set(job_id, message="Trộn nhạc nền" + (" + tự nén khi có giọng nói (ducking)" if duck else "") + "...")
-    if info["has_audio"] and duck:
+    _set(job_id, message="Trộn nhạc nền" + (" (tắt tiếng gốc)" if mute else "")
+         + (" + tự nén khi có giọng nói (ducking)" if duck and not mute else "") + "...")
+    if mute:  # thay hẳn âm gốc bằng nhạc
+        fc = f"[1:a]volume={vol}[aout]"
+    elif info["has_audio"] and duck:
         fc = (f"[1:a]volume={vol}[m];"
               "[m][0:a]sidechaincompress=threshold=0.03:ratio=10:attack=20:release=400[dk];"
               "[0:a][dk]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[aout]")
@@ -1375,12 +1432,72 @@ def job_music(job_id: str, src: Path, music: Path, vol: float, duck: bool):
     return [out_entry(out)]
 
 
+# ---------------------------------------------------------------- job: color grade (bảng chỉnh màu)
+def job_grade(job_id: str, src: Path, p: dict):
+    """Bảng chỉnh màu chuyên nghiệp (kiểu TTM/CapCut): phơi sáng, sáng/tương phản,
+    bão hoà, nhiệt độ, tông màu, vibrance, độ nét, gamma, zoom — render ffmpeg thật."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình để chỉnh màu")
+    dur = info["duration"] or 1
+    w, h = info["width"] // 2 * 2, info["height"] // 2 * 2
+
+    exposure = min(3.0, max(-3.0, _safe_float(p.get("exposure"), 0)))
+    bright = min(1.0, max(-1.0, _safe_float(p.get("brightness"), 0)))
+    contrast = min(3.0, max(0.0, _safe_float(p.get("contrast"), 1)))
+    sat = min(3.0, max(0.0, _safe_float(p.get("saturation"), 1)))
+    gamma = min(3.0, max(0.3, _safe_float(p.get("gamma"), 1)))
+    temp = min(100.0, max(-100.0, _safe_float(p.get("temperature"), 0)))
+    hue_deg = min(180.0, max(-180.0, _safe_float(p.get("hue"), 0)))
+    vib = min(2.0, max(-2.0, _safe_float(p.get("vibrance"), 0)))
+    sharp = min(5.0, max(0.0, _safe_float(p.get("sharp"), 0)))
+    zoom = min(2.0, max(1.0, _safe_float(p.get("zoom"), 1)))
+
+    vf = []
+    if exposure:
+        vf.append(f"exposure=exposure={exposure:.2f}")
+    if bright or contrast != 1 or sat != 1 or gamma != 1:
+        vf.append(f"eq=brightness={bright:.2f}:contrast={contrast:.2f}"
+                  f":saturation={sat:.2f}:gamma={gamma:.2f}")
+    if temp:  # -100..100 → 3800K (ấm) .. 9200K (lạnh), 0 = 6500K trung tính
+        vf.append(f"colortemperature=temperature={int(6500 + temp * 27)}")
+    if hue_deg:
+        vf.append(f"hue=h={hue_deg:.1f}")
+    if vib:
+        vf.append(f"vibrance=intensity={vib:.2f}")
+    if sharp:
+        vf.append(f"unsharp=5:5:{sharp:.2f}")
+    if zoom > 1.001:
+        vf.append(f"crop=trunc(iw/{zoom:.3f}/2)*2:trunc(ih/{zoom:.3f}/2)*2,"
+                  f"scale={w}:{h}:flags=lanczos")
+    if not vf:
+        raise RuntimeError("Chưa chỉnh thông số nào — kéo ít nhất 1 thanh trượt")
+
+    out = unique_out(f"{src.stem}_grade", ".mp4")
+    _set(job_id, message=f"Chỉnh màu ({len(vf)} phép xử lý)...")
+    args = ["-i", str(src), "-vf", ",".join(vf),
+            "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(out)]
+    run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
+    return [out_entry(out)]
+
+
 # ---------------------------------------------------------------- job: stabilize
-def job_stabilize(job_id: str, src: Path):
-    dur = media_info(src)["duration"] or 1
+def job_stabilize(job_id: str, src: Path, strength: str = "normal"):
+    info = media_info(src)
+    dur = info["duration"] or 1
     out = unique_out(f"{src.stem}_stab", ".mp4")
-    _set(job_id, message="Chống rung (deshake)...")
-    args = ["-i", str(src), "-vf", "deshake=rx=32:ry=32:edge=mirror",
+    if strength == "strong" and info["width"]:
+        # tìm rung phạm vi lớn + crop 6% che mép lắc rồi phóng về cỡ gốc (rõ hơn hẳn)
+        w, h = info["width"] // 2 * 2, info["height"] // 2 * 2
+        vf = ("deshake=rx=64:ry=64:edge=mirror,"
+              "crop=trunc(iw*0.94/2)*2:trunc(ih*0.94/2)*2,"
+              f"scale={w}:{h}:flags=lanczos")
+    else:
+        vf = "deshake=rx=32:ry=32:edge=mirror"
+    _set(job_id, message="Chống rung (deshake"
+         + (" MẠNH + crop 6%" if strength == "strong" else "") + ")...")
+    args = ["-i", str(src), "-vf", vf,
             "-c:v", "libx264", "-crf", "19", "-preset", "medium",
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(out)]
     run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
@@ -1584,19 +1701,40 @@ def job_beatsync(job_id: str, files: list, music: Path, target: str, max_seg: in
 
 
 # ---------------------------------------------------------------- job: audio enhance
-def job_audio_enhance(job_id: str, src: Path, denoise: bool, loudness: bool):
-    """Khử ồn + chuẩn hoá âm lượng chuẩn mạng xã hội (loudnorm -16 LUFS)."""
+def _measure_lufs(job_id: str, path: Path) -> float:
+    """Đo loudness tích hợp (LUFS) bằng loudnorm print_format=json. NaN nếu lỗi."""
+    r = _run_tracked(job_id, [FFMPEG_BIN, "-hide_banner", "-nostats", "-i", str(path),
+                              "-vn", "-af", "loudnorm=print_format=json",
+                              "-f", "null", "-"])
+    try:
+        return float(_extract_json(r.stderr_text[-1200:]).get("input_i"))
+    except (ValueError, TypeError):
+        return float("nan")
+
+
+def job_audio_enhance(job_id: str, src: Path, denoise: bool, loudness: bool,
+                      strength: str = "normal"):
+    """Khử ồn + chuẩn hoá âm lượng chuẩn mạng xã hội. Đo LUFS trước/sau để
+    người dùng THẤY thay đổi (góp ý: 'xử lý xong không thấy khác gì')."""
     info = media_info(src)
     if not info["has_audio"]:
         raise RuntimeError("Tệp không có âm thanh")
     dur = info["duration"] or 1
+    strong = strength == "strong"
+    _set(job_id, progress=2, message="Đo âm lượng gốc (LUFS)...")
+    lufs_in = _measure_lufs(job_id, src)
+    _cancel_point(job_id)
     af = ["highpass=f=70"]
     if denoise:
-        af.append("afftdn=nf=-28")
+        af.append("afftdn=nf=-32" if strong else "afftdn=nf=-28")
+    if strong:
+        af.append("acompressor=threshold=-18dB:ratio=3:attack=5:release=120")
     if loudness:
-        af.append("loudnorm=I=-16:TP=-1.5:LRA=11")
-    _set(job_id, message="Xử lý âm thanh: " +
-         " + ".join(x for x, on in (("khử ồn", denoise), ("chuẩn hoá -16 LUFS", loudness)) if on))
+        af.append("loudnorm=I=-14:TP=-1.5:LRA=9" if strong
+                  else "loudnorm=I=-16:TP=-1.5:LRA=11")
+    _set(job_id, message="Xử lý âm thanh (" + ("MẠNH" if strong else "chuẩn") + "): " +
+         " + ".join(x for x, on in (("khử ồn", denoise),
+                                    ("chuẩn hoá loudness", loudness)) if on))
     if info["width"]:
         out = unique_out(f"{src.stem}_audio", ".mp4")
         # video copy nếu codec hợp mp4; vp8/vp9/khác → re-encode x264
@@ -1609,7 +1747,13 @@ def job_audio_enhance(job_id: str, src: Path, denoise: bool, loudness: bool):
         out = unique_out(f"{src.stem}_clean", ".mp3")
         args = ["-i", str(src), "-af", ",".join(af),
                 "-c:a", "libmp3lame", "-b:a", "320k", str(out)]
-    run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
+    run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=min(94, pr)), job_id)
+    _set(job_id, progress=96, message="Đo âm lượng sau xử lý...")
+    lufs_out = _measure_lufs(job_id, out)
+    note = ""
+    if lufs_in == lufs_in and lufs_out == lufs_out:  # not NaN
+        note = f" · LUFS {lufs_in:.1f} → {lufs_out:.1f}"
+    _set(job_id, message="Xong — âm thanh đã xử lý" + note)
     return [out_entry(out)]
 
 
@@ -1886,7 +2030,23 @@ def llm_generate(prompt: str, max_tokens: int = 1500, job_id: str = None,
     if engine == "local" and not llm_available() and claude_available():
         engine = "claude"  # máy chỉ có Claude (vd không cài mlx-lm) → khỏi crash
     if engine == "claude":
-        return claude_generate(prompt, job_id=job_id)
+        try:
+            return claude_generate(prompt, job_id=job_id)
+        except RuntimeError as e:
+            low = str(e).lower()
+            quota = any(k in low for k in ("limit", "quota", "usage", "rate",
+                                           "hạn mức", "out of extended"))
+            if quota and llm_available():
+                # hết hạn mức gói sub → tự chuyển não local thay vì chết job
+                if job_id:
+                    _set(job_id, message="⚠ Claude hết hạn mức → chuyển Qwen local...")
+                engine = "local"
+            elif quota:
+                raise RuntimeError(
+                    "Claude báo HẾT HẠN MỨC gói sub (quota). Thử lại sau khi hạn mức "
+                    "reset, hoặc chuyển Não AI = Local trong tuỳ chọn.")
+            else:
+                raise
     global _llm_cache
     from mlx_lm import load, generate
     while not _llm_lock.acquire(timeout=1.0):
@@ -2233,19 +2393,18 @@ LANG_NAMES = {
 }
 
 
-def _ai_translate_lines(texts: list, target_name: str, engine: str,
-                        job_id: str, batch: int = 120) -> list:
-    """Dịch danh sách câu qua Claude/LLM theo lô, GIỮ đúng số dòng & thứ tự.
+def _ai_lines_batch(texts: list, instruction: str, engine: str,
+                    job_id: str, batch: int = 120) -> list:
+    """Biến đổi danh sách câu qua Claude/LLM theo lô, GIỮ đúng số dòng & thứ tự.
     Câu nào AI bỏ sót → giữ nguyên bản gốc (không lệch mốc thời gian)."""
     out = []
     for i in range(0, len(texts), batch):
         chunk = texts[i:i + batch]
         numbered = "\n".join(f"{k + 1}. {t}" for k, t in enumerate(chunk))
         prompt = (
-            f"Dịch các câu phụ đề sau sang {target_name}. Dịch tự nhiên, ngắn gọn "
-            f"hợp phụ đề, KHÔNG thêm chú thích hay đánh số. Giữ NGUYÊN số lượng và "
-            f"thứ tự câu.\nTrả về DUY NHẤT một JSON dạng "
-            f'{{"lines": ["bản dịch câu 1", "bản dịch câu 2", ...]}} '
+            f"{instruction} KHÔNG thêm chú thích hay đánh số. Giữ NGUYÊN số lượng "
+            f"và thứ tự câu.\nTrả về DUY NHẤT một JSON dạng "
+            f'{{"lines": ["câu 1", "câu 2", ...]}} '
             f"đúng {len(chunk)} phần tử.\n\n{numbered}")
         raw = llm_generate(prompt, max_tokens=4000, job_id=job_id, engine=engine)
         arr = None
@@ -2262,6 +2421,21 @@ def _ai_translate_lines(texts: list, target_name: str, engine: str,
         out.extend(arr)
         _cancel_point(job_id)
     return out
+
+
+def _ai_translate_lines(texts: list, target_name: str, engine: str,
+                        job_id: str) -> list:
+    return _ai_lines_batch(
+        texts, f"Dịch các câu phụ đề sau sang {target_name}. Dịch tự nhiên, "
+        "ngắn gọn hợp phụ đề.", engine, job_id)
+
+
+def _ai_fix_lines(texts: list, engine: str, job_id: str) -> list:
+    """Soát & sửa chính tả/dấu tiếng Việt cho phụ đề (giữ nguyên nghĩa, số dòng)."""
+    return _ai_lines_batch(
+        texts, "Sửa lỗi chính tả, dấu câu và từ nghe nhầm trong các dòng phụ đề "
+        "tiếng Việt sau (do nhận dạng giọng nói). GIỮ NGUYÊN nghĩa và cách nói.",
+        engine, job_id)
 
 
 def job_translate(job_id: str, src: Path, p: dict):
@@ -2371,7 +2545,8 @@ def job_dub(job_id: str, src: Path, p: dict):
     _cancel_point(job_id)
 
     ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
-    tgt_name = LANG_NAMES.get(voice, voice)
+    # giọng vi/vi2/... → ngôn ngữ đích suy từ tiền tố (vi*/en*)
+    tgt_name = LANG_NAMES["vi" if voice.startswith("vi") else "en"]
     _set(job_id, progress=48, message=f"Dịch {len(segs)} câu sang {tgt_name}...")
     translated = _ai_translate_lines([s.text.strip() for s in segs], tgt_name, ai, job_id)
     _cancel_point(job_id)
@@ -3074,6 +3249,14 @@ def _viral_ass(clusters, w: int, h: int, params: dict) -> str:
     kw_on = bool(params.get("keyword", False))
     kw_set = set(k.strip().lower() for k in (params.get("keywords") or []) if k.strip())
     karaoke = bool(params.get("karaoke", False))
+    # hiệu ứng chữ: classic (chuẩn) / pop (phóng nhẹ khi hiện) / box (nền hộp mờ)
+    style_fx = params.get("style_fx") if params.get("style_fx") in ("classic", "pop", "box") else "classic"
+    border_style, outline_c = 1, "&H00000000"
+    if style_fx == "box":
+        border_style = 3                      # BorderStyle=3: outline thành hộp nền
+        outline_c = "&H55000000"              # đen mờ ~66% đục
+        outline = max(outline, round(h * 0.012, 1))  # độ dày outline = padding hộp
+    pop_tag = r"{\fscx55\fscy55\t(0,120,\fscx100\fscy100)}" if style_fx == "pop" else ""
 
     head = (
         "[Script Info]\nScriptType: v4.00+\n"
@@ -3083,8 +3266,8 @@ def _viral_ass(clusters, w: int, h: int, params: dict) -> str:
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Viral,{font},{fontsize},&H00FFFFFF,&H00FFFFFF,&H00000000,"
-        f"&H00000000,-1,0,0,0,100,100,0,0,1,{outline},0,2,60,60,{margin_v},1\n\n"
+        f"Style: Viral,{font},{fontsize},&H00FFFFFF,&H00FFFFFF,{outline_c},"
+        f"&H00000000,-1,0,0,0,100,100,0,0,{border_style},{outline},0,2,60,60,{margin_v},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -3105,7 +3288,7 @@ def _viral_ass(clusters, w: int, h: int, params: dict) -> str:
         st = max(0.0, c[0]["s"])          # clamp: không âm, end > start
         en = max(st + 0.1, c[-1]["e"])
         l1, l2 = _balance_lines(c)
-        prefix = r"{\2c&H00AAAAAA&}" if karaoke else ""  # chưa đọc = xám → sweep sang trắng
+        prefix = pop_tag + (r"{\2c&H00AAAAAA&}" if karaoke else "")  # pop-in + karaoke xám→trắng
         t1 = " ".join(render_word(x) for x in l1)
         text = prefix + t1
         if l2:
@@ -3333,7 +3516,8 @@ def job_face_blur(job_id: str, src: Path, mode: str, strength: float):
     # detect ở bản thu nhỏ ~640px cho nhanh, scale box ngược lại
     dw = min(640, w)
     dh = max(1, int(h * dw / w))
-    det = cv2.FaceDetectorYN.create(str(YUNET_ONNX), "", (dw, dh), 0.6, 0.3, 500)
+    # ngưỡng 0.75 (0.6 cũ hay nhận nhầm cảnh vật thành "mặt" → mờ cả khung hình)
+    det = cv2.FaceDetectorYN.create(str(YUNET_ONNX), "", (dw, dh), 0.75, 0.3, 500)
     sx, sy = w / dw, h / dh
 
     out = unique_out(f"{src.stem}_facemask", ".mp4")
@@ -3388,6 +3572,10 @@ def job_face_blur(job_id: str, src: Path, mode: str, strength: float):
                     y1 = int(max(0, y - ey))
                     x2 = int(min(w, x + fw + ex))
                     y2 = int(min(h, y + fh + ey))
+                    # bỏ box chiếm >35% khung — mặt thật hiếm khi to vậy, thường là
+                    # nhận nhầm (khiến cả video bị mờ)
+                    if (x2 - x1) * (y2 - y1) > 0.35 * w * h:
+                        continue
                     if x2 > x1 and y2 > y1:
                         # bỏ box cũ trùng vị trí (tâm nằm trong box mới) — chống tích luỹ
                         active = [b for b in active
@@ -3464,11 +3652,12 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
         "gpu": gpu_info(),
+        "piper_voices": piper_installed_voices(),
         "features": {
             "ffmpeg": ffmpeg_ok,
             "transcribe": whisper_ok,
@@ -3484,6 +3673,7 @@ def health():
             "reframe": ffmpeg_ok,
             "speed": ffmpeg_ok,
             "color": ffmpeg_ok,
+            "grade": ffmpeg_ok,
             "music": ffmpeg_ok,
             "stabilize": ffmpeg_ok,
             "merge": ffmpeg_ok,
@@ -3775,11 +3965,15 @@ def create_job(req: JobRequest):
         music = safe_upload_path(str(p.get("music", "")))
         if not music.is_file():
             raise HTTPException(404, "Không tìm thấy file nhạc trong kho media")
-        vol = min(1.0, max(0.05, float(p.get("volume", 0.25))))
+        vol = min(1.0, max(0.05, _safe_float(p.get("volume"), 0.25)))
         duck = bool(p.get("duck", True))
-        return submit_job("music", src.name, job_music, src, music, vol, duck)
+        mute = bool(p.get("mute", False))
+        return submit_job("music", src.name, job_music, src, music, vol, duck, mute)
     if req.type == "stabilize":
-        return submit_job("stabilize", src.name, job_stabilize, src)
+        stab_str = p.get("strength") if p.get("strength") in ("normal", "strong") else "normal"
+        return submit_job("stabilize", src.name, job_stabilize, src, stab_str)
+    if req.type == "grade":
+        return submit_job("grade", src.name, job_grade, src, dict(p))
     if req.type == "merge":
         extra_names = list(p.get("files") or [])
         if len(extra_names) > 7:
@@ -3819,8 +4013,9 @@ def create_job(req: JobRequest):
         loudness = bool(p.get("loudness", True))
         if not denoise and not loudness:
             loudness = True
+        strength = p.get("strength") if p.get("strength") in ("normal", "strong") else "normal"
         return submit_job("audio_enhance", src.name, job_audio_enhance,
-                          src, denoise, loudness)
+                          src, denoise, loudness, strength)
     if req.type == "brand":
         title = str(p.get("title") or "")[:120]
         sign = str(p.get("sign") or "")[:60]
@@ -3959,6 +4154,25 @@ DIRECTOR_CATALOG = """\
 class DirectorReq(BaseModel):
     message: str
     reset: bool = False
+    file: str = ""      # file đang chọn trong app — ngữ cảnh mặc định
+
+
+DIRECTOR_STOP = {"flag": False}
+
+
+@app.post("/api/director/stop")
+def director_stop():
+    """Dừng NGAY lệnh Claude của Đạo diễn đang chạy (kill tiến trình CLI)."""
+    DIRECTOR_STOP["flag"] = True
+    with JOBS_LOCK:
+        procs = list(JOB_PROCS.get("__director__", []))
+    for pr in procs:
+        if pr.poll() is None:
+            try:
+                pr.kill()
+            except OSError:
+                pass
+    return {"stopped": len(procs)}
 
 
 # Bộ nhớ hội thoại của Đạo diễn (app cá nhân 1 người — 1 luồng chung, có khoá)
@@ -3989,6 +4203,16 @@ def director(req: DirectorReq):
         raise HTTPException(400, "Thiếu nội dung yêu cầu")
     if len(msg) > 2000:
         raise HTTPException(400, "Yêu cầu quá dài (tối đa 2000 ký tự)")
+    DIRECTOR_STOP["flag"] = False
+    with JOBS_LOCK:  # dọn proc director cũ (đã xong/bị kill) khỏi bảng theo dõi
+        JOB_PROCS.pop("__director__", None)
+
+    # file đang chọn trong app → Claude tự hiểu khi người dùng không nêu tên file
+    sel_desc = ""
+    sel = (req.file or "").strip()
+    if sel and not re.search(r"[\\/]", sel) and (UPLOADS / sel).is_file():
+        sel_desc = (f"FILE ĐANG CHỌN TRONG APP: {sel} — nếu người dùng không nêu "
+                    "tên file cụ thể thì dùng file này.\n\n")
 
     items = []
     for pth in sorted(UPLOADS.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)[:40]:
@@ -4011,6 +4235,7 @@ def director(req: DirectorReq):
     prompt = (
         "Bạn là đạo diễn hậu kỳ điều khiển app dựng video Local Studio.\n\n"
         f"KHO MEDIA (tên file phải dùng CHÍNH XÁC):\n{media_desc}\n\n"
+        f"{sel_desc}"
         f"CÔNG CỤ (job type + params):\n{DIRECTOR_CATALOG}\n\n"
         f"{hist_desc}"
         f"YÊU CẦU MỚI CỦA NGƯỜI DÙNG: {msg}\n\n"
@@ -4022,8 +4247,11 @@ def director(req: DirectorReq):
         "nếu yêu cầu mơ hồ hoặc thiếu file thì actions để rỗng và hỏi lại trong reply."
     )
     try:
-        data = _extract_json(claude_generate(prompt, timeout=180))
+        # job_id giả "__director__" → proc được theo dõi, /api/director/stop kill được
+        data = _extract_json(claude_generate(prompt, job_id="__director__", timeout=180))
     except (RuntimeError, ValueError, json.JSONDecodeError) as e:
+        if DIRECTOR_STOP["flag"]:
+            return {"reply": "⏹ Đã dừng theo yêu cầu.", "jobs": [], "errors": []}
         raise HTTPException(502, f"Đạo diễn không phản hồi hợp lệ: {str(e)[:200]}")
     if not isinstance(data, dict):
         raise HTTPException(502, "Đạo diễn trả sai định dạng")
@@ -4239,6 +4467,91 @@ def thumb(name: str):
         if r.returncode != 0 or not t.exists():
             raise HTTPException(404, "no thumbnail")
     return FileResponse(str(t), media_type="image/jpeg")
+
+
+PREVIEWS = TMP / "previews"
+PREVIEWS.mkdir(exist_ok=True)
+_PREVIEW_LOCK = threading.Lock()  # tránh 2 request transcode trùng 1 file
+
+
+@app.delete("/api/media/{name}")
+def delete_media(name: str):
+    """Xoá file khỏi kho media + mọi cache (thumb/preview/wave/strip) của nó."""
+    src = safe_upload_path(name)
+    if not src.is_file():
+        raise HTTPException(404, "Không tìm thấy file")
+    src.unlink()
+    (THUMBS / (name + ".jpg")).unlink(missing_ok=True)
+    for c in PREVIEWS.glob(name + ".*"):
+        c.unlink(missing_ok=True)
+    return {"ok": True, "deleted": name}
+
+
+@app.get("/api/preview/{name}")
+def preview_media(name: str):
+    """Bản xem thử H.264 720p cho file trình duyệt không phát được (mkv/avi/hevc...).
+    Transcode 1 lần rồi cache — các lần sau trả ngay."""
+    src = safe_upload_path(name)
+    if not src.is_file():
+        raise HTTPException(404, "Không tìm thấy file")
+    info = media_info(src)
+    if not info["width"]:
+        raise HTTPException(415, "File không có hình")
+    out = PREVIEWS / (name + ".mp4")
+    with _PREVIEW_LOCK:
+        if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
+            cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                   "-i", str(src),
+                   "-vf", "scale='min(1280,iw)':-2",
+                   "-c:v", "libx264", "-crf", "26", "-preset", "veryfast",
+                   "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                   "-c:a", "aac", "-b:a", "128k", str(out)]
+            r = _run(cmd)
+            if r.returncode != 0 or not out.exists():
+                out.unlink(missing_ok=True)
+                raise HTTPException(500, "Không tạo được bản xem thử")
+    return FileResponse(str(out), media_type="video/mp4")
+
+
+@app.get("/api/wave/{name}")
+def wave_media(name: str):
+    """Ảnh sóng âm (waveform) cho timeline hiển thị."""
+    src = safe_upload_path(name)
+    if not src.is_file():
+        raise HTTPException(404, "Không tìm thấy file")
+    if not media_info(src)["has_audio"]:
+        raise HTTPException(415, "File không có âm thanh")
+    out = PREVIEWS / (name + ".wave.png")
+    if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
+        r = _run([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                  "-i", str(src), "-filter_complex",
+                  "aformat=channel_layouts=mono,compand,"
+                  "showwavespic=s=1200x96:colors=#FFB23F",
+                  "-frames:v", "1", str(out)])
+        if r.returncode != 0 or not out.exists():
+            raise HTTPException(500, "Không tạo được waveform")
+    return FileResponse(str(out), media_type="image/png")
+
+
+@app.get("/api/strip/{name}")
+def strip_media(name: str):
+    """Dải 10 khung hình (filmstrip) cho timeline hiển thị."""
+    src = safe_upload_path(name)
+    if not src.is_file():
+        raise HTTPException(404, "Không tìm thấy file")
+    info = media_info(src)
+    if not info["width"] or (info["duration"] or 0) < 0.2:
+        raise HTTPException(415, "File không phải video")
+    out = PREVIEWS / (name + ".strip.jpg")
+    if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
+        dur = info["duration"]
+        r = _run([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                  "-i", str(src), "-vf",
+                  f"fps=10/{dur:.3f},scale=160:90:force_original_aspect_ratio=increase,"
+                  "crop=160:90,tile=10x1", "-frames:v", "1", "-q:v", "4", str(out)])
+        if r.returncode != 0 or not out.exists():
+            raise HTTPException(500, "Không tạo được filmstrip")
+    return FileResponse(str(out), media_type="image/jpeg")
 
 
 @app.post("/api/open-outputs")

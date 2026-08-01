@@ -28,6 +28,7 @@ export type Health = {
   status: string;
   version: string;
   workers?: number;
+  piper_voices?: string[];
   gpu: { name: string; vram_total_mb: number; vram_used_mb?: number; type?: string } | null;
   features: Record<string, boolean>;
 };
@@ -94,13 +95,13 @@ export async function createJob(
   return r.json();
 }
 
-export async function askDirector(message: string): Promise<{
+export async function askDirector(message: string, file = ""): Promise<{
   reply: string; jobs: Job[]; errors: string[];
 }> {
   const r = await fetch("/api/director", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, file }),
   });
   if (!r.ok) {
     const e = await r.json().catch(() => ({ detail: r.statusText }));
@@ -162,6 +163,18 @@ export async function testClaude(): Promise<{ ok: boolean; model: string; ms: nu
   const d = await r.json().catch(() => ({ detail: r.statusText }));
   if (!r.ok) throw new Error(d.detail || "Test thất bại");
   return d;
+}
+
+export async function deleteMedia(name: string): Promise<void> {
+  const r = await fetch(`/api/media/${encodeURIComponent(name)}`, { method: "DELETE" });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(e.detail || "Xoá thất bại");
+  }
+}
+
+export async function stopDirector(): Promise<void> {
+  await fetch("/api/director/stop", { method: "POST" });
 }
 
 export async function cancelJob(id: string): Promise<void> {

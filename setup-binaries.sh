@@ -43,7 +43,9 @@ fi
 
 # 5. Giọng Piper TTS (engine cài qua pip trong requirements.txt)
 mkdir -p piper/voices && cd piper/voices
-for V in "vi/vi_VN/vais1000/medium/vi_VN-vais1000-medium" "en/en_US/lessac/medium/en_US-lessac-medium"; do
+for V in "vi/vi_VN/vais1000/medium/vi_VN-vais1000-medium" "en/en_US/lessac/medium/en_US-lessac-medium" \
+         "vi/vi_VN/25hours_single/low/vi_VN-25hours_single-low" "en/en_US/amy/medium/en_US-amy-medium" \
+         "en/en_US/ryan/high/en_US-ryan-high"; do
   F=$(basename "$V")
   if [ ! -f "$F.onnx" ]; then
     echo "==> Giọng Piper: $F"

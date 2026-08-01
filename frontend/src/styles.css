@@ -209,6 +209,55 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;bac
 .loginerr{color:var(--warn);font-size:12px;text-align:center}
 .loginfoot{font-family:var(--mono);font-size:9.5px;color:var(--faint);text-align:center;letter-spacing:.04em}
 
+/* ============ UI TTM: tab nhóm + chip đánh số màu ============ */
+.cattabs{display:flex;gap:4px;margin:2px 0 8px;flex-wrap:wrap}
+.cattabs button{font-size:11px;padding:5px 9px;border-radius:7px;background:var(--p2);
+  border:1px solid var(--line);color:var(--dim)}
+.cattabs button.on{background:var(--amberg);border-color:var(--amber);color:var(--amber);font-weight:600}
+.ai-num{min-width:20px;height:20px;border-radius:6px;display:grid;place-items:center;
+  font-family:var(--mono);font-size:10px;font-weight:700;margin-right:2px}
+.aitool.cat-ai .ai-num{background:rgba(255,178,63,.16);color:var(--amber)}
+.aitool.cat-edit .ai-num{background:rgba(70,214,198,.14);color:var(--ice)}
+.aitool.cat-audio .ai-num{background:rgba(199,122,245,.16);color:#C77AF5}
+.aitool.cat-pub .ai-num{background:rgba(122,203,107,.16);color:#7ACB6B}
+.aitool.disabled{opacity:.45}
+
+/* nút xoá media */
+.mitem{position:relative}
+.mdel{position:absolute;top:4px;right:4px;z-index:2;font-size:11px;padding:3px 5px;
+  border-radius:6px;background:rgba(0,0,0,.55);opacity:0;transition:opacity .15s}
+.mitem:hover .mdel{opacity:1}
+.mdel:hover{background:rgba(255,107,87,.75)}
+
+/* timeline hiển thị: filmstrip + waveform */
+.tlbox{margin-top:6px;background:var(--p1);border:1px solid var(--line);border-radius:10px;
+  padding:8px 10px;display:flex;flex-direction:column;gap:6px}
+.tlrow{display:flex;align-items:center;gap:8px;min-height:30px}
+.tllab{font-family:var(--mono);font-size:9.5px;color:var(--faint);width:56px;flex:none}
+.tlstrip{flex:1;height:44px;object-fit:cover;border-radius:6px;border:1px solid var(--line2);min-width:0}
+.tlwave{flex:1;height:34px;object-fit:fill;border-radius:6px;background:var(--p2);
+  border:1px solid var(--line2);min-width:0}
+
+/* chat Đạo diễn AI nổi */
+.fabchat{position:fixed;right:18px;bottom:40px;z-index:40;background:linear-gradient(140deg,var(--amber),#E0761B);
+  color:#1A1204;font-weight:700;padding:10px 16px;border-radius:24px;box-shadow:0 8px 28px rgba(0,0,0,.5);font-size:13px}
+.fabchat:hover{transform:translateY(-1px)}
+.chatbox{position:fixed;right:18px;bottom:40px;z-index:41;width:min(380px,92vw);
+  background:var(--p1);border:1px solid var(--line2);border-radius:14px;padding:14px;
+  box-shadow:0 20px 60px rgba(0,0,0,.65);display:flex;flex-direction:column;gap:8px}
+.chatlog{max-height:280px;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
+
+/* trạng thái hệ thống trong Settings */
+.statgrid{display:flex;flex-direction:column;gap:3px;max-height:220px;overflow-y:auto;
+  background:var(--p2);border:1px solid var(--line);border-radius:8px;padding:8px}
+.statrow{font-size:11.5px;color:var(--ink)}
+.statrow.bad{color:var(--dim)}
+.statwhy{color:var(--warn);font-size:10.5px}
+
+/* slider bảng chỉnh màu gọn hơn */
+.field.gr{margin-bottom:4px}
+.field.gr input[type=range]{width:100%}
+
 /* ============ MODAL (Settings) ============ */
 .modal-bg{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.6);display:grid;place-items:center;padding:20px}
 .modal-card{width:min(440px,94vw);max-height:88vh;overflow:auto;background:var(--p1);
