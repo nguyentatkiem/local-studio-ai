@@ -11,3 +11,4 @@ backend/ADMIN-PASSWORD.txt
 desktop/node_modules/
 desktop/src-tauri/target/
 backend/.env
+backend/claude_config.json
