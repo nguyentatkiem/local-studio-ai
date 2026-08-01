@@ -1834,9 +1834,15 @@ def _anim_xy(anim: str, a: float, fx: str, fy: str, off_l: str, off_r: str,
     return fx, fy
 
 
+def _kf_expr(f0: str, f1: str, a: float, b: float) -> str:
+    """Keyframe vị trí: nội suy tuyến tính từ f0 (tại t=a) đến f1 (tại t=b)."""
+    return (f"'({f0})+(({f1})-({f0}))*"
+            f"min(1,max(0,(t-{a:.3f})/{max(0.1, b - a):.3f}))'")
+
+
 def job_composite(job_id: str, src: Path, p: dict):
     """Multi-track xếp lớp: đè ảnh/logo + chữ + nhạc + VIDEO PiP lên video nền theo
-    mốc thời gian, kèm hiệu ứng bay vào (fade/trượt 4 hướng). Tối đa 12 lớp."""
+    mốc thời gian, kèm hiệu ứng bay vào (fade/trượt) + keyframe vị trí đầu→cuối."""
     info = media_info(src)
     if not info["width"]:
         raise RuntimeError("Cần video nền có hình")
@@ -1863,6 +1869,11 @@ def job_composite(job_id: str, src: Path, p: dict):
             x = min(1.0, max(0.0, _safe_float(l.get("x"), 0.5)))
             y = min(1.0, max(0.0, _safe_float(l.get("y"), 0.5)))
             anim = l.get("anim") if l.get("anim") in COMP_ANIMS else "none"
+            # keyframe vị trí: có x2/y2 khác điểm đầu → bay từ (x,y) đến (x2,y2)
+            x2 = min(1.0, max(0.0, _safe_float(l.get("x2"), x)))
+            y2 = min(1.0, max(0.0, _safe_float(l.get("y2"), y)))
+            has_kf = (l.get("x2") is not None or l.get("y2") is not None) \
+                and (abs(x2 - x) > 0.003 or abs(y2 - y) > 0.003)
             if kind == "image":
                 f = safe_upload_path(str(l.get("file", "")))
                 if not f.is_file() or f.suffix.lower() not in IMAGE_EXT:
@@ -1879,8 +1890,12 @@ def job_composite(job_id: str, src: Path, p: dict):
                 vparts.append(
                     f"[{n_in}:v]scale={pw}:-1,format=rgba,"
                     f"colorchannelmixer=aa={op:.2f}{fade}[{lab}]")
-                ox, oy = _anim_xy(anim, a, f"(W-w)*{x:.3f}", f"(H-h)*{y:.3f}",
-                                  "-w", "W", "-h", "H")
+                if has_kf:
+                    ox = _kf_expr(f"(W-w)*{x:.3f}", f"(W-w)*{x2:.3f}", a, b)
+                    oy = _kf_expr(f"(H-h)*{y:.3f}", f"(H-h)*{y2:.3f}", a, b)
+                else:
+                    ox, oy = _anim_xy(anim, a, f"(W-w)*{x:.3f}", f"(H-h)*{y:.3f}",
+                                      "-w", "W", "-h", "H")
                 nxt = f"v{li}"
                 vparts.append(
                     f"{vcur}[{lab}]overlay=x={ox}:y={oy}"
@@ -1905,8 +1920,12 @@ def job_composite(job_id: str, src: Path, p: dict):
                 vparts.append(
                     f"[{n_in}:v]trim=0:{b - a:.3f},setpts=PTS-STARTPTS+{a:.3f}/TB,"
                     f"scale={pw}:-2,format=rgba,colorchannelmixer=aa={op:.2f}[{lab}]")
-                ox, oy = _anim_xy(anim, a, f"(W-w)*{x:.3f}", f"(H-h)*{y:.3f}",
-                                  "-w", "W", "-h", "H")
+                if has_kf:
+                    ox = _kf_expr(f"(W-w)*{x:.3f}", f"(W-w)*{x2:.3f}", a, b)
+                    oy = _kf_expr(f"(H-h)*{y:.3f}", f"(H-h)*{y2:.3f}", a, b)
+                else:
+                    ox, oy = _anim_xy(anim, a, f"(W-w)*{x:.3f}", f"(H-h)*{y:.3f}",
+                                      "-w", "W", "-h", "H")
                 nxt = f"v{li}"
                 vparts.append(
                     f"{vcur}[{lab}]overlay=x={ox}:y={oy}:eof_action=pass"
@@ -1929,8 +1948,12 @@ def job_composite(job_id: str, src: Path, p: dict):
                 tmp_files.append(tf)
                 font = FONTS_DIR / "BeVietnamPro-Bold.ttf"
                 fs = max(12, int(bh * size))
-                ox, oy = _anim_xy(anim, a, f"(w-text_w)*{x:.3f}", f"(h-text_h)*{y:.3f}",
-                                  "-text_w", "w", "-text_h", "h")
+                if has_kf:
+                    ox = _kf_expr(f"(w-text_w)*{x:.3f}", f"(w-text_w)*{x2:.3f}", a, b)
+                    oy = _kf_expr(f"(h-text_h)*{y:.3f}", f"(h-text_h)*{y2:.3f}", a, b)
+                else:
+                    ox, oy = _anim_xy(anim, a, f"(w-text_w)*{x:.3f}", f"(h-text_h)*{y:.3f}",
+                                      "-text_w", "w", "-text_h", "h")
                 alpha = (f":alpha='if(lt(t,{a:.3f}+0.45),max(0,(t-{a:.3f})/0.45),"
                          f"if(gt(t,{b:.3f}-0.45),max(0,({b:.3f}-t)/0.45),1))'"
                          if anim == "fade" else "")
@@ -4160,7 +4183,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "1.7.0",
+        "version": "1.8.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -4905,6 +4928,62 @@ class WorkersReq(BaseModel):
 def set_workers(req: WorkersReq):
     """Chỉnh số job chạy song song (1-4)."""
     return {"workers": set_worker_limit(req.workers)}
+
+
+# ---------------------------------------------------------------- Dự án lớp phủ (save/load)
+PROJECTS_DIR = WORKSPACE / "projects"
+PROJECTS_DIR.mkdir(exist_ok=True)
+
+
+def _proj_path(name: str) -> Path:
+    name = re.sub(r"[^\w\- À-ỹ]", "", str(name or "")).strip()[:48]
+    if not name:
+        raise HTTPException(400, "Tên dự án không hợp lệ")
+    return PROJECTS_DIR / (name + ".json")
+
+
+class ProjectSaveReq(BaseModel):
+    name: str
+    file: str = ""
+    data: dict = {}
+
+
+@app.get("/api/projects")
+def list_projects():
+    out = []
+    for f in sorted(PROJECTS_DIR.glob("*.json"), key=lambda x: -x.stat().st_mtime):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            out.append({"name": f.stem, "file": d.get("file", ""),
+                        "layers": len((d.get("data") or {}).get("layers") or []),
+                        "mtime": f.stat().st_mtime})
+        except (json.JSONDecodeError, OSError):
+            continue
+    return out
+
+
+@app.post("/api/projects")
+def save_project(req: ProjectSaveReq):
+    payload = {"file": str(req.file or "")[:200], "data": req.data}
+    blob = json.dumps(payload, ensure_ascii=False)
+    if len(blob) > 300_000:
+        raise HTTPException(400, "Dự án quá lớn")
+    _proj_path(req.name).write_text(blob, encoding="utf-8")
+    return {"ok": True, "name": req.name}
+
+
+@app.get("/api/projects/{name}")
+def load_project(name: str):
+    f = _proj_path(name)
+    if not f.exists():
+        raise HTTPException(404, "Không tìm thấy dự án")
+    return json.loads(f.read_text(encoding="utf-8"))
+
+
+@app.delete("/api/projects/{name}")
+def delete_project(name: str):
+    _proj_path(name).unlink(missing_ok=True)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- Settings: gói sub Claude

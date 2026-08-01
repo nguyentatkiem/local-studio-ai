@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import {
-  askDirector, authStatus, cancelJob, clipSearch, createJob, deleteMedia, fetchCuesJson,
-  fmtDur, fmtSize, getClaudeSettings, getHealth, getJobs, getMedia, login,
-  logout, openOutputs, resetDirector, saveClaudeSettings, stopDirector, testClaude,
-  uploadFile, viralAnalyze, type Health, type Job, type MediaItem, type ViralCluster,
+  askDirector, authStatus, cancelJob, clipSearch, createJob, deleteMedia,
+  deleteProject, fetchCuesJson, fmtDur, fmtSize, getClaudeSettings, getHealth,
+  getJobs, getMedia, listProjects, loadProject, login, logout, openOutputs,
+  resetDirector, saveClaudeSettings, saveProject, stopDirector, testClaude,
+  uploadFile, viralAnalyze,
+  type Health, type Job, type MediaItem, type ProjectInfo, type ViralCluster,
 } from "./api";
 
 // Nhãn giọng Piper (key khớp backend PIPER_VOICE_MAP)
@@ -121,6 +123,7 @@ type Layer = {
   id: number; kind: "image" | "text" | "audio" | "video";
   file?: string; text?: string; color?: string; anim?: string;
   start: number; end: number; x: number; y: number;
+  x2?: number; y2?: number;   // keyframe vị trí cuối (bay từ x,y → x2,y2)
   scale: number; opacity: number; size: number; volume: number;
 };
 const ANIMS: [string, string][] = [
@@ -431,7 +434,10 @@ export default function App() {
   const [laySel, setLaySel] = useState<number>(-1);
   const [tlNow, setTlNow] = useState(0);
   const layDrag = useRef<{ i: number; mode: "move" | "l" | "r"; x0: number; s0: number; e0: number } | null>(null);
-  const ovDrag = useRef<number>(-1);   // index lớp đang kéo trên player
+  const ovDrag = useRef<{ i: number; pt: 1 | 2 } | null>(null);  // lớp + điểm (đầu/cuối) đang kéo
+  const [projName, setProjName] = useState("");
+  const [projList, setProjList] = useState<ProjectInfo[]>([]);
+  const [projPick, setProjPick] = useState("");
   const [trackPt, setTrackPt] = useState<{ x: number; y: number } | null>(null);
   const [trackFx, setTrackFx] = useState("blur");
   const [trackStr, setTrackStr] = useState(1.0);
@@ -766,7 +772,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v1.7 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v1.8 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -986,14 +992,14 @@ export default function App() {
             {stageSrc ? (
               <div className="canvas"
                 onPointerMove={(e) => {
-                  if (ovDrag.current < 0) return;
+                  const g = ovDrag.current;
+                  if (!g) return;
                   const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                  patchLayer(ovDrag.current, {
-                    x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
-                    y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)),
-                  });
+                  const nx = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+                  const ny = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+                  patchLayer(g.i, g.pt === 2 ? { x2: nx, y2: ny } : { x: nx, y: ny });
                 }}
-                onPointerUp={() => { ovDrag.current = -1; }}>
+                onPointerUp={() => { ovDrag.current = null; }}>
                 {selected && !preview && (
                   <span className="reslab">{selected.info.width}×{selected.info.height} · {Math.round(selected.info.fps)}fps</span>
                 )}
@@ -1031,29 +1037,53 @@ export default function App() {
                     {!trackPt && <span className="trackhint">👆 Bấm vào ĐỐI TƯỢNG cần theo dõi</span>}
                   </div>
                 )}
-                {/* preview lớp phủ multi-track (kéo được để đổi vị trí) */}
+                {/* preview lớp phủ multi-track: kéo điểm ĐẦU (liền) + điểm CUỐI (mờ) */}
                 {!preview && layers.map((l, i) => {
                   if (l.kind === "audio") return null;
                   const show = laySel === i || (tlNow >= l.start && tlNow <= l.end);
                   if (!show) return null;
+                  const hasKf = l.x2 != null && l.y2 != null;
+                  // đang phát trong cửa sổ + có keyframe → nội suy vị trí như bản render
+                  const k = hasKf && tlNow > l.start && laySel !== i
+                    ? Math.min(1, Math.max(0, (tlNow - l.start) / Math.max(0.1, l.end - l.start)))
+                    : 0;
+                  const cx = hasKf ? l.x + ((l.x2 as number) - l.x) * k : l.x;
+                  const cy = hasKf ? l.y + ((l.y2 as number) - l.y) * k : l.y;
+                  const pos = (px: number, py: number) => ({
+                    left: `${px * 100}%`, top: `${py * 100}%`,
+                    transform: `translate(-${px * 100}%, -${py * 100}%)`,
+                  } as const);
                   const common = {
-                    left: `${l.x * 100}%`, top: `${l.y * 100}%`,
-                    transform: `translate(-${l.x * 100}%, -${l.y * 100}%)`,
+                    ...pos(cx, cy),
                     outline: laySel === i ? "1.5px dashed var(--amber)" : undefined,
-                  } as const;
+                  };
+                  const grab = (pt: 1 | 2) => (e: { stopPropagation: () => void }) => {
+                    e.stopPropagation(); setLaySel(i); ovDrag.current = { i, pt };
+                  };
+                  const ghost = laySel === i && hasKf && (
+                    <span key={l.id + "-kf"} className="ovlayer ovghost"
+                      style={{ ...pos(l.x2 as number, l.y2 as number) }}
+                      onPointerDown={grab(2)}>⤳ cuối</span>
+                  );
                   return l.kind === "image" || l.kind === "video" ? (
-                    <img key={l.id} className={"ovlayer" + (l.kind === "video" ? " ovpip" : "")}
-                      draggable={false} alt=""
-                      src={l.kind === "video"
-                        ? `/api/thumb/${encodeURIComponent(l.file || "")}`
-                        : `/files/uploads/${encodeURIComponent(l.file || "")}`}
-                      style={{ ...common, width: `${l.scale * 100}%`, opacity: l.opacity }}
-                      onPointerDown={(e) => { e.stopPropagation(); setLaySel(i); ovDrag.current = i; }} />
+                    <span key={l.id}>
+                      <img className={"ovlayer" + (l.kind === "video" ? " ovpip" : "")}
+                        draggable={false} alt=""
+                        src={l.kind === "video"
+                          ? `/api/thumb/${encodeURIComponent(l.file || "")}`
+                          : `/files/uploads/${encodeURIComponent(l.file || "")}`}
+                        style={{ ...common, width: `${l.scale * 100}%`, opacity: l.opacity }}
+                        onPointerDown={grab(1)} />
+                      {ghost}
+                    </span>
                   ) : (
-                    <span key={l.id} className="ovlayer ovtext"
-                      style={{ ...common, fontSize: `${l.size * 100}cqh`, color: l.color }}
-                      onPointerDown={(e) => { e.stopPropagation(); setLaySel(i); ovDrag.current = i; }}>
-                      {l.text}
+                    <span key={l.id}>
+                      <span className="ovlayer ovtext"
+                        style={{ ...common, fontSize: `${l.size * 100}cqh`, color: l.color }}
+                        onPointerDown={grab(1)}>
+                        {l.text}
+                      </span>
+                      {ghost}
                     </span>
                   );
                 })}
@@ -1222,12 +1252,23 @@ export default function App() {
                     </>)}
                     {l.kind !== "audio" && (
                       <label>Bay vào
-                        <select value={l.anim || "none"} onChange={(e) => patchLayer(laySel, { anim: e.target.value })}>
+                        <select value={l.anim || "none"} disabled={l.x2 != null}
+                          onChange={(e) => patchLayer(laySel, { anim: e.target.value })}>
                           {ANIMS.map(([v, lb]) => <option key={v} value={v}>{lb}</option>)}
                         </select>
                       </label>
                     )}
-                    {l.kind !== "audio" && <span className="tllab">kéo trực tiếp trên video để đặt vị trí</span>}
+                    {l.kind !== "audio" && (
+                      <button className={"btn sm" + (l.x2 != null ? " pri" : "")}
+                        title="Bay từ vị trí đầu đến vị trí cuối trong khoảng thời gian của lớp"
+                        onClick={() => patchLayer(laySel, l.x2 != null
+                          ? { x2: undefined, y2: undefined }
+                          : { x2: Math.min(1, l.x + 0.25), y2: l.y })}>
+                        ⤳ Keyframe {l.x2 != null ? "BẬT" : "tắt"}
+                      </button>
+                    )}
+                    {l.kind !== "audio" && <span className="tllab">
+                      {l.x2 != null ? "kéo điểm ĐẦU (liền) và điểm CUỐI (mờ) trên video" : "kéo trực tiếp trên video để đặt vị trí"}</span>}
                     <button className="btn sm" style={{ color: "var(--warn)" }}
                       onClick={() => { setLayers((ls) => ls.filter((_, j) => j !== laySel)); setLaySel(-1); }}>🗑 Xoá lớp</button>
                   </div>
@@ -1245,6 +1286,56 @@ export default function App() {
                       layers: layers.map(({ id, ...rest }) => rest),
                     })}>🎬 Render {layers.length} lớp phủ</button>
                   )}
+                </div>
+              </div>
+              <div className="tlrow">
+                <span className="tllab">💾 Dự án</span>
+                <div className="segchips">
+                  <input className="lytext" style={{ maxWidth: 130 }} placeholder="tên dự án..."
+                    value={projName} maxLength={48} onChange={(e) => setProjName(e.target.value)} />
+                  <button className="btn sm" disabled={!projName.trim() || layers.length === 0}
+                    onClick={async () => {
+                      try {
+                        await saveProject(projName.trim(), selected.name, {
+                          layers: layers.map(({ id, ...rest }) => rest),
+                          grade, shTint, hlTint,
+                        });
+                        setProjList(await listProjects());
+                        showToast("💾 Đã lưu dự án " + projName.trim());
+                      } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                    }}>Lưu</button>
+                  <select value={projPick} onChange={(e) => setProjPick(e.target.value)}
+                    onFocus={async () => setProjList(await listProjects())}>
+                    <option value="">— dự án đã lưu —</option>
+                    {projList.map((pr) => (
+                      <option key={pr.name} value={pr.name}>{pr.name} ({pr.layers} lớp · {pr.file})</option>
+                    ))}
+                  </select>
+                  <button className="btn sm" disabled={!projPick} onClick={async () => {
+                    try {
+                      const pj = await loadProject(projPick);
+                      const d = pj.data as { layers?: Omit<Layer, "id">[]; grade?: Record<string, number>; shTint?: { h: number; s: number }; hlTint?: { h: number; s: number } };
+                      if (pj.file && pj.file !== selected.name) {
+                        const item = media.find((m) => m.name === pj.file);
+                        if (item) setSelected(item);
+                        else showToast("⚠ Video gốc của dự án không còn — áp lên video đang chọn");
+                      }
+                      // đặt sau setSelected: setLayers ghi đè effect dọn lớp khi đổi video
+                      setTimeout(() => {
+                        setLayers((d.layers || []).map((x) => ({ ...x, id: layerIdRef.current++ })));
+                        if (d.grade) setGrade({ ...GRADE_DEF, ...d.grade });
+                        if (d.shTint) setShTint(d.shTint);
+                        if (d.hlTint) setHlTint(d.hlTint);
+                      }, 50);
+                      showToast("📂 Đã mở dự án " + projPick);
+                    } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                  }}>📂 Mở</button>
+                  <button className="btn sm" disabled={!projPick} style={{ color: "var(--warn)" }}
+                    onClick={async () => {
+                      await deleteProject(projPick);
+                      setProjPick(""); setProjList(await listProjects());
+                      showToast("🗑 Đã xoá dự án");
+                    }}>🗑</button>
                 </div>
               </div>
             </div>

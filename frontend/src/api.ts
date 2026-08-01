@@ -179,6 +179,34 @@ export async function clipSearch(query: string): Promise<{
   return d;
 }
 
+export type ProjectInfo = { name: string; file: string; layers: number; mtime: number };
+
+export async function listProjects(): Promise<ProjectInfo[]> {
+  const r = await fetch("/api/projects");
+  return r.ok ? r.json() : [];
+}
+
+export async function saveProject(name: string, file: string, data: Record<string, unknown>): Promise<void> {
+  const r = await fetch("/api/projects", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, file, data }),
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(e.detail || "Lưu dự án thất bại");
+  }
+}
+
+export async function loadProject(name: string): Promise<{ file: string; data: Record<string, unknown> }> {
+  const r = await fetch(`/api/projects/${encodeURIComponent(name)}`);
+  if (!r.ok) throw new Error("Không mở được dự án");
+  return r.json();
+}
+
+export async function deleteProject(name: string): Promise<void> {
+  await fetch(`/api/projects/${encodeURIComponent(name)}`, { method: "DELETE" });
+}
+
 export async function deleteMedia(name: string): Promise<void> {
   const r = await fetch(`/api/media/${encodeURIComponent(name)}`, { method: "DELETE" });
   if (!r.ok) {

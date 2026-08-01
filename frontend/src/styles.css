@@ -303,6 +303,10 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;bac
   background:rgba(0,0,0,.65);color:#fff;font-size:11.5px;padding:5px 12px;border-radius:16px}
 
 .ovpip{border:2px solid var(--ice);border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.5)}
+.ovghost{font-size:11px;font-weight:700;color:#fff;background:rgba(255,178,63,.35);
+  border:1.5px dashed var(--amber);border-radius:8px;padding:3px 8px;cursor:move;white-space:nowrap}
+.segchips select{background:var(--p3);color:var(--ink);border:1px solid var(--line2);
+  border-radius:6px;padding:3px 6px;font-size:10.5px;max-width:210px}
 .lyblock.video{background:linear-gradient(140deg,#5B8DEF,#3A5FC0);color:#fff}
 
 /* kết quả tìm cảnh CLIP */
