@@ -61,6 +61,12 @@ if [ ! -f yunet/face_detection_yunet_2023mar.onnx ]; then
   mkdir -p yunet && dl yunet/face_detection_yunet_2023mar.onnx "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 fi
 
+# 7b. SAM 2 tiny (track đối tượng — cần thêm: pip install ultralytics trong venv backend)
+if [ ! -f sam2/sam2.1_t.pt ]; then
+  echo "==> SAM 2 tiny (track đối tượng)"
+  mkdir -p sam2 && dl sam2/sam2.1_t.pt "https://github.com/ultralytics/assets/releases/download/v8.3.0/sam2.1_t.pt"
+fi
+
 # 7. Font Be Vietnam Pro (Phụ đề Viral — đóng gói cho libass, OFL, mọi hệ)
 mkdir -p fonts
 for W in Bold ExtraBold; do

@@ -1533,6 +1533,250 @@ def job_cutlist(job_id: str, src: Path, p: dict):
     return [out_entry(out)]
 
 
+# ---------------------------------------------------------------- job: SAM2 track đối tượng
+SAM2_MODEL = BINARIES / "sam2" / "sam2.1_t.pt"
+_SAM_LOCK = threading.Lock()  # 1 phiên SAM2 tại một thời điểm (nặng RAM/GPU)
+
+
+def sam2_available() -> bool:
+    try:
+        import ultralytics  # noqa: F401
+        return SAM2_MODEL.exists()
+    except ImportError:
+        return False
+
+
+def job_track(job_id: str, src: Path, p: dict):
+    """SAM 2 track đối tượng: bấm 1 điểm vào vật/người trên video → AI theo dõi
+    suốt video → làm mờ / che ô / spotlight / tách nền xanh đối tượng đó."""
+    import cv2
+    import numpy as np
+
+    if not sam2_available():
+        raise RuntimeError("Chưa cài SAM 2 (ultralytics + binaries/sam2/sam2.1_t.pt)")
+    info = media_info(src)
+    w, h = info["width"], info["height"]
+    if not w or not h:
+        raise RuntimeError("Cần video có hình")
+    fps = info["fps"] or 30
+    total = max(1, int((info["duration"] or 1) * fps))
+    px = int(min(0.999, max(0.0, _safe_float(p.get("x"), 0.5))) * w)
+    py = int(min(0.999, max(0.0, _safe_float(p.get("y"), 0.5))) * h)
+    effect = p.get("effect") if p.get("effect") in ("blur", "pixelate", "spotlight", "green") else "blur"
+    strength = min(2.0, max(0.5, _safe_float(p.get("strength"), 1.0)))
+
+    _set(job_id, progress=2, message="Nạp SAM 2 (lần đầu hơi lâu)...")
+    from ultralytics.models.sam import SAM2VideoPredictor
+    ew, eh = w // 2 * 2, h // 2 * 2
+    out_v = TMP / f"track_{job_id}.mp4"
+    enc_log = TMP / f"trackenc_{job_id}.log"
+    enc_ef = open(enc_log, "wb")
+    enc = subprocess.Popen(
+        [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
+         "-r", str(fps), "-i", "pipe:0",
+         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+         "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
+         "-pix_fmt", "yuv420p", str(out_v)],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=enc_ef)
+    _track_proc(job_id, enc)
+
+    i = hit = 0
+    green = np.full((h, w, 3), (0, 177, 64), dtype=np.uint8)  # BGR xanh key chuẩn
+    try:
+        with _SAM_LOCK:
+            predictor = SAM2VideoPredictor(overrides=dict(
+                conf=0.25, task="segment", mode="predict", imgsz=512,
+                model=str(SAM2_MODEL), save=False, verbose=False))
+            _set(job_id, progress=5, message=f"SAM 2 theo dõi đối tượng tại ({px},{py})...")
+            for r in predictor(source=str(src), points=[[px, py]], labels=[1], stream=True):
+                if job_id in CANCEL_REQUESTED:
+                    raise JobCancelled()
+                frame = r.orig_img  # BGR gốc
+                mask = None
+                if r.masks is not None and len(r.masks.data):
+                    m = r.masks.data[0].cpu().numpy().astype(np.uint8)
+                    if m.shape[:2] != (h, w):
+                        m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+                    if m.any():
+                        mask = m.astype(bool)
+                        hit += 1
+                if mask is not None:
+                    if effect == "blur":
+                        sigma = max(8.0, w / 40.0 * strength)
+                        eff = cv2.GaussianBlur(frame, (0, 0), sigma)
+                        frame = np.where(mask[..., None], eff, frame)
+                    elif effect == "pixelate":
+                        k = max(4, int(w / (48 / strength)))
+                        eff = cv2.resize(cv2.resize(frame, (w // k, h // k),
+                                                    interpolation=cv2.INTER_LINEAR),
+                                         (w, h), interpolation=cv2.INTER_NEAREST)
+                        frame = np.where(mask[..., None], eff, frame)
+                    elif effect == "spotlight":  # tối mọi thứ TRỪ đối tượng
+                        frame = np.where(mask[..., None], frame,
+                                         (frame * 0.22).astype(np.uint8))
+                    else:  # green: giữ đối tượng, nền → xanh key
+                        frame = np.where(mask[..., None], frame, green)
+                try:
+                    enc.stdin.write(np.ascontiguousarray(frame).tobytes())
+                except BrokenPipeError:
+                    break
+                i += 1
+                if i % 10 == 0:
+                    _set(job_id, progress=min(94, 5 + i / total * 88),
+                         message=f"SAM 2 ({effect}): {i}/{total} khung hình")
+    finally:
+        if enc.stdin:
+            try:
+                enc.stdin.close()
+            except BrokenPipeError:
+                pass
+        enc.wait()
+        enc_ef.close()
+    _cancel_point(job_id)
+    enc_ok = enc.returncode == 0 and out_v.exists()
+    err = "" if enc_ok or not enc_log.exists() else enc_log.read_text(encoding="utf-8", errors="replace")
+    enc_log.unlink(missing_ok=True)
+    if not enc_ok:
+        out_v.unlink(missing_ok=True)
+        raise RuntimeError(f"Encode failed: {err[-400:]}")
+    if hit < max(1, i // 20):  # bám được <5% khung → điểm bấm không trúng đối tượng
+        out_v.unlink(missing_ok=True)
+        raise RuntimeError("SAM 2 không bám được đối tượng tại điểm đã bấm — "
+                           "thử bấm chính giữa đối tượng rõ nét hơn.")
+
+    _set(job_id, progress=96, message="Ghép lại âm thanh gốc...")
+    out = unique_out(f"{src.stem}_track_{effect}", ".mp4")
+    if info["has_audio"]:
+        r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                  "-i", str(out_v), "-i", str(src),
+                                  "-map", "0:v", "-map", "1:a?", "-c:v", "copy",
+                                  "-c:a", "aac", "-b:a", "192k", "-shortest", str(out)])
+        out_v.unlink(missing_ok=True)
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Mux audio failed: {r.stderr_text[-300:]}")
+    else:
+        shutil.move(str(out_v), str(out))
+    _set(job_id, message=f"Xong — SAM 2 {effect}, bám {hit}/{i} khung hình")
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: composite (multi-track)
+def job_composite(job_id: str, src: Path, p: dict):
+    """Multi-track xếp lớp: đè ảnh/logo + chữ + nhạc lên video nền theo mốc thời gian
+    (kéo thả trên timeline). layers=[{kind:image|text|audio, ...}] — tối đa 12 lớp."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video nền có hình")
+    dur = info["duration"] or 1
+    bw, bh = info["width"], info["height"]
+    raw = p.get("layers")
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError("Chưa có lớp nào — thêm ảnh/chữ/nhạc vào timeline trước")
+
+    inputs = ["-i", str(src)]
+    vparts, aparts, tmp_files = [], [], []
+    vcur = "[0:v]"
+    n_in = 0          # index input ffmpeg (0 = nền)
+    n_img = n_txt = n_aud = 0
+    try:
+        for li, l in enumerate(raw[:12]):
+            if not isinstance(l, dict):
+                continue
+            kind = l.get("kind")
+            a = min(dur, max(0.0, _safe_float(l.get("start"), 0)))
+            b = min(dur, max(0.0, _safe_float(l.get("end"), dur)))
+            if kind != "audio" and b - a < 0.1:
+                continue
+            x = min(1.0, max(0.0, _safe_float(l.get("x"), 0.5)))
+            y = min(1.0, max(0.0, _safe_float(l.get("y"), 0.5)))
+            if kind == "image":
+                f = safe_upload_path(str(l.get("file", "")))
+                if not f.is_file() or f.suffix.lower() not in IMAGE_EXT:
+                    continue
+                scale = min(1.5, max(0.03, _safe_float(l.get("scale"), 0.25)))
+                op = min(1.0, max(0.05, _safe_float(l.get("opacity"), 1.0)))
+                pw = max(16, int(bw * scale) // 2 * 2)
+                n_in += 1
+                inputs += ["-loop", "1", "-i", str(f)]
+                lab = f"im{li}"
+                vparts.append(
+                    f"[{n_in}:v]scale={pw}:-1,format=rgba,"
+                    f"colorchannelmixer=aa={op:.2f}[{lab}]")
+                nxt = f"v{li}"
+                vparts.append(
+                    f"{vcur}[{lab}]overlay=x=(W-w)*{x:.3f}:y=(H-h)*{y:.3f}"
+                    f":enable='between(t,{a:.3f},{b:.3f})'[{nxt}]")
+                vcur = f"[{nxt}]"
+                n_img += 1
+            elif kind == "text":
+                text = str(l.get("text") or "").strip()[:200]
+                if not text:
+                    continue
+                size = min(0.2, max(0.02, _safe_float(l.get("size"), 0.055)))
+                color = re.sub(r"[^#0-9A-Fa-f]", "", str(l.get("color") or "#FFFFFF"))[:7] or "#FFFFFF"
+                # textfile= né toàn bộ vấn đề escape ký tự trong drawtext
+                tf = TMP / f"cmp_{job_id}_{li}.txt"
+                tf.write_text(text, encoding="utf-8")
+                tmp_files.append(tf)
+                font = FONTS_DIR / "BeVietnamPro-Bold.ttf"
+                fs = max(12, int(bh * size))
+                nxt = f"v{li}"
+                vparts.append(
+                    f"{vcur}drawtext=textfile='{_ff_escape_path(tf)}'"
+                    + (f":fontfile='{_ff_escape_path(font)}'" if font.exists() else "")
+                    + f":fontsize={fs}:fontcolor={color}"
+                    f":borderw={max(1, fs // 14)}:bordercolor=black@0.75"
+                    f":x=(w-text_w)*{x:.3f}:y=(h-text_h)*{y:.3f}"
+                    f":enable='between(t,{a:.3f},{b:.3f})'[{nxt}]")
+                vcur = f"[{nxt}]"
+                n_txt += 1
+            elif kind == "audio":
+                f = safe_upload_path(str(l.get("file", "")))
+                if not f.is_file() or not media_info(f)["has_audio"]:
+                    continue
+                vol = min(2.0, max(0.05, _safe_float(l.get("volume"), 0.5)))
+                n_in += 1
+                inputs += ["-i", str(f)]
+                lab = f"au{li}"
+                aparts.append(f"[{n_in}:a]volume={vol:.2f},"
+                              f"adelay={int(a * 1000)}:all=1[{lab}]")
+                n_aud += 1
+
+        if not (n_img or n_txt or n_aud):
+            raise RuntimeError("Không có lớp hợp lệ nào (kiểm tra file/nội dung từng lớp)")
+        _set(job_id, message=f"Ghép lớp: {n_img} ảnh · {n_txt} chữ · {n_aud} nhạc...")
+
+        # âm thanh: nền (nếu có) + các lớp nhạc → amix kết thúc theo NỀN
+        amaps = []
+        if n_aud:
+            base_a = "[0:a]" if info["has_audio"] else None
+            # nhãn [auN] theo đúng thứ tự đã tạo trong aparts; nền đứng đầu (duration=first)
+            labs = ([base_a] if base_a else []) + re.findall(r"\[au\d+\]", ";".join(aparts))
+            aparts.append("".join(labs) + f"amix=inputs={len(labs)}:duration=first:"
+                          "normalize=0,alimiter=limit=0.95[aout]")
+            amaps = ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k",
+                     "-ar", "48000", "-ac", "2"]
+        elif info["has_audio"]:
+            amaps = ["-map", "0:a", "-c:a", "aac", "-b:a", "192k"]
+
+        vparts.append(f"{vcur}format=yuv420p[vout]")
+        fc = ";".join(vparts + aparts)
+        out = unique_out(f"{src.stem}_layers", ".mp4")
+        cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error"] + inputs + \
+              ["-filter_complex", fc, "-map", "[vout]"] + amaps + \
+              ["-c:v", "libx264", "-crf", "19", "-preset", "medium",
+               "-t", f"{dur:.3f}", str(out)]
+        r = _run_tracked(job_id, cmd)
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Ghép lớp thất bại: {r.stderr_text[-400:]}")
+    finally:
+        for f in tmp_files:
+            f.unlink(missing_ok=True)
+    _set(job_id, message=f"Xong — {n_img} ảnh + {n_txt} chữ + {n_aud} nhạc đè lên video")
+    return [out_entry(out)]
+
+
 # ---------------------------------------------------------------- job: stabilize
 def job_stabilize(job_id: str, src: Path, strength: str = "normal"):
     info = media_info(src)
@@ -3703,7 +3947,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "1.5.0",
+        "version": "1.6.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -3726,6 +3970,8 @@ def health():
             "color": ffmpeg_ok,
             "grade": ffmpeg_ok,
             "cutlist": ffmpeg_ok,
+            "composite": ffmpeg_ok,
+            "track": sam2_available() and ffmpeg_ok,
             "music": ffmpeg_ok,
             "stabilize": ffmpeg_ok,
             "merge": ffmpeg_ok,
@@ -4033,6 +4279,12 @@ def create_job(req: JobRequest):
         return submit_job("grade", src.name, job_grade, src, dict(p))
     if req.type == "cutlist":
         return submit_job("cutlist", src.name, job_cutlist, src, dict(p))
+    if req.type == "composite":
+        return submit_job("composite", src.name, job_composite, src, dict(p))
+    if req.type == "track":
+        if not sam2_available():
+            raise HTTPException(400, "Chưa cài SAM 2 — pip install ultralytics + tải sam2.1_t.pt vào binaries/sam2")
+        return submit_job("track", src.name, job_track, src, dict(p))
     if req.type == "merge":
         extra_names = list(p.get("files") or [])
         if len(extra_names) > 7:

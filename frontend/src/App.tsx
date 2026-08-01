@@ -20,7 +20,7 @@ const TOOL_CATS: Record<string, ToolCat> = {
   thumbnail: "ai", auto_edit: "ai", transcribe: "ai", content: "ai", lesson: "ai",
   merge: "edit", beatsync: "edit", silence_cut: "edit", upscale: "edit",
   rife: "edit", bg_remove: "edit", reframe: "edit", speed: "edit", color: "edit",
-  grade: "edit", stabilize: "edit", face_blur: "edit", brand: "edit",
+  grade: "edit", track: "edit", stabilize: "edit", face_blur: "edit", brand: "edit",
   music: "audio", audio_enhance: "audio", audiogram: "audio", tts: "audio",
   export: "pub",
 };
@@ -37,7 +37,7 @@ const FEAT_KEY: Record<string, string> = {
   face_blur: "face_blur", director: "director", lesson: "lesson",
   translate: "translate", social_pack: "social_pack", dub: "dub", qc: "qc",
   script: "script", thumbnail: "thumbnail", viral: "viral_caption",
-  pipeline: "export", export: "export", grade: "grade",
+  pipeline: "export", export: "export", grade: "grade", track: "track",
   reframe: "ffmpeg", speed: "ffmpeg", color: "ffmpeg", music: "ffmpeg",
   stabilize: "ffmpeg", merge: "ffmpeg", audio_enhance: "ffmpeg",
   brand: "ffmpeg", audiogram: "ffmpeg",
@@ -65,6 +65,7 @@ const TOOL_REQS: Record<string, string> = {
   script: "cần Claude CLI hoặc mlx-lm + whisper",
   dub: "cần whisper + Piper TTS + Claude/Qwen",
   viral: "cần whisper + font trong binaries/fonts (setup-binaries.sh)",
+  track: "cần pip install ultralytics + model sam2.1_t.pt trong binaries/sam2",
 };
 
 // Ngôn ngữ đích cho Dịch phụ đề AI
@@ -110,7 +111,15 @@ type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" |
   | "merge" | "beatsync" | "audio_enhance" | "brand" | "audiogram"
   | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll" | "viral"
   | "translate" | "social_pack" | "dub" | "qc" | "script" | "thumbnail"
-  | "grade" | "pipeline";
+  | "grade" | "track" | "pipeline";
+
+// Lớp phủ multi-track (đè lên video nền theo mốc thời gian)
+type Layer = {
+  id: number; kind: "image" | "text" | "audio";
+  file?: string; text?: string; color?: string;
+  start: number; end: number; x: number; y: number;
+  scale: number; opacity: number; size: number; volume: number;
+};
 
 // Các bước có thể xếp vào Chuỗi tự động (nối tiếp output→input)
 type PipeStep = { type: string; params: Record<string, unknown> };
@@ -156,6 +165,7 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "speed", icon: "⏩", name: "Tốc độ video", desc: "0.5× – 3× · giữ cao độ âm thanh", gpu: false },
   { key: "color", icon: "🎨", name: "Filter màu", desc: "vivid · warm · film · B&W · sharp", gpu: false },
   { key: "grade", icon: "🎛️", name: "Bảng chỉnh màu PRO", desc: "phơi sáng · tương phản · nhiệt độ · vibrance · nét", gpu: false },
+  { key: "track", icon: "🎯", name: "Track đối tượng (SAM 2)", desc: "bấm vào vật/người → AI bám theo → mờ/spotlight/tách nền", gpu: true },
   { key: "music", icon: "🎵", name: "Nhạc nền + ducking", desc: "tự nén nhạc khi có giọng nói", gpu: false },
   { key: "face_blur", icon: "🫥", name: "Làm mờ mặt tự động", desc: "YuNet AI · che mặt học sinh/người lạ", gpu: false },
   { key: "content", icon: "📝", name: "AI viết nội dung", desc: "tiêu đề · mô tả · hashtags · chapters", gpu: true },
@@ -408,6 +418,16 @@ export default function App() {
   const [shTint, setShTint] = useState({ h: 0, s: 0 });   // Nhuộm Tối (shadows)
   const [hlTint, setHlTint] = useState({ h: 0, s: 0 });   // Nhuộm Sáng (highlights)
   const [segs, setSegs] = useState<{ start: number; end: number }[]>([]);  // timeline cắt
+  // multi-track lớp phủ + SAM2 track
+  const [layers, setLayers] = useState<Layer[]>([]);
+  const [laySel, setLaySel] = useState<number>(-1);
+  const [tlNow, setTlNow] = useState(0);
+  const layDrag = useRef<{ i: number; mode: "move" | "l" | "r"; x0: number; s0: number; e0: number } | null>(null);
+  const ovDrag = useRef<number>(-1);   // index lớp đang kéo trên player
+  const [trackPt, setTrackPt] = useState<{ x: number; y: number } | null>(null);
+  const [trackFx, setTrackFx] = useState("blur");
+  const [trackStr, setTrackStr] = useState(1.0);
+  const layerIdRef = useRef(1);
   // Settings — gói sub Claude
   const [csEnabled, setCsEnabled] = useState(true);
   const [csModel, setCsModel] = useState("sonnet");
@@ -639,6 +659,36 @@ export default function App() {
   useEffect(() => { setPreviewFb(null); }, [selected, preview, ab]);
   // áp tốc độ phát ngay khi đổi
   useEffect(() => { if (vidElRef.current) vidElRef.current.playbackRate = pbRate; }, [pbRate]);
+  // đổi video → dọn lớp phủ + điểm track của video cũ
+  useEffect(() => { setLayers([]); setLaySel(-1); setTrackPt(null); }, [selected?.name]);
+  // đồng hồ hiện tại cho preview lớp phủ (nghe timeupdate của player)
+  useEffect(() => {
+    const v = vidElRef.current; if (!v || layers.length === 0) return;
+    const f = () => setTlNow(v.currentTime || 0);
+    v.addEventListener("timeupdate", f);
+    return () => v.removeEventListener("timeupdate", f);
+    // KHÔNG dùng stageSrc trong deps (khai báo phía dưới → TDZ sập app — vết xe cũ);
+    // selected/preview/ab đủ để re-attach khi video remount
+  }, [layers.length, previewFb, selected, preview, ab]);
+
+  // thêm lớp phủ mới (mặc định 0 → hết video, giữa màn hình)
+  const addLayer = (kind: Layer["kind"]) => {
+    if (!selected) { showToast("⚠️ Chọn video trước"); return; }
+    const d = selected.info.duration;
+    if (kind === "image" && imageFiles.length === 0) { showToast("⚠️ Kéo 1 ảnh (png/jpg) vào kho media trước"); return; }
+    if (kind === "audio" && audioFiles.length === 0) { showToast("⚠️ Kéo 1 file nhạc vào kho media trước"); return; }
+    const l: Layer = {
+      id: layerIdRef.current++, kind,
+      file: kind === "image" ? imageFiles[0].name : kind === "audio" ? audioFiles[0].name : undefined,
+      text: kind === "text" ? "Chữ của bạn" : undefined, color: "#FFD400",
+      start: 0, end: Math.min(d, kind === "audio" ? d : Math.max(3, d * 0.4)),
+      x: kind === "image" ? 0.92 : 0.5, y: kind === "image" ? 0.06 : 0.82,
+      scale: 0.22, opacity: 1, size: 0.06, volume: 0.5,
+    };
+    setLayers((ls) => [...ls, l]); setLaySel(layers.length);
+  };
+  const patchLayer = (i: number, patch: Partial<Layer>) =>
+    setLayers((ls) => ls.map((l, j) => (j === i ? { ...l, ...patch } : l)));
 
   // merge/beatsync: NHIỀU clip vào MỘT job (thứ tự = thứ tự chọn trong batch)
   const runMulti = async (type: string, params: Record<string, unknown>) => {
@@ -696,7 +746,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v1.5 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v1.6 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -914,7 +964,16 @@ export default function App() {
         <section className="stagewrap">
           <div className="player">
             {stageSrc ? (
-              <div className="canvas">
+              <div className="canvas"
+                onPointerMove={(e) => {
+                  if (ovDrag.current < 0) return;
+                  const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                  patchLayer(ovDrag.current, {
+                    x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+                    y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)),
+                  });
+                }}
+                onPointerUp={() => { ovDrag.current = -1; }}>
                 {selected && !preview && (
                   <span className="reslab">{selected.info.width}×{selected.info.height} · {Math.round(selected.info.fps)}fps</span>
                 )}
@@ -934,6 +993,43 @@ export default function App() {
                       showToast("🎞 Đang tạo bản xem thử H.264 (lần đầu hơi lâu)...");
                     }
                   }} />
+                {/* SAM2: bắt click chọn đối tượng khi mở tool Track */}
+                {tool === "track" && !preview && (
+                  <div className="clickcatch"
+                    onPointerDown={(e) => {
+                      const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                      setTrackPt({
+                        x: Math.round((e.clientX - r.left) / r.width * 1000) / 1000,
+                        y: Math.round((e.clientY - r.top) / r.height * 1000) / 1000,
+                      });
+                    }}>
+                    {trackPt && <span className="trackdot" style={{ left: `${trackPt.x * 100}%`, top: `${trackPt.y * 100}%` }} />}
+                    {!trackPt && <span className="trackhint">👆 Bấm vào ĐỐI TƯỢNG cần theo dõi</span>}
+                  </div>
+                )}
+                {/* preview lớp phủ multi-track (kéo được để đổi vị trí) */}
+                {!preview && layers.map((l, i) => {
+                  if (l.kind === "audio") return null;
+                  const show = laySel === i || (tlNow >= l.start && tlNow <= l.end);
+                  if (!show) return null;
+                  const common = {
+                    left: `${l.x * 100}%`, top: `${l.y * 100}%`,
+                    transform: `translate(-${l.x * 100}%, -${l.y * 100}%)`,
+                    outline: laySel === i ? "1.5px dashed var(--amber)" : undefined,
+                  } as const;
+                  return l.kind === "image" ? (
+                    <img key={l.id} className="ovlayer" draggable={false} alt=""
+                      src={`/files/uploads/${encodeURIComponent(l.file || "")}`}
+                      style={{ ...common, width: `${l.scale * 100}%`, opacity: l.opacity }}
+                      onPointerDown={(e) => { e.stopPropagation(); setLaySel(i); ovDrag.current = i; }} />
+                  ) : (
+                    <span key={l.id} className="ovlayer ovtext"
+                      style={{ ...common, fontSize: `${l.size * 100}cqh`, color: l.color }}
+                      onPointerDown={(e) => { e.stopPropagation(); setLaySel(i); ovDrag.current = i; }}>
+                      {l.text}
+                    </span>
+                  );
+                })}
                 {tool === "viral" && vcNowText && !preview && (
                   <div className="vcoverlay" style={{ bottom: `${vcPos}%` }}>
                     {vcNowText.split("\n").map((ln, i) => (
@@ -1014,6 +1110,98 @@ export default function App() {
                     onError={(e) => { (e.target as HTMLImageElement).parentElement!.style.display = "none"; }} />
                 </div>
               )}
+              {/* ===== multi-track: các lớp phủ ảnh/chữ/nhạc ===== */}
+              {layers.map((l, i) => {
+                const d = selected.info.duration;
+                const toT = (clientX: number, el: HTMLElement) => {
+                  const r = el.getBoundingClientRect();
+                  return Math.min(d, Math.max(0, (clientX - r.left) / r.width * d));
+                };
+                return (
+                  <div className="tlrow" key={l.id}>
+                    <span className="tllab" style={{ cursor: "pointer" }} onClick={() => setLaySel(laySel === i ? -1 : i)}>
+                      {l.kind === "image" ? "🖼" : l.kind === "text" ? "🔤" : "🎵"} Lớp {i + 1}
+                    </span>
+                    <div className="lytrack"
+                      onPointerDown={(e) => {
+                        setLaySel(i);
+                        (e.currentTarget as Element).setPointerCapture(e.pointerId);
+                        const el = e.currentTarget as HTMLElement;
+                        const r = el.getBoundingClientRect();
+                        const xs = r.left + (l.start / d) * r.width;
+                        const xe = r.left + (l.end / d) * r.width;
+                        const mode = Math.abs(e.clientX - xs) < 8 ? "l"
+                          : Math.abs(e.clientX - xe) < 8 ? "r" : "move";
+                        layDrag.current = { i, mode, x0: toT(e.clientX, el), s0: l.start, e0: l.end };
+                      }}
+                      onPointerMove={(e) => {
+                        const g = layDrag.current;
+                        if (!g || g.i !== i || !e.buttons) return;
+                        const t = toT(e.clientX, e.currentTarget as HTMLElement);
+                        if (g.mode === "l") patchLayer(i, { start: Math.min(t, l.end - 0.2) });
+                        else if (g.mode === "r") patchLayer(i, { end: Math.max(t, l.start + 0.2) });
+                        else {
+                          const dt = t - g.x0, len = g.e0 - g.s0;
+                          const ns = Math.min(Math.max(0, g.s0 + dt), d - len);
+                          patchLayer(i, { start: ns, end: ns + len });
+                        }
+                      }}
+                      onPointerUp={() => { layDrag.current = null; }}>
+                      <div className={"lyblock " + l.kind + (laySel === i ? " sel" : "")}
+                        style={{ left: `${(l.start / d) * 100}%`, width: `${((l.end - l.start) / d) * 100}%` }}>
+                        {l.kind === "text" ? (l.text || "").slice(0, 18) : (l.file || "").slice(0, 18)}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+              {laySel >= 0 && layers[laySel] && (() => {
+                const l = layers[laySel];
+                return (
+                  <div className="lyinspect">
+                    {l.kind === "image" && (<>
+                      <select value={l.file} onChange={(e) => patchLayer(laySel, { file: e.target.value })}>
+                        {imageFiles.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                      </select>
+                      <label>Cỡ <input type="range" min={0.05} max={0.8} step={0.01} value={l.scale}
+                        onChange={(e) => patchLayer(laySel, { scale: parseFloat(e.target.value) })} /></label>
+                      <label>Mờ/đục <input type="range" min={0.1} max={1} step={0.05} value={l.opacity}
+                        onChange={(e) => patchLayer(laySel, { opacity: parseFloat(e.target.value) })} /></label>
+                    </>)}
+                    {l.kind === "text" && (<>
+                      <input className="lytext" value={l.text || ""} maxLength={200}
+                        onChange={(e) => patchLayer(laySel, { text: e.target.value })} />
+                      <input type="color" value={l.color || "#FFD400"}
+                        onChange={(e) => patchLayer(laySel, { color: e.target.value })} />
+                      <label>Cỡ <input type="range" min={0.03} max={0.15} step={0.005} value={l.size}
+                        onChange={(e) => patchLayer(laySel, { size: parseFloat(e.target.value) })} /></label>
+                    </>)}
+                    {l.kind === "audio" && (<>
+                      <select value={l.file} onChange={(e) => patchLayer(laySel, { file: e.target.value })}>
+                        {audioFiles.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                      </select>
+                      <label>Âm lượng <input type="range" min={0.05} max={2} step={0.05} value={l.volume}
+                        onChange={(e) => patchLayer(laySel, { volume: parseFloat(e.target.value) })} /></label>
+                    </>)}
+                    {l.kind !== "audio" && <span className="tllab">kéo trực tiếp trên video để đặt vị trí</span>}
+                    <button className="btn sm" style={{ color: "var(--warn)" }}
+                      onClick={() => { setLayers((ls) => ls.filter((_, j) => j !== laySel)); setLaySel(-1); }}>🗑 Xoá lớp</button>
+                  </div>
+                );
+              })()}
+              <div className="tlrow">
+                <span className="tllab">➕ Lớp</span>
+                <div className="segchips">
+                  <button className="btn sm" onClick={() => addLayer("image")}>🖼 Ảnh/Logo</button>
+                  <button className="btn sm" onClick={() => addLayer("text")}>🔤 Chữ</button>
+                  <button className="btn sm" onClick={() => addLayer("audio")}>🎵 Nhạc</button>
+                  {layers.length > 0 && (
+                    <button className="btn sm pri" onClick={() => run("composite", {
+                      layers: layers.map(({ id, ...rest }) => rest),
+                    })}>🎬 Render {layers.length} lớp phủ</button>
+                  )}
+                </div>
+              </div>
             </div>
           )}
         </section>
@@ -1922,6 +2110,38 @@ export default function App() {
                       })}>🎛️ Render bản chỉnh màu</button>
                   </div>
                   <div className="hint">Xem thử CSS chưa gồm nhuộm Tối/Sáng — bản render ffmpeg mới có.</div>
+                </>
+              )}
+
+              {tool === "track" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎯 SAM 2 (Meta AI) chạy local: <b>bấm thẳng vào đối tượng trên video</b> bên
+                    trái (vật, người, thú, xe...) → AI tự bám theo suốt video rồi áp hiệu ứng.
+                  </div>
+                  <div className="field"><label>Điểm đã chọn</label>
+                    <div className="csrow">{trackPt
+                      ? `✅ (${Math.round(trackPt.x * 100)}%, ${Math.round(trackPt.y * 100)}%) — bấm lại để đổi`
+                      : "chưa có — bấm vào đối tượng trên video"}</div>
+                  </div>
+                  <div className="field"><label>Hiệu ứng lên đối tượng</label>
+                    <div className="seg">
+                      {[["blur", "🌫 Làm mờ"], ["pixelate", "🟪 Che ô"], ["spotlight", "🔦 Spotlight"], ["green", "🟩 Tách nền"]].map(([v, l]) => (
+                        <button key={v} className={trackFx === v ? "on" : ""} onClick={() => setTrackFx(v)}>{l}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Cường độ (mờ/ô)</span><b>{trackStr.toFixed(1)}</b></div>
+                    <input type="range" min={0.5} max={2} step={0.1} value={trackStr}
+                      onChange={(e) => setTrackStr(parseFloat(e.target.value))} />
+                  </div>
+                  <div className="hint">Spotlight = tối mọi thứ trừ đối tượng · Tách nền = nền → xanh key
+                    (ghép phông sau). Video dài xử lý lâu (AI chạy từng khung hình).</div>
+                  <button className="btn pri big" disabled={!trackPt}
+                    onClick={() => trackPt && run("track", { x: trackPt.x, y: trackPt.y, effect: trackFx, strength: trackStr })}>
+                    🎯 Track & áp hiệu ứng
+                  </button>
                 </>
               )}
 

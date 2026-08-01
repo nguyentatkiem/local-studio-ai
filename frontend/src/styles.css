@@ -277,6 +277,31 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;bac
   border-radius:7px;padding:3px 7px;display:inline-flex;align-items:center;gap:5px}
 .segchip button{color:var(--warn);font-size:10px;padding:0}
 
+/* ============ Multi-track lớp phủ + SAM2 track ============ */
+.lytrack{position:relative;flex:1;height:26px;border-radius:6px;background:var(--p2);
+  border:1px solid var(--line);cursor:grab;user-select:none;touch-action:none;min-width:0}
+.lyblock{position:absolute;top:2px;bottom:2px;border-radius:5px;font-size:9.5px;font-family:var(--mono);
+  display:flex;align-items:center;padding:0 6px;overflow:hidden;white-space:nowrap;pointer-events:none;color:#1A1204}
+.lyblock.image{background:linear-gradient(140deg,#46D6C6,#2FA396)}
+.lyblock.text{background:linear-gradient(140deg,#FFB23F,#E0761B)}
+.lyblock.audio{background:linear-gradient(140deg,#C77AF5,#9A4FD0);color:#fff}
+.lyblock.sel{box-shadow:0 0 0 2px #fff inset}
+.lyinspect{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--p2);
+  border:1px solid var(--line2);border-radius:8px;padding:7px 10px;font-size:11px}
+.lyinspect label{display:flex;align-items:center;gap:5px;color:var(--dim);font-size:10.5px}
+.lyinspect input[type=range]{width:90px}
+.lyinspect select,.lyinspect .lytext{background:var(--p3);color:var(--ink);border:1px solid var(--line2);
+  border-radius:6px;padding:4px 7px;font-size:11px;max-width:170px}
+.ovlayer{position:absolute;z-index:3;cursor:move;user-select:none;touch-action:none}
+.ovtext{font-weight:800;font-family:var(--ui);white-space:nowrap;
+  text-shadow:0 0 4px rgba(0,0,0,.9),0 0 2px rgba(0,0,0,.9)}
+.clickcatch{position:absolute;inset:0;z-index:4;cursor:crosshair}
+.trackdot{position:absolute;width:16px;height:16px;border-radius:50%;border:3px solid #FF4444;
+  background:rgba(255,68,68,.25);transform:translate(-50%,-50%);pointer-events:none;
+  box-shadow:0 0 10px rgba(255,68,68,.8)}
+.trackhint{position:absolute;left:50%;top:12px;transform:translateX(-50%);
+  background:rgba(0,0,0,.65);color:#fff;font-size:11.5px;padding:5px 12px;border-radius:16px}
+
 /* ============ Bánh xe nhuộm màu ============ */
 .cwheels{display:flex;gap:18px;justify-content:center;padding:6px 0}
 .cwheel-wrap{display:flex;flex-direction:column;align-items:center;gap:5px}
