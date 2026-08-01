@@ -126,7 +126,8 @@ def _session_ok(request: Request) -> bool:
     return bool(tok and SESSIONS.get(tok, 0) > time.time())
 
 
-PUBLIC_PATHS = {"/", "/index.html", "/api/login", "/api/auth-status", "/favicon.ico"}
+PUBLIC_PATHS = {"/", "/index.html", "/api/login", "/api/auth-status", "/favicon.ico",
+                "/api/ingest"}  # ingest tự bảo vệ bằng token riêng (Apple Shortcuts)
 
 
 @app.middleware("http")
@@ -1516,6 +1517,289 @@ def job_grade(job_id: str, src: Path, p: dict):
     return [out_entry(out)]
 
 
+# ---------------------------------------------------------------- job: AutoPilot 1 nút
+def job_autopilot(job_id: str, src: Path, p: dict):
+    """AutoPilot 'Làm hết cho tôi' kiểu CapCut Auto-Edit: tự dò có lời thoại hay
+    không → tự quyết chuỗi bước phù hợp → bản đăng hoàn chỉnh. 1 nút."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình")
+    target = p.get("target") if p.get("target") in ("tiktok", "youtube") else "tiktok"
+    want = {k: bool(p.get(k, True)) for k in
+            ("cut_silence", "cut_filler", "enhance", "audio", "caption", "reframe")}
+
+    # dò nhanh: video CÓ lời thoại không? (whisper tiny 45s đầu — quyết định nhánh)
+    has_speech = False
+    if info["has_audio"] and whisper_available_any():
+        _set(job_id, progress=2, message="AutoPilot: nghe thử video (dò lời thoại)...")
+        probe = TMP / f"ap_{job_id}.wav"
+        _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                              "-t", "45", "-i", str(src), "-vn", "-ac", "1",
+                              "-ar", "16000", str(probe)])
+        try:
+            segs, _l, _lg = _speech_recognize(job_id, probe, "tiny", None,
+                                              p.get("engine"), 45, 2, 8)
+            has_speech = sum(len(s.text.split()) for s in segs) >= 8
+        except Exception:  # noqa: BLE001 - dò lỗi thì coi như không có thoại
+            has_speech = False
+        finally:
+            probe.unlink(missing_ok=True)
+
+    steps = []
+    if has_speech and want["cut_silence"]:
+        steps.append({"type": "silence_cut", "params": {"margin": 0.25}})
+    if has_speech and want["cut_filler"]:
+        steps.append({"type": "filler_cut", "params": {"model": "base"}})
+    if want["enhance"]:
+        steps.append({"type": "enhance", "params": {"mode": "natural"}})
+    if info["has_audio"] and want["audio"]:
+        steps.append({"type": "audio_enhance", "params": {"denoise": True, "loudness": True}})
+    if target == "tiktok" and want["reframe"] and info["width"] > info["height"]:
+        # ngang → dọc: ưu tiên bám mặt, không có mặt thì job tự lỗi → fallback nền mờ
+        steps.append({"type": "autoframe", "params": {"ratio": "916"}})
+    if has_speech and want["caption"]:
+        steps.append({"type": "viral_caption", "params": {"model": "base"}})
+
+    if not steps:
+        raise RuntimeError("Không có bước nào phù hợp (video không tiếng + đã tắt hết tuỳ chọn)")
+    labels = " → ".join(STEP_LABELS.get(s["type"], s["type"]) for s in steps)
+    _set(job_id, progress=10,
+         message=f"AutoPilot ({'có' if has_speech else 'không'} lời thoại): {labels}")
+    cur, produced, done_steps = src, [], []
+    for si, st in enumerate(steps):
+        _cancel_point(job_id)
+        _set(job_id, progress=10 + int(si / len(steps) * 85),
+             message=f"AutoPilot {si + 1}/{len(steps)}: {STEP_LABELS.get(st['type'])}")
+        try:
+            primary, outs = _run_step(job_id, st["type"], cur, st["params"])
+            produced.extend(outs)
+            cur = primary
+            done_steps.append(STEP_LABELS.get(st["type"], st["type"]))
+        except JobCancelled:
+            for x in produced:
+                x.unlink(missing_ok=True)
+            raise
+        except Exception as e:  # noqa: BLE001 - bước phụ lỗi → bỏ qua, đi tiếp
+            if st["type"] == "autoframe":  # không dò được mặt → nền mờ 9:16
+                try:
+                    primary, outs = _run_step(job_id, "reframe", cur, {"mode": "blur"})
+                    produced.extend(outs)
+                    cur = primary
+                    done_steps.append("khung 9:16 nền mờ")
+                    continue
+                except Exception:  # noqa: BLE001
+                    pass
+            done_steps.append(f"(bỏ qua {STEP_LABELS.get(st['type'])}: {str(e)[:40]})")
+    if cur == src:
+        raise RuntimeError("AutoPilot không hoàn thành được bước nào")
+    final = unique_out(f"{src.stem}_autopilot", cur.suffix if cur.suffix else ".mp4")
+    shutil.move(str(cur), str(final))
+    for x in produced:
+        if x != cur:
+            x.unlink(missing_ok=True)
+    _set(job_id, message="Xong — AutoPilot: " + " → ".join(done_steps))
+    return [out_entry(final)]
+
+
+# ---------------------------------------------------------------- job: Script-to-Video
+def job_script_video(job_id: str, p: dict):
+    """Script-to-Video kiểu CapCut 2026: chủ đề/kịch bản → AI chia cảnh + lời bình
+    → Piper đọc → B-roll Pexels từng cảnh → ghép + (tuỳ chọn) phụ đề viral.
+    Video hoàn chỉnh từ con số 0."""
+    text_in = str(p.get("text") or "").strip()[:4000]
+    if not text_in:
+        raise RuntimeError("Nhập chủ đề hoặc kịch bản trước")
+    if not pexels_available():
+        raise RuntimeError("Cần PEXELS_API_KEY trong backend/.env để tải B-roll")
+    voice = p.get("voice") if p.get("voice") in PIPER_VOICE_MAP else "vi"
+    if not (PIPER_VOICES_DIR / PIPER_VOICE_MAP[voice]).exists():
+        raise RuntimeError(f"Chưa tải giọng Piper '{voice}'")
+    portrait = p.get("target") != "landscape"
+    W, H = (1080, 1920) if portrait else (1920, 1080)
+    n_scene = min(8, max(2, _safe_int(p.get("scenes"), 5)))
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+
+    _set(job_id, progress=3, message=f"AI ({ai}) viết kịch bản {n_scene} cảnh...")
+    lang_note = "tiếng Việt" if voice.startswith("vi") else "English"
+    prompt = (
+        f"Viết kịch bản video ngắn dạng voice-over bằng {lang_note} từ đầu vào sau "
+        f"(có thể là CHỦ ĐỀ hoặc kịch bản thô):\n\n{text_in}\n\n"
+        f"Chia đúng {n_scene} cảnh. Trả về DUY NHẤT JSON:\n"
+        '{"scenes": [{"voice": "<lời bình 1-2 câu, tự nhiên như nói>", '
+        '"broll": "<2-4 từ khoá TIẾNG ANH tìm cảnh stock, vd office worker typing>"}]}')
+    data = _extract_json(llm_generate(prompt, max_tokens=2000, job_id=job_id, engine=ai))
+    scenes = [s for s in (data.get("scenes") or []) if isinstance(s, dict)
+              and str(s.get("voice", "")).strip()][:n_scene]
+    if len(scenes) < 2:
+        raise RuntimeError("AI không chia được kịch bản thành cảnh — thử lại/đổi não AI")
+    _cancel_point(job_id)
+
+    clips, tmp = [], []
+    try:
+        for i, sc in enumerate(scenes):
+            _cancel_point(job_id)
+            base = 8 + int(i / len(scenes) * 74)
+            vo_text = str(sc["voice"]).strip()[:400]
+            _set(job_id, progress=base, message=f"Cảnh {i + 1}/{len(scenes)}: đọc lời bình...")
+            vo = TMP / f"sv_{job_id}_{i}.wav"
+            tmp.append(vo)
+            _piper_synth(job_id, vo_text, voice, vo)
+            vdur = (media_info(vo)["duration"] or 2) + 0.45  # thở nhẹ cuối câu
+
+            _set(job_id, progress=base + 3,
+                 message=f"Cảnh {i + 1}/{len(scenes)}: tải B-roll '{sc.get('broll', '')[:30]}'...")
+            braw = TMP / f"sv_{job_id}_{i}_b.mp4"
+            tmp.append(braw)
+            got = _pexels_search_download(str(sc.get("broll") or "b-roll"),
+                                          "portrait" if portrait else "landscape",
+                                          vdur, braw)
+            clip = TMP / f"sv_{job_id}_{i}_c.mp4"
+            tmp.append(clip)
+            if got and braw.exists():
+                # loop broll cho đủ dài + chuẩn khung + ghép lời bình
+                cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                       "-stream_loop", "-1", "-i", str(braw), "-i", str(vo),
+                       "-t", f"{vdur:.2f}",
+                       "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+                              f"crop={W}:{H},fps=30,setsar=1",
+                       "-map", "0:v", "-map", "1:a",
+                       "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+                       "-pix_fmt", "yuv420p",
+                       "-c:a", "aac", "-ar", "48000", "-ac", "2", str(clip)]
+            else:  # không có B-roll → nền tối + chữ lời bình (không bao giờ trắng cảnh)
+                tf = TMP / f"sv_{job_id}_{i}.txt"
+                tf.write_text(vo_text, encoding="utf-8")
+                tmp.append(tf)
+                font = FONTS_DIR / "BeVietnamPro-Bold.ttf"
+                cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                       "-f", "lavfi", "-i", f"color=c=0x17171C:s={W}x{H}:r=30",
+                       "-i", str(vo), "-t", f"{vdur:.2f}",
+                       "-vf", "drawtext=textfile='" + _ff_escape_path(tf) + "'"
+                              + (f":fontfile='{_ff_escape_path(font)}'" if font.exists() else "")
+                              + f":fontsize={int(H * 0.045)}:fontcolor=#EDEEF2:expansion=none"
+                              f":x=(w-text_w)/2:y=(h-text_h)/2:borderw=2:bordercolor=black",
+                       "-map", "0:v", "-map", "1:a",
+                       "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+                       "-pix_fmt", "yuv420p",
+                       "-c:a", "aac", "-ar", "48000", "-ac", "2", str(clip)]
+            r = _run_tracked(job_id, cmd)
+            if r.returncode != 0 or not clip.exists():
+                raise RuntimeError(f"Dựng cảnh {i + 1} lỗi: {r.stderr_text[-250:]}")
+            clips.append(clip)
+
+        _set(job_id, progress=84, message="Nối các cảnh...")
+        lst = TMP / f"sv_{job_id}.txt"
+        tmp.append(lst)
+        lst.write_text("".join(f"file '{c.as_posix()}'\n" for c in clips), encoding="utf-8")
+        out = unique_out("script_video", ".mp4")
+        r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                  "-f", "concat", "-safe", "0", "-i", str(lst),
+                                  "-c", "copy", str(out)])
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Nối cảnh lỗi: {r.stderr_text[-250:]}")
+
+        outputs = [out]
+        if p.get("caption", True):  # phụ đề viral trên video hoàn chỉnh
+            _set(job_id, progress=87, message="Cháy phụ đề viral lên video...")
+            try:
+                vc = job_viral_caption(job_id, out, {"model": "base", "karaoke": True})
+                # vc[0] = video đã burn — thay bản thường
+                burned = OUTPUTS / vc[0]["name"]
+                if burned.exists():
+                    out.unlink(missing_ok=True)
+                    outputs = [OUTPUTS / v["name"] for v in vc]
+            except Exception:  # noqa: BLE001 - caption lỗi thì vẫn giao video
+                pass
+        kb = " · ".join(str(s.get("broll", ""))[:20] for s in scenes[:4])
+        _set(job_id, message=f"Xong — Script-to-Video {len(scenes)} cảnh ({kb}...)")
+        return [out_entry(x) for x in outputs]
+    finally:
+        for f in tmp:
+            f.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- job: Gói đăng bài 1 chạm
+def job_post_pack(job_id: str, src: Path, p: dict):
+    """Gói đăng bài 1 chạm: thumbnail (Claude Vision/khung giữa) + caption đa nền
+    tảng + phụ đề .srt + video → 1 file .zip sẵn sàng đăng."""
+    import zipfile
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình")
+    dur = info["duration"] or 1
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+
+    # 1) transcript (dùng chung cho caption + srt)
+    seg_list, _l, lang = _speech_recognize(
+        job_id, src, model_size, None, p.get("engine"), dur, 3, 40)
+    segs = [s for s in seg_list if s.text.strip()]
+    _cancel_point(job_id)
+
+    tmp_files = []
+    try:
+        # 2) .srt
+        srt_p = TMP / f"pp_{job_id}.srt"
+        tmp_files.append(srt_p)
+        srt_p.write_text("\n".join(
+            f"{i}\n{srt_ts(s.start)} --> {srt_ts(s.end)}\n{s.text.strip()}\n"
+            for i, s in enumerate(segs, 1)) or "1\n00:00:00,000 --> 00:00:02,000\n...\n",
+            encoding="utf-8")
+
+        # 3) caption đa nền tảng
+        cap_p = TMP / f"pp_{job_id}.md"
+        tmp_files.append(cap_p)
+        if segs and (llm_available() or claude_available()):
+            _set(job_id, progress=48, message=f"AI ({ai}) viết caption đăng bài...")
+            text_all = "\n".join(_transcript_lines(seg_list))[:12000]
+            content = llm_generate(
+                f"Transcript video ({dur:.0f}s):\n\n{text_all}\n\n"
+                "Viết bằng tiếng Việt, Markdown: ## Tiêu đề (3 phương án ≤70 ký tự) · "
+                "## Mô tả YouTube (SEO + CTA) · ## Caption TikTok (2-3 câu + emoji) · "
+                "## Hashtags (10 cái)", max_tokens=1200, job_id=job_id, engine=ai)
+            cap_p.write_text(f"# Gói đăng bài — {src.name}\n\n{content}\n", encoding="utf-8")
+        else:
+            cap_p.write_text(f"# Gói đăng bài — {src.name}\n\n(Video không có lời thoại "
+                             "hoặc thiếu não AI — tự viết caption nhé)\n", encoding="utf-8")
+        _cancel_point(job_id)
+
+        # 4) thumbnail: Claude Vision chọn, không có thì khung giữa
+        thumb_p = TMP / f"pp_{job_id}.jpg"
+        tmp_files.append(thumb_p)
+        picked = False
+        if claude_available():
+            _set(job_id, progress=62, message="Claude Vision chọn thumbnail...")
+            try:
+                th = job_thumbnail(job_id, src, {"count": 6})
+                tsrc = OUTPUTS / th[0]["name"]
+                shutil.move(str(tsrc), str(thumb_p))
+                for x in th[1:]:
+                    (OUTPUTS / x["name"]).unlink(missing_ok=True)
+                picked = True
+            except Exception:  # noqa: BLE001
+                picked = False
+        if not picked:
+            _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                  "-ss", f"{dur / 2:.2f}", "-i", str(src),
+                                  "-frames:v", "1", "-q:v", "2", str(thumb_p)])
+        _cancel_point(job_id)
+
+        # 5) đóng gói zip (video STORED — không nén lại cho nhanh)
+        _set(job_id, progress=85, message="Đóng gói .zip sẵn sàng đăng...")
+        out = unique_out(f"{src.stem}_goidang", ".zip")
+        with zipfile.ZipFile(out, "w") as z:
+            z.write(thumb_p, "thumbnail.jpg", compress_type=zipfile.ZIP_DEFLATED)
+            z.write(cap_p, "caption-hashtags.md", compress_type=zipfile.ZIP_DEFLATED)
+            z.write(srt_p, "phude.srt", compress_type=zipfile.ZIP_DEFLATED)
+            if p.get("include_video", True):
+                z.write(src, src.name, compress_type=zipfile.ZIP_STORED)
+        _set(job_id, message="Xong — gói đăng bài: video + thumbnail + caption + srt (.zip)")
+        return [out_entry(out)]
+    finally:
+        for f in tmp_files:
+            f.unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------- job: Auto Reframe bám chủ thể
 def job_autoframe(job_id: str, src: Path, p: dict):
     """Auto Reframe kiểu CapCut: YuNet dò khuôn mặt từng khung → làm mượt EMA →
@@ -1621,6 +1905,159 @@ def job_autoframe(job_id: str, src: Path, p: dict):
         shutil.move(str(out_v), str(out))
     _set(job_id, message=f"Xong — auto reframe {rw}:{rh}, bám chủ thể {found} lần / {i} khung")
     return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: tách cảnh tự động
+def job_scene_split(job_id: str, src: Path, p: dict):
+    """Scene detect kiểu CapCut: dò chuyển cảnh → cắt thành từng clip riêng
+    + danh sách mốc cảnh (.txt)."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình")
+    dur = info["duration"] or 1
+    thr = min(0.7, max(0.15, _safe_float(p.get("threshold"), 0.35)))
+    _set(job_id, progress=3, message=f"Dò chuyển cảnh (ngưỡng {thr:.2f})...")
+    r = _run_tracked(job_id, [FFMPEG_BIN, "-hide_banner", "-nostats", "-i", str(src),
+                              "-vf", f"select='gt(scene,{thr})',showinfo",
+                              "-f", "null", "-"])
+    marks = [float(m) for m in re.findall(r"pts_time:([0-9.]+)", r.stderr_text or "")]
+    marks = sorted(set(round(m, 2) for m in marks if 0.4 < m < dur - 0.4))[:29]
+    bounds = [0.0] + marks + [dur]
+    scenes = [(a, b) for a, b in zip(bounds, bounds[1:]) if b - a >= 0.4]
+    if len(scenes) < 2:
+        raise RuntimeError("Chỉ thấy 1 cảnh — video không có chuyển cảnh rõ "
+                           "(thử giảm ngưỡng nhạy)")
+    outputs = []
+    for i, (a, b) in enumerate(scenes):
+        _cancel_point(job_id)
+        _set(job_id, progress=5 + int(i / len(scenes) * 90),
+             message=f"Cắt cảnh {i + 1}/{len(scenes)} ({a:.1f}s–{b:.1f}s)...")
+        oc = unique_out(f"{src.stem}_canh{i + 1:02d}", ".mp4")
+        cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+               "-ss", f"{a:.3f}", "-to", f"{b:.3f}", "-i", str(src),
+               "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+               "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+               "-pix_fmt", "yuv420p"]
+        cmd += (["-c:a", "aac", "-b:a", "192k"] if info["has_audio"] else ["-an"])
+        r2 = _run_tracked(job_id, cmd + [str(oc)])
+        if r2.returncode == 0 and oc.exists():
+            outputs.append(oc)
+        else:
+            oc.unlink(missing_ok=True)
+    note = unique_out(f"{src.stem}_canh", ".txt")
+    note.write_text("\n".join(f"Cảnh {i + 1}: {srt_ts(a)[:-4]} → {srt_ts(b)[:-4]}"
+                              for i, (a, b) in enumerate(scenes)) + "\n", encoding="utf-8")
+    outputs.append(note)
+    _set(job_id, message=f"Xong — tách {len(scenes)} cảnh")
+    return [out_entry(x) for x in outputs]
+
+
+# ---------------------------------------------------------------- job: auto punch-in
+def job_punchin(job_id: str, src: Path, p: dict):
+    """Auto punch-in kiểu faceless channel: zoom tĩnh xen kẽ 1.0×/1.07× theo TỪNG
+    CÂU nói (whisper segments) — nhịp dựng năng động không cần kỹ xảo tay."""
+    info = media_info(src)
+    w, h = info["width"], info["height"]
+    if not w or not h:
+        raise RuntimeError("Cần video có hình")
+    dur = info["duration"] or 1
+    z = 1.05 if p.get("strength") != "strong" else 1.1
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "tiny"
+    seg_list, _l, _lg = _speech_recognize(
+        job_id, src, model_size, None, p.get("engine"), dur, 3, 45)
+    # gộp câu ngắn → mỗi "nhịp" ≥ 1.2s; xen kẽ zoom
+    beats, cur_start = [], 0.0
+    for s in seg_list:
+        if s.end - cur_start >= 1.2:
+            beats.append((cur_start, s.end))
+            cur_start = s.end
+    if dur - cur_start > 0.3:
+        beats.append((cur_start, dur))
+    if len(beats) < 2:
+        raise RuntimeError("Không đủ câu nói để tạo nhịp punch-in")
+    beats = beats[:80]
+    w2, h2 = w // 2 * 2, h // 2 * 2
+    tmp, lst = [], TMP / f"pi_{job_id}.txt"
+    try:
+        for i, (a, b) in enumerate(beats):
+            _cancel_point(job_id)
+            _set(job_id, progress=48 + int(i / len(beats) * 45),
+                 message=f"Punch-in nhịp {i + 1}/{len(beats)}"
+                         + (" (zoom)" if i % 2 else ""))
+            clip = TMP / f"pi_{job_id}_{i}.mp4"
+            tmp.append(clip)
+            vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2" if i % 2 == 0 else \
+                (f"scale=trunc(iw*{z}/2)*2:trunc(ih*{z}/2)*2,crop={w2}:{h2}")
+            cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                   "-ss", f"{a:.3f}", "-to", f"{b:.3f}", "-i", str(src),
+                   "-vf", vf, "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+                   "-pix_fmt", "yuv420p"]
+            cmd += (["-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k"]
+                    if info["has_audio"] else ["-an"])
+            r = _run_tracked(job_id, cmd + [str(clip)])
+            if r.returncode != 0 or not clip.exists():
+                raise RuntimeError(f"Nhịp {i + 1} lỗi: {r.stderr_text[-200:]}")
+        lst.write_text("".join(f"file '{c.as_posix()}'\n" for c in tmp if c.suffix == ".mp4"),
+                       encoding="utf-8")
+        out = unique_out(f"{src.stem}_punchin", ".mp4")
+        r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                  "-f", "concat", "-safe", "0", "-i", str(lst),
+                                  "-c", "copy", str(out)])
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Nối nhịp lỗi: {r.stderr_text[-250:]}")
+    finally:
+        lst.unlink(missing_ok=True)
+        for c in tmp:
+            c.unlink(missing_ok=True)
+    _set(job_id, message=f"Xong — punch-in {len(beats)} nhịp (zoom {z}× xen kẽ theo câu)")
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: dịch đa ngữ 1 chạm
+def job_multi_translate(job_id: str, src: Path, p: dict):
+    """1 video → nhiều bản hardsub các ngôn ngữ trong 1 job (nghe 1 lần, dịch N lần)."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình")
+    dur = info["duration"] or 1
+    langs = [x for x in (p.get("langs") or []) if x in LANG_NAMES][:6]
+    if not langs:
+        raise RuntimeError("Chọn ít nhất 1 ngôn ngữ đích")
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+    seg_list, _l, _lg = _speech_recognize(
+        job_id, src, model_size, None, p.get("engine"), dur, 3, 35)
+    segs = [s for s in seg_list if s.text.strip()]
+    if not segs:
+        raise RuntimeError("Video không có lời thoại để dịch")
+    texts = [s.text.strip() for s in segs]
+    outputs = []
+    for li, lang in enumerate(langs):
+        _cancel_point(job_id)
+        base = 38 + int(li / len(langs) * 58)
+        _set(job_id, progress=base,
+             message=f"[{li + 1}/{len(langs)}] Dịch sang {LANG_NAMES[lang]}...")
+        translated = _ai_translate_lines(texts, LANG_NAMES[lang], ai, job_id)
+        srt = unique_out(f"{src.stem}_{lang}", ".srt")
+        srt.write_text("\n".join(
+            f"{i}\n{srt_ts(s.start)} --> {srt_ts(s.end)}\n{t}\n"
+            for i, (s, t) in enumerate(zip(segs, translated), 1)), encoding="utf-8")
+        outputs.append(srt)
+        _set(job_id, progress=base + 4,
+             message=f"[{li + 1}/{len(langs)}] Cháy phụ đề {lang} vào video...")
+        burned = unique_out(f"{src.stem}_{lang}_sub", ".mp4")
+        r = _run_tracked(job_id, [
+            FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
+            "-vf", f"subtitles={srt.name}:force_style='Fontsize=18,Outline=1,MarginV=28'",
+            "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+            "-c:a", "aac", "-b:a", "192k", str(burned)], cwd=str(OUTPUTS))
+        if r.returncode == 0 and burned.exists():
+            outputs.append(burned)
+        else:
+            burned.unlink(missing_ok=True)
+    _set(job_id, message=f"Xong — {len(langs)} ngôn ngữ: "
+         + ", ".join(LANG_NAMES[x] for x in langs))
+    return [out_entry(x) for x in outputs]
 
 
 # ---------------------------------------------------------------- job: voice effects (đổi giọng)
@@ -4568,7 +5005,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -4593,6 +5030,13 @@ def health():
             "cutlist": ffmpeg_ok,
             "composite": ffmpeg_ok,
             "folder": ffmpeg_ok,
+            "autopilot": ffmpeg_ok,
+            "script_video": pexels_available() and piper_available()
+            and (llm_available() or claude_available()) and ffmpeg_ok,
+            "post_pack": whisper_ok and ffmpeg_ok,
+            "scene_split": ffmpeg_ok,
+            "punchin": whisper_ok and ffmpeg_ok,
+            "multi_translate": whisper_ok and (llm_available() or claude_available()),
             "autoframe": cv2_available() and YUNET_ONNX.exists() and ffmpeg_ok,
             "voicefx": ffmpeg_ok,
             "enhance": ffmpeg_ok,
@@ -4821,7 +5265,9 @@ STEP_LABELS = {
     "silence_cut": "cắt lặng", "speed": "tốc độ", "color": "filter màu",
     "grade": "chỉnh màu PRO", "cutlist": "cắt timeline",
     "enhance": "đẹp màu 1 chạm", "voicefx": "đổi giọng", "autoframe": "auto reframe",
-    "filler_cut": "cắt từ đệm", "retouch": "mịn da",
+    "filler_cut": "cắt từ đệm", "retouch": "mịn da", "punchin": "punch-in",
+    "autopilot": "AutoPilot", "scene_split": "tách cảnh",
+    "multi_translate": "dịch đa ngữ", "post_pack": "gói đăng bài",
     "stabilize": "chống rung", "reframe": "khung 9:16", "rife": "nội suy",
     "upscale": "upscale", "bg_remove": "tách nền", "audio_enhance": "chuẩn âm",
     "face_blur": "che mặt", "brand": "logo/tiêu đề", "export": "xuất preset",
@@ -4848,6 +5294,15 @@ def create_job(req: JobRequest):
         speed = min(1.5, max(0.6, _safe_float(p.get("speed"), 1.0)))
         label = text[:40] + ("…" if len(text) > 40 else "")
         return submit_job("tts", label, job_tts, text, voice, speed)
+
+    if req.type == "script_video":  # kịch bản → video — không cần file nguồn
+        if not pexels_available():
+            raise HTTPException(400, "Cần PEXELS_API_KEY trong backend/.env")
+        if not piper_available():
+            raise HTTPException(400, "Cần Piper TTS (giọng đọc)")
+        if not llm_available() and not claude_available():
+            raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm để viết kịch bản")
+        return submit_job("script_video", "🎬 kịch bản → video", job_script_video, dict(p))
 
     if req.type == "folder_batch":  # edit hàng loạt cả thư mục ổ cứng — không cần file trong kho
         d = Path(str(p.get("path") or "").strip()).expanduser()
@@ -4950,6 +5405,24 @@ def create_job(req: JobRequest):
             raise HTTPException(400, "Cần opencv + model YuNet (chạy setup-binaries.sh)")
         rt_str = min(2.0, max(0.3, _safe_float(p.get("strength"), 1.0)))
         return submit_job("retouch", src.name, job_retouch, src, rt_str)
+    if req.type == "autopilot":
+        return submit_job("autopilot", src.name, job_autopilot, src, dict(p))
+    if req.type == "post_pack":
+        if not whisper_available_any():
+            raise HTTPException(400, "Cần whisper để làm gói đăng bài")
+        return submit_job("post_pack", src.name, job_post_pack, src, dict(p))
+    if req.type == "scene_split":
+        return submit_job("scene_split", src.name, job_scene_split, src, dict(p))
+    if req.type == "punchin":
+        if not whisper_available_any():
+            raise HTTPException(400, "Cần whisper để bắt nhịp câu nói")
+        return submit_job("punchin", src.name, job_punchin, src, dict(p))
+    if req.type == "multi_translate":
+        if not whisper_available_any():
+            raise HTTPException(400, "Cần whisper để nhận dạng lời nói")
+        if not llm_available() and not claude_available():
+            raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm để dịch")
+        return submit_job("multi_translate", src.name, job_multi_translate, src, dict(p))
     if req.type == "track":
         if not sam2_available():
             raise HTTPException(400, "Chưa cài SAM 2 — pip install ultralytics + tải sam2.1_t.pt vào binaries/sam2")
@@ -5103,6 +5576,7 @@ DIRECTOR_ALLOWED_TYPES = {
     "beatsync", "audio_enhance", "brand", "audiogram", "highlights", "content",
     "face_blur", "tts", "lesson", "broll", "viral_caption", "pipeline",
     "grade", "cutlist", "enhance", "voicefx", "autoframe", "filler_cut", "retouch",
+    "autopilot", "scene_split", "punchin", "multi_translate", "post_pack",
 }
 
 DIRECTOR_CATALOG = """\
@@ -5130,6 +5604,11 @@ DIRECTOR_CATALOG = """\
 - broll: tự chèn B-roll (cảnh minh hoạ) tải từ Pexels đè lên video người nói. params: count(1-6 số đoạn), ai(local/claude)
 - tts: đọc văn bản (KHÔNG cần file). params: text(chuỗi), voice(vi/en), speed(0.6-1.5)
 - grade: bảng chỉnh màu chuyên nghiệp. params: exposure(-3..3), brightness(-1..1), contrast(0..3, mặc định 1), saturation(0..3, mặc định 1), temperature(-100 ấm..100 lạnh), hue(-180..180), vibrance(-2..2), gamma(0.3..3), sharp(0..5), zoom(1..2), sh_hue+sh_sat(nhuộm vùng tối), hl_hue+hl_sat(nhuộm vùng sáng)
+- autopilot: TỰ LÀM HẾT 1 nút (dò lời thoại → cắt lặng+từ đệm → đẹp màu → chuẩn âm → reframe → phụ đề viral). params: target(tiktok/youtube)
+- scene_split: tách video thành từng cảnh (dò chuyển cảnh). params: threshold(0.15-0.7)
+- punchin: zoom xen kẽ theo từng câu nói (nhịp faceless). params: strength(normal/strong)
+- multi_translate: 1 video → nhiều bản hardsub. params: langs(mảng mã: en/zh/ja/ko/th/fr/es/de/id/pt/ru)
+- post_pack: gói đăng bài .zip (thumbnail + caption + srt + video). params: model
 - enhance: đẹp màu 1 chạm (tự cân bằng trắng + vibrance). params: mode(natural/vivid)
 - voicefx: đổi giọng. params: effect(chipmunk/deep/robot/phone/echo/cave)
 - autoframe: auto reframe BÁM CHỦ THỂ (AI dò mặt, crop dọc lia theo người). params: ratio(916/11/45)
@@ -5410,6 +5889,31 @@ def folder_scan(req: FolderScanReq):
             "truncated": len(files) >= FOLDER_MAX_FILES}
 
 
+def _process_file_steps(job_id: str, f: Path, steps: list, outdir: Path) -> Path:
+    """Chạy chuỗi bước cho 1 file → move kết quả vào outdir (tên _LS, tự né trùng).
+    Dọn file trung gian; raise nếu bước nào lỗi. Dùng chung: folder batch + thư mục nóng."""
+    cur, produced = f, []
+    try:
+        for st in steps:
+            primary, outs = _run_step(job_id, st["type"], cur, st.get("params") or {})
+            produced.extend(outs)
+            cur = primary
+        dest = outdir / f"{f.stem}_LS{cur.suffix}"
+        n = 1
+        while dest.exists():
+            dest = outdir / f"{f.stem}_LS_{n}{cur.suffix}"
+            n += 1
+        shutil.move(str(cur), str(dest))
+        for x in produced:
+            if x != cur:
+                x.unlink(missing_ok=True)
+        return dest
+    except BaseException:
+        for x in produced:
+            x.unlink(missing_ok=True)
+        raise
+
+
 def job_folder_batch(job_id: str, p: dict):
     """Edit hàng loạt cả THƯ MỤC trong ổ cứng: chạy chuỗi bước cho từng file media,
     kết quả xuất vào <thư mục>/LocalStudio_Xuat. File lỗi bỏ qua, có báo cáo."""
@@ -5433,31 +5937,13 @@ def job_folder_batch(job_id: str, p: dict):
         _cancel_point(job_id)
         _set(job_id, progress=int(i / len(files) * 100),
              message=f"[{i + 1}/{len(files)}] {f.name} — {chain}")
-        cur, produced = f, []
         try:
-            for st in steps:
-                primary, outs = _run_step(job_id, st["type"], cur,
-                                          st.get("params") or {})
-                produced.extend(outs)
-                cur = primary
-            dest = outdir / f"{f.stem}_LS{cur.suffix}"
-            n = 1
-            while dest.exists():
-                dest = outdir / f"{f.stem}_LS_{n}{cur.suffix}"
-                n += 1
-            shutil.move(str(cur), str(dest))
-            for x in produced:  # dọn file trung gian + file phụ trong OUTPUTS
-                if x != cur:
-                    x.unlink(missing_ok=True)
+            dest = _process_file_steps(job_id, f, steps, outdir)
             ok += 1
             lines.append(f"✅ {f.relative_to(d)}  →  {dest.name}")
         except JobCancelled:
-            for x in produced:
-                x.unlink(missing_ok=True)
             raise
         except Exception as e:  # noqa: BLE001 - 1 file hỏng không chặn cả lô
-            for x in produced:
-                x.unlink(missing_ok=True)
             fail += 1
             lines.append(f"❌ {f.relative_to(d)}  —  {str(e)[:160]}")
     report = unique_out(f"{d.name}_batch_baocao", ".txt")
@@ -5466,6 +5952,266 @@ def job_folder_batch(job_id: str, p: dict):
     _set(job_id, message=f"Xong — {ok}/{len(files)} file → {outdir}"
          + (f" · {fail} lỗi (xem báo cáo)" if fail else ""))
     return [out_entry(report)]
+
+
+# ---------------------------------------------------------------- Template chuỗi bước
+TEMPLATES_DIR = WORKSPACE / "templates"
+TEMPLATES_DIR.mkdir(exist_ok=True)
+
+
+def _tpl_path(name: str) -> Path:
+    name = re.sub(r"[^\w\- À-ỹ]", "", str(name or "")).strip()[:48]
+    if not name:
+        raise HTTPException(400, "Tên template không hợp lệ")
+    return TEMPLATES_DIR / (name + ".json")
+
+
+class TemplateReq(BaseModel):
+    name: str
+    steps: list = []
+
+
+@app.get("/api/templates")
+def list_templates():
+    out = []
+    for f in sorted(TEMPLATES_DIR.glob("*.json"), key=lambda x: -x.stat().st_mtime):
+        try:
+            steps = json.loads(f.read_text(encoding="utf-8"))
+            out.append({"name": f.stem, "steps": steps,
+                        "label": " → ".join(STEP_LABELS.get(s.get("type"), s.get("type", "?"))
+                                            for s in steps[:8])})
+        except (json.JSONDecodeError, OSError):
+            continue
+    return out
+
+
+@app.post("/api/templates")
+def save_template(req: TemplateReq):
+    steps = [s for s in (req.steps or [])
+             if isinstance(s, dict) and s.get("type") in PIPELINE_STEP_TYPES][:8]
+    if not steps:
+        raise HTTPException(400, "Template cần ít nhất 1 bước hợp lệ")
+    path = _tpl_path(req.name)
+    path.write_text(json.dumps(steps, ensure_ascii=False), encoding="utf-8")
+    return {"ok": True, "name": path.stem}
+
+
+@app.delete("/api/templates/{name}")
+def delete_template(name: str):
+    _tpl_path(name).unlink(missing_ok=True)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- Thư mục nóng + Lịch chạy đêm
+WATCH_FILE = BACKEND_DIR / "watch_config.json"
+WATCH_STATE_FILE = WORKSPACE / "watch_state.json"
+WATCH_CFG = {"enabled": False, "path": "", "recursive": False, "steps": [],
+             "schedule_enabled": False, "schedule_time": "02:00"}
+_WATCH_LOCK = threading.Lock()
+_watch_pending: dict = {}      # path -> size lần quét trước (chờ file copy xong)
+_watch_stats = {"processed": 0, "last_scan": 0.0, "last_sched_date": ""}
+
+
+def _load_watch_cfg():
+    if WATCH_FILE.exists():
+        try:
+            data = json.loads(WATCH_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                WATCH_CFG.update({k: data[k] for k in WATCH_CFG if k in data})
+                _watch_stats["last_sched_date"] = data.get("last_sched_date", "")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+
+def _save_watch_cfg():
+    try:
+        WATCH_FILE.write_text(json.dumps(
+            {**WATCH_CFG, "last_sched_date": _watch_stats["last_sched_date"]},
+            ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _watch_state() -> dict:
+    if WATCH_STATE_FILE.exists():
+        try:
+            return json.loads(WATCH_STATE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _watch_mark(key: str):
+    st = _watch_state()
+    st[key] = time.time()
+    if len(st) > 3000:  # gọn state
+        st = dict(sorted(st.items(), key=lambda kv: -kv[1])[:2000])
+    WATCH_STATE_FILE.write_text(json.dumps(st), encoding="utf-8")
+
+
+def job_watch_one(job_id: str, f: Path, steps: list, outdir: Path):
+    """Xử lý 1 file mới rơi vào thư mục nóng."""
+    chain = " → ".join(STEP_LABELS.get(s["type"], s["type"]) for s in steps)
+    _set(job_id, message=f"🔥 Thư mục nóng: {f.name} — {chain}")
+    dest = _process_file_steps(job_id, f, steps, outdir)
+    _watch_stats["processed"] += 1
+    _set(job_id, message=f"Xong — 🔥 {f.name} → {dest.name}")
+    return []
+
+
+def _watch_tick():
+    """1 nhịp quét thư mục nóng: file mới + ổn định (copy xong) → xếp job."""
+    with _WATCH_LOCK:
+        cfg = dict(WATCH_CFG)
+    if not (cfg["enabled"] and cfg["path"] and cfg["steps"]):
+        return
+    d = Path(cfg["path"]).expanduser()
+    if not d.is_dir():
+        return
+    _watch_stats["last_scan"] = time.time()
+    state = _watch_state()
+    outdir = d / FOLDER_OUT_NAME
+    for f in _folder_scan(d, bool(cfg["recursive"]))[:50]:
+        try:
+            stt = f.stat()
+        except OSError:
+            continue
+        key = f"{f}|{stt.st_size}|{int(stt.st_mtime)}"
+        if key in state:
+            continue
+        # file phải "đứng yên": size không đổi giữa 2 nhịp + mtime cũ hơn 8s
+        prev = _watch_pending.get(str(f))
+        _watch_pending[str(f)] = stt.st_size
+        if prev != stt.st_size or time.time() - stt.st_mtime < 8:
+            continue
+        _watch_mark(key)
+        _watch_pending.pop(str(f), None)
+        outdir.mkdir(exist_ok=True)
+        submit_job("watch", f"🔥 {f.name}", job_watch_one, f,
+                   list(cfg["steps"]), outdir)
+
+
+def _schedule_tick():
+    """Lịch chạy đêm: đến giờ (HH:MM) → chạy folder_batch cả thư mục, 1 lần/ngày."""
+    with _WATCH_LOCK:
+        cfg = dict(WATCH_CFG)
+    if not (cfg["schedule_enabled"] and cfg["path"] and cfg["steps"]):
+        return
+    now = time.localtime()
+    today = time.strftime("%Y-%m-%d", now)
+    if _watch_stats["last_sched_date"] == today:
+        return
+    if time.strftime("%H:%M", now) != str(cfg["schedule_time"]):
+        return
+    _watch_stats["last_sched_date"] = today
+    _save_watch_cfg()
+    submit_job("folder_batch", f"⏰ {Path(cfg['path']).name}", job_folder_batch,
+               {"path": cfg["path"], "recursive": cfg["recursive"], "steps": cfg["steps"]})
+
+
+def _watch_daemon():
+    while True:
+        try:
+            _watch_tick()
+            _schedule_tick()
+        except Exception:  # noqa: BLE001 - daemon không bao giờ được chết
+            pass
+        time.sleep(12)
+
+
+_load_watch_cfg()
+threading.Thread(target=_watch_daemon, daemon=True).start()
+
+
+class WatchReq(BaseModel):
+    enabled: Optional[bool] = None
+    path: Optional[str] = None
+    recursive: Optional[bool] = None
+    steps: Optional[list] = None
+    schedule_enabled: Optional[bool] = None
+    schedule_time: Optional[str] = None
+
+
+def _watch_payload():
+    return {**WATCH_CFG, "processed": _watch_stats["processed"],
+            "last_scan": _watch_stats["last_scan"]}
+
+
+@app.get("/api/watch")
+def get_watch():
+    return _watch_payload()
+
+
+@app.post("/api/watch")
+def set_watch(req: WatchReq):
+    with _WATCH_LOCK:
+        if req.enabled is not None:
+            WATCH_CFG["enabled"] = bool(req.enabled)
+        if req.path is not None:
+            WATCH_CFG["path"] = str(req.path).strip()[:500]
+        if req.recursive is not None:
+            WATCH_CFG["recursive"] = bool(req.recursive)
+        if req.steps is not None:
+            WATCH_CFG["steps"] = [s for s in req.steps if isinstance(s, dict)
+                                  and s.get("type") in PIPELINE_STEP_TYPES][:8]
+        if req.schedule_enabled is not None:
+            WATCH_CFG["schedule_enabled"] = bool(req.schedule_enabled)
+        if req.schedule_time is not None:
+            t = str(req.schedule_time).strip()
+            if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", t):
+                WATCH_CFG["schedule_time"] = t
+        _save_watch_cfg()
+    return _watch_payload()
+
+
+# ---------------------------------------------------------------- Nhận video từ iPhone (Shortcuts)
+INGEST_TOKEN_FILE = BACKEND_DIR / "ingest_token.txt"
+if INGEST_TOKEN_FILE.exists():
+    INGEST_TOKEN = INGEST_TOKEN_FILE.read_text(encoding="utf-8").strip()
+else:
+    INGEST_TOKEN = secrets.token_urlsafe(18)
+    INGEST_TOKEN_FILE.write_text(INGEST_TOKEN, encoding="utf-8")
+
+
+@app.get("/api/ingest-info")
+def ingest_info(request: Request):
+    """Thông tin cho Apple Shortcuts: URL + token (chỉ trả khi đã đăng nhập)."""
+    host = request.headers.get("host", "127.0.0.1:8765")
+    scheme = "https" if request.headers.get("x-forwarded-proto") == "https" else "http"
+    return {"token": INGEST_TOKEN,
+            "url": f"{scheme}://{host}/api/ingest?token={INGEST_TOKEN}"}
+
+
+@app.post("/api/ingest")
+async def ingest(request: Request, file: UploadFile = File(...), token: str = ""):
+    """Nhận video từ iPhone qua Apple Shortcuts (token thay cookie — dùng trong LAN).
+    Lưu vào kho media; nếu thư mục nóng có chuỗi bước → tự xử lý luôn."""
+    if not hmac.compare_digest(token or "", INGEST_TOKEN):
+        raise HTTPException(401, "Sai token")
+    name = re.sub(r"[^\w\-.]+", "_", file.filename or "iphone.mp4")[:120] or "iphone.mp4"
+    if Path(name).suffix.lower() not in ALLOWED_EXT:
+        raise HTTPException(400, "Định dạng không hỗ trợ")
+    dest = UPLOADS / name
+    n = 1
+    while dest.exists():
+        dest = UPLOADS / f"{Path(name).stem}_{n}{Path(name).suffix}"
+        n += 1
+    size = 0
+    with open(dest, "wb") as f:
+        while chunk := await file.read(1 << 20):
+            size += len(chunk)
+            if size > MAX_UPLOAD:
+                f.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(413, "File quá lớn")
+            f.write(chunk)
+    auto = False
+    with _WATCH_LOCK:
+        steps = list(WATCH_CFG["steps"]) if WATCH_CFG["steps"] else []
+    if steps:  # có chuỗi định sẵn → tự xử lý, kết quả về Kết quả của app
+        submit_job("watch", f"📲 {dest.name}", job_watch_one, dest, steps, OUTPUTS)
+        auto = True
+    return {"ok": True, "saved": dest.name, "auto_processing": auto}
 
 
 # ---------------------------------------------------------------- Dự án lớp phủ (save/load)

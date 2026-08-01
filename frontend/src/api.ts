@@ -191,6 +191,55 @@ export async function scanFolder(path: string, recursive: boolean): Promise<{
   return d;
 }
 
+export type PipeStepT = { type: string; params: Record<string, unknown> };
+export type TemplateInfo = { name: string; steps: PipeStepT[]; label: string };
+
+export async function listTemplates(): Promise<TemplateInfo[]> {
+  const r = await fetch("/api/templates");
+  return r.ok ? r.json() : [];
+}
+
+export async function saveTemplate(name: string, steps: PipeStepT[]): Promise<void> {
+  const r = await fetch("/api/templates", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, steps }),
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(e.detail || "Lưu template thất bại");
+  }
+}
+
+export async function deleteTemplate(name: string): Promise<void> {
+  await fetch(`/api/templates/${encodeURIComponent(name)}`, { method: "DELETE" });
+}
+
+export type WatchCfg = {
+  enabled: boolean; path: string; recursive: boolean; steps: PipeStepT[];
+  schedule_enabled: boolean; schedule_time: string; processed: number; last_scan: number;
+};
+
+export async function getWatch(): Promise<WatchCfg> {
+  const r = await fetch("/api/watch");
+  if (!r.ok) throw new Error("Không đọc được cấu hình");
+  return r.json();
+}
+
+export async function setWatch(patch: Partial<WatchCfg>): Promise<WatchCfg> {
+  const r = await fetch("/api/watch", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!r.ok) throw new Error("Lưu cấu hình thất bại");
+  return r.json();
+}
+
+export async function getIngestInfo(): Promise<{ token: string; url: string }> {
+  const r = await fetch("/api/ingest-info");
+  if (!r.ok) throw new Error("Không đọc được");
+  return r.json();
+}
+
 export type ProjectInfo = { name: string; file: string; layers: number; mtime: number };
 
 export async function listProjects(): Promise<ProjectInfo[]> {

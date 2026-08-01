@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import {
   askDirector, authStatus, cancelJob, clipSearch, createJob, deleteMedia,
-  deleteProject, fetchCuesJson, fmtDur, fmtSize, getClaudeSettings, getHealth,
-  getJobs, getMedia, listProjects, loadProject, login, logout, openOutputs,
-  resetDirector, saveClaudeSettings, saveProject, scanFolder, stopDirector, testClaude,
-  uploadFile, viralAnalyze,
-  type Health, type Job, type MediaItem, type ProjectInfo, type ViralCluster,
+  deleteProject, deleteTemplate, fetchCuesJson, fmtDur, fmtSize,
+  getClaudeSettings, getHealth, getIngestInfo, getJobs, getMedia,
+  listProjects, listTemplates, loadProject, login, logout, openOutputs,
+  resetDirector, saveClaudeSettings, saveProject, saveTemplate, scanFolder,
+  setWatch, getWatch, stopDirector, testClaude, uploadFile, viralAnalyze,
+  type Health, type Job, type MediaItem, type ProjectInfo, type TemplateInfo,
+  type ViralCluster, type WatchCfg,
 } from "./api";
 
 // Nhãn giọng Piper (key khớp backend PIPER_VOICE_MAP)
@@ -22,6 +24,8 @@ const TOOL_CATS: Record<string, ToolCat> = {
   thumbnail: "ai", auto_edit: "ai", transcribe: "ai", content: "ai", lesson: "ai",
   clipsearch: "ai", folder: "ai", autoframe: "edit", filler_cut: "ai",
   enhance: "edit", retouch: "edit", voicefx: "audio",
+  autopilot: "ai", script_video: "ai", post_pack: "ai",
+  scene_split: "edit", punchin: "edit", multi_translate: "ai",
   merge: "edit", beatsync: "edit", silence_cut: "edit", upscale: "edit",
   rife: "edit", bg_remove: "edit", reframe: "edit", speed: "edit", color: "edit",
   grade: "edit", track: "edit", stabilize: "edit", face_blur: "edit", brand: "edit",
@@ -44,6 +48,8 @@ const FEAT_KEY: Record<string, string> = {
   pipeline: "export", export: "export", grade: "grade", track: "track",
   clipsearch: "clipsearch", folder: "folder", autoframe: "autoframe",
   voicefx: "voicefx", enhance: "enhance", filler_cut: "filler_cut", retouch: "retouch",
+  autopilot: "autopilot", script_video: "script_video", post_pack: "post_pack",
+  scene_split: "scene_split", punchin: "punchin", multi_translate: "multi_translate",
   reframe: "ffmpeg", speed: "ffmpeg", color: "ffmpeg", music: "ffmpeg",
   stabilize: "ffmpeg", merge: "ffmpeg", audio_enhance: "ffmpeg",
   brand: "ffmpeg", audiogram: "ffmpeg",
@@ -76,6 +82,10 @@ const TOOL_REQS: Record<string, string> = {
   autoframe: "cần opencv + model YuNet (chạy ./setup-binaries.sh)",
   retouch: "cần opencv + model YuNet (chạy ./setup-binaries.sh)",
   filler_cut: "cần faster-whisper/MLX",
+  script_video: "cần PEXELS_API_KEY + Piper TTS + Claude/Qwen",
+  post_pack: "cần whisper (faster/MLX)",
+  punchin: "cần whisper (faster/MLX)",
+  multi_translate: "cần whisper + Claude/Qwen",
 };
 
 // Ngôn ngữ đích cho Dịch phụ đề AI
@@ -122,7 +132,8 @@ type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" |
   | "highlights" | "face_blur" | "content" | "director" | "lesson" | "broll" | "viral"
   | "translate" | "social_pack" | "dub" | "qc" | "script" | "thumbnail"
   | "grade" | "track" | "clipsearch" | "folder" | "pipeline"
-  | "autoframe" | "voicefx" | "enhance" | "filler_cut" | "retouch";
+  | "autoframe" | "voicefx" | "enhance" | "filler_cut" | "retouch"
+  | "autopilot" | "script_video" | "post_pack" | "scene_split" | "punchin" | "multi_translate";
 
 // Lớp phủ multi-track (đè lên video nền theo mốc thời gian)
 type Layer = {
@@ -162,6 +173,9 @@ const PIPE_PALETTE: { type: string; label: string; def: Record<string, unknown> 
 ];
 
 const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: boolean }[] = [
+  { key: "autopilot", icon: "🚀", name: "AutoPilot — Làm hết cho tôi", desc: "1 nút: AI tự dò → cắt lặng+ừm → đẹp màu → chuẩn âm → 9:16 → phụ đề", gpu: true },
+  { key: "script_video", icon: "🎥", name: "Kịch bản → Video (Script-to-Video)", desc: "gõ chủ đề → AI chia cảnh + đọc lời + B-roll → video hoàn chỉnh", gpu: true },
+  { key: "post_pack", icon: "📦", name: "Gói đăng bài 1 chạm", desc: "video + thumbnail AI + caption/hashtags + srt → 1 file .zip", gpu: true },
   { key: "pipeline", icon: "🔗", name: "Chuỗi tự động (nối nhiều bước)", desc: "xếp nhiều tính năng chạy nối tiếp trên 1 video", gpu: false },
   { key: "folder", icon: "📁", name: "Edit hàng loạt cả THƯ MỤC", desc: "trỏ vào folder trong ổ cứng → chạy chuỗi bước cho mọi video", gpu: false },
   { key: "viral", icon: "🔥", name: "Phụ đề Viral 1 chạm", desc: "nhận dạng → tách cụm → cháy preset viral + chuẩn âm", gpu: true },
@@ -194,6 +208,9 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "enhance", icon: "✨", name: "Đẹp màu 1 chạm", desc: "tự cân bằng trắng + màu sống động + nét", gpu: false },
   { key: "retouch", icon: "💆", name: "Làm mịn da (retouch)", desc: "AI dò mặt → mịn da vùng mặt, nền giữ nét", gpu: false },
   { key: "voicefx", icon: "🎭", name: "Đổi giọng (voice FX)", desc: "sóc chuột · trầm · robot · điện thoại · vang · hang", gpu: false },
+  { key: "scene_split", icon: "🎬", name: "Tách cảnh tự động", desc: "dò chuyển cảnh → cắt thành từng clip riêng", gpu: false },
+  { key: "punchin", icon: "🔍", name: "Auto punch-in theo câu", desc: "zoom xen kẽ theo từng câu nói — nhịp faceless channel", gpu: false },
+  { key: "multi_translate", icon: "🌏", name: "Dịch đa ngữ 1 chạm", desc: "1 video → nhiều bản hardsub (EN/中/日/한...) trong 1 job", gpu: true },
   { key: "music", icon: "🎵", name: "Nhạc nền + ducking", desc: "tự nén nhạc khi có giọng nói", gpu: false },
   { key: "face_blur", icon: "🫥", name: "Làm mờ mặt tự động", desc: "YuNet AI · che mặt học sinh/người lạ", gpu: false },
   { key: "content", icon: "📝", name: "AI viết nội dung", desc: "tiêu đề · mô tả · hashtags · chapters", gpu: true },
@@ -465,6 +482,23 @@ export default function App() {
   const [vfxFx, setVfxFx] = useState("deep");
   const [enhMode, setEnhMode] = useState("natural");
   const [rtStr, setRtStr] = useState(1.0);
+  // Wave automation: autopilot / script-to-video / gói đăng / tách cảnh / punch-in / đa ngữ
+  const [apTarget, setApTarget] = useState("tiktok");
+  const [svText, setSvText] = useState("");
+  const [svVoice, setSvVoice] = useState("vi");
+  const [svScenes, setSvScenes] = useState(5);
+  const [svCaption, setSvCaption] = useState(true);
+  const [svPortrait, setSvPortrait] = useState(true);
+  const [ppVideo, setPpVideo] = useState(true);
+  const [ssThr, setSsThr] = useState(0.35);
+  const [piStrong, setPiStrong] = useState(false);
+  const [mtLangs, setMtLangs] = useState<string[]>(["en"]);
+  // Template chuỗi + thư mục nóng + lịch
+  const [tplName, setTplName] = useState("");
+  const [tplList, setTplList] = useState<TemplateInfo[]>([]);
+  const [tplPick, setTplPick] = useState("");
+  const [watchCfg, setWatchCfg] = useState<WatchCfg | null>(null);
+  const [ingest, setIngest] = useState<{ token: string; url: string } | null>(null);
   // Edit hàng loạt cả thư mục ổ cứng
   const [fdPath, setFdPath] = useState("");
   const [fdRec, setFdRec] = useState(false);
@@ -602,7 +636,9 @@ export default function App() {
       setCsAliases(s.model_aliases); setCsPresent(s.cli_present);
     } catch { /* ignore */ }
   }, []);
-  useEffect(() => { if (showSettings) { setCsTest(""); loadClaudeSettings(); } }, [showSettings, loadClaudeSettings]);
+  useEffect(() => { if (showSettings) { setCsTest(""); loadClaudeSettings(); getIngestInfo().then(setIngest).catch(() => {}); } }, [showSettings, loadClaudeSettings]);
+  // nạp cấu hình thư mục nóng khi mở tool folder
+  useEffect(() => { if (tool === "folder") { getWatch().then((w) => { setWatchCfg(w); if (!fdPath && w.path) setFdPath(w.path); }).catch(() => {}); } }, [tool]);  // eslint-disable-line react-hooks/exhaustive-deps
   const applyClaude = async (patch: { enabled?: boolean; model?: string }) => {
     try {
       const s = await saveClaudeSettings(patch);
@@ -874,6 +910,16 @@ export default function App() {
                 {csBusy ? "Đang gọi Claude..." : "🔌 Test kết nối"}
               </button>
               {csTest && <span className="logindesc" style={{ margin: 0 }}>{csTest}</span>}
+            </div>
+            <div className="field" style={{ marginTop: 14 }}>
+              <label>📲 Nhận video từ iPhone (Apple Shortcuts)</label>
+              <div className="csrow" style={{ wordBreak: "break-all", fontSize: 10.5 }}>
+                {ingest ? <>Tạo Shortcut: <b>Chia sẻ → Get Contents of URL</b> · Method POST ·
+                  Request Body = Form, field <code>file</code> = video · URL:<br />
+                  <code>{ingest.url}</code>
+                  {watchCfg?.steps?.length ? " — video gửi lên sẽ TỰ xử lý theo chuỗi thư mục nóng" : ""}</>
+                  : "đang tải..."}
+              </div>
             </div>
             <div className="field" style={{ marginTop: 16 }}>
               <label>Trạng thái hệ thống (tính năng nào tắt → xem lý do & cách cài)</label>
@@ -2386,6 +2432,171 @@ export default function App() {
                 </>
               )}
 
+              {tool === "autopilot" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🚀 <b>1 nút — máy tự làm hết:</b> dò video có lời thoại không → tự quyết
+                    chuỗi: cắt lặng → cắt ừm/à → đẹp màu → chuẩn âm → khung dọc bám mặt
+                    (không mặt thì nền mờ) → phụ đề viral. Ra thẳng bản đăng.
+                  </div>
+                  <div className="field"><label>Đích</label>
+                    <div className="seg">
+                      <button className={apTarget === "tiktok" ? "on" : ""} onClick={() => setApTarget("tiktok")}>📱 TikTok/Shorts 9:16</button>
+                      <button className={apTarget === "youtube" ? "on" : ""} onClick={() => setApTarget("youtube")}>🖥 YouTube ngang</button>
+                    </div>
+                  </div>
+                  <button className="btn pri big" onClick={() => run("autopilot", { target: apTarget })}>
+                    🚀 Làm hết cho tôi
+                  </button>
+                </>
+              )}
+
+              {tool === "script_video" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎥 Script-to-Video kiểu CapCut 2026: gõ CHỦ ĐỀ hoặc dán kịch bản →
+                    AI chia cảnh + viết lời bình → giọng đọc AI + B-roll Pexels từng cảnh
+                    → video hoàn chỉnh từ con số 0.
+                  </div>
+                  <textarea className="ttsbox" rows={4} maxLength={4000} value={svText}
+                    placeholder='VD: "5 thói quen buổi sáng của người thành công" — hoặc dán nguyên kịch bản...'
+                    onChange={(e) => setSvText(e.target.value)} />
+                  <div className="field"><label>Giọng đọc</label>
+                    <div className="seg">
+                      {(health?.piper_voices?.length ? health.piper_voices : ["vi"]).map((v) => (
+                        <button key={v} className={svVoice === v ? "on" : ""}
+                          onClick={() => setSvVoice(v)}>{VOICE_LABELS[v] || v}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Số cảnh</span><b>{svScenes}</b></div>
+                    <input type="range" min={2} max={8} step={1} value={svScenes}
+                      onChange={(e) => setSvScenes(Number(e.target.value))} />
+                  </div>
+                  <div className="optrow">
+                    <label className="chk"><input type="checkbox" checked={svPortrait} onChange={(e) => setSvPortrait(e.target.checked)} />Khung dọc 9:16</label>
+                    <label className="chk"><input type="checkbox" checked={svCaption} onChange={(e) => setSvCaption(e.target.checked)} />Phụ đề viral</label>
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI viết kịch bản</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <button className="btn pri big" disabled={!svText.trim()}
+                    onClick={async () => {
+                      try {
+                        await createJob("script_video", "", {
+                          text: svText.trim(), voice: svVoice, scenes: svScenes,
+                          target: svPortrait ? "portrait" : "landscape",
+                          caption: svCaption, ai: aiEngine,
+                        });
+                        setJobs(await getJobs()); setRightTab("jobs");
+                        showToast("🎥 Đang dựng video từ kịch bản — AI viết + đọc + tải B-roll");
+                      } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                    }}>🎥 Dựng video từ kịch bản</button>
+                </>
+              )}
+
+              {tool === "post_pack" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    📦 1 chạm ra trọn bộ sẵn sàng đăng: video + thumbnail (Claude Vision
+                    chọn khung giật view) + tiêu đề/caption/hashtags + phụ đề .srt — đóng
+                    gói 1 file .zip.
+                  </div>
+                  <div className="field"><label>Model Whisper</label>
+                    <div className="seg">
+                      {["tiny", "base", "small"].map((m) => (
+                        <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <label className="chk"><input type="checkbox" checked={ppVideo} onChange={(e) => setPpVideo(e.target.checked)} />Kèm cả video vào .zip</label>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <button className="btn pri big" onClick={() => run("post_pack", {
+                    model: whModel, ai: aiEngine, include_video: ppVideo,
+                  })}>📦 Làm gói đăng bài</button>
+                </>
+              )}
+
+              {tool === "scene_split" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎬 Dò chuyển cảnh → tách video thành từng clip riêng + danh sách mốc
+                    cảnh. Hợp với vlog/quay nhiều cảnh cần lọc lại.
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Độ nhạy (thấp = tách nhiều cảnh hơn)</span><b>{ssThr.toFixed(2)}</b></div>
+                    <input type="range" min={0.15} max={0.7} step={0.05} value={ssThr}
+                      onChange={(e) => setSsThr(parseFloat(e.target.value))} />
+                  </div>
+                  <button className="btn pri big" onClick={() => run("scene_split", { threshold: ssThr })}>
+                    🎬 Tách cảnh
+                  </button>
+                </>
+              )}
+
+              {tool === "punchin" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🔍 Nhịp dựng faceless channel: AI nghe từng CÂU → zoom xen kẽ
+                    1.0× / zoom-in theo câu — video nói chuyện hết nhàm chán.
+                  </div>
+                  <div className="field"><label>Mức zoom</label>
+                    <div className="seg">
+                      <button className={!piStrong ? "on" : ""} onClick={() => setPiStrong(false)}>Nhẹ (1.05×)</button>
+                      <button className={piStrong ? "on" : ""} onClick={() => setPiStrong(true)}>Mạnh (1.1×)</button>
+                    </div>
+                  </div>
+                  <button className="btn pri big" onClick={() => run("punchin", {
+                    strength: piStrong ? "strong" : "normal", model: "tiny",
+                  })}>🔍 Auto punch-in</button>
+                </>
+              )}
+
+              {tool === "multi_translate" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🌏 Nghe 1 lần → dịch + cháy phụ đề NHIỀU ngôn ngữ trong 1 job —
+                    mỗi ngôn ngữ 1 bản .mp4 + .srt.
+                  </div>
+                  <div className="field"><label>Ngôn ngữ đích (chọn nhiều, tối đa 6)</label>
+                    <div className="segchips">
+                      {TR_LANGS.map(([v, l]) => (
+                        <button key={v}
+                          className={"btn sm" + (mtLangs.includes(v) ? " pri" : "")}
+                          onClick={() => setMtLangs((ls) => ls.includes(v)
+                            ? ls.filter((x) => x !== v)
+                            : ls.length < 6 ? [...ls, v] : ls)}>{l}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI dịch</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <button className="btn pri big" disabled={mtLangs.length === 0}
+                    onClick={() => run("multi_translate", { langs: mtLangs, model: whModel, ai: aiEngine })}>
+                    🌏 Dịch {mtLangs.length} ngôn ngữ
+                  </button>
+                </>
+              )}
+
               {tool === "track" && (
                 <>
                   <div className="hint" style={{ marginBottom: 10 }}>
@@ -2475,6 +2686,73 @@ export default function App() {
                     }}>
                     📁 Chạy {fdScan ? fdScan.files.length : 0} file × {pipe.length} bước
                   </button>
+
+                  <div className="field" style={{ marginTop: 14 }}><label>🧩 Template chuỗi (lưu/áp nhanh)</label>
+                    <div className="segchips">
+                      <input className="lytext" style={{ maxWidth: 120 }} placeholder="tên template"
+                        value={tplName} maxLength={48} onChange={(e) => setTplName(e.target.value)} />
+                      <button className="btn sm" disabled={!tplName.trim() || pipe.length === 0}
+                        onClick={async () => {
+                          try {
+                            await saveTemplate(tplName.trim(), pipe);
+                            setTplList(await listTemplates()); showToast("🧩 Đã lưu template");
+                          } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                        }}>Lưu chuỗi hiện tại</button>
+                      <select value={tplPick} onChange={(e) => setTplPick(e.target.value)}
+                        onFocus={async () => setTplList(await listTemplates())}>
+                        <option value="">— template —</option>
+                        {tplList.map((t) => <option key={t.name} value={t.name}>{t.name} ({t.label})</option>)}
+                      </select>
+                      <button className="btn sm" disabled={!tplPick} onClick={() => {
+                        const t = tplList.find((x) => x.name === tplPick);
+                        if (t) { setPipe(t.steps.map((s) => ({ type: s.type, params: { ...s.params } }))); showToast("🧩 Đã áp template " + t.name); }
+                      }}>Áp</button>
+                      <button className="btn sm" disabled={!tplPick} style={{ color: "var(--warn)" }}
+                        onClick={async () => { await deleteTemplate(tplPick); setTplPick(""); setTplList(await listTemplates()); }}>🗑</button>
+                    </div>
+                  </div>
+
+                  <div className="field" style={{ marginTop: 8 }}>
+                    <label>🔥 Thư mục nóng — thả video vào là TỰ xử lý {watchCfg?.enabled
+                      ? <b style={{ color: "var(--ice)" }}> · ĐANG BẬT ({watchCfg.processed} file đã xử lý)</b>
+                      : " · đang tắt"}</label>
+                    <div className="segchips">
+                      <button className={"btn sm" + (watchCfg?.enabled ? "" : " pri")}
+                        disabled={!watchCfg?.enabled && (!fdPath.trim() || pipe.length === 0)}
+                        onClick={async () => {
+                          try {
+                            const w = await setWatch(watchCfg?.enabled
+                              ? { enabled: false }
+                              : { enabled: true, path: fdPath.trim(), recursive: fdRec, steps: pipe });
+                            setWatchCfg(w);
+                            showToast(w.enabled ? "🔥 Thư mục nóng ĐANG CANH " + w.path : "Đã tắt thư mục nóng");
+                          } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                        }}>
+                        {watchCfg?.enabled ? "⏹ Tắt" : "🔥 Bật với đường dẫn + chuỗi hiện tại"}
+                      </button>
+                      {watchCfg?.enabled && <span className="tllab">{watchCfg.path}</span>}
+                    </div>
+                  </div>
+
+                  <div className="field" style={{ marginTop: 4 }}>
+                    <label>⏰ Lịch chạy đêm — tự chạy cả thư mục mỗi ngày lúc:</label>
+                    <div className="segchips">
+                      <input className="lytext" style={{ maxWidth: 80 }} type="time"
+                        value={watchCfg?.schedule_time || "02:00"}
+                        onChange={async (e) => setWatchCfg(await setWatch({ schedule_time: e.target.value }))} />
+                      <button className={"btn sm" + (watchCfg?.schedule_enabled ? "" : " pri")}
+                        disabled={!watchCfg?.schedule_enabled && (!fdPath.trim() || pipe.length === 0)}
+                        onClick={async () => {
+                          const w = await setWatch(watchCfg?.schedule_enabled
+                            ? { schedule_enabled: false }
+                            : { schedule_enabled: true, path: fdPath.trim(), recursive: fdRec, steps: pipe });
+                          setWatchCfg(w);
+                          showToast(w.schedule_enabled ? "⏰ Đã hẹn " + w.schedule_time + " mỗi đêm" : "Đã tắt lịch");
+                        }}>
+                        {watchCfg?.schedule_enabled ? "⏹ Tắt lịch" : "⏰ Bật lịch"}
+                      </button>
+                    </div>
+                  </div>
                 </>
               )}
 

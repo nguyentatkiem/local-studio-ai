@@ -1,8 +1,8 @@
 # 🎬 Local Studio — AI Video Editor chạy 100% trên máy
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.0.0-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-50-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-2.1.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-60-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/cloud-0%25-FF6B57?style=for-the-badge" alt="no cloud">
   <img src="https://img.shields.io/badge/watermark-kh%C3%B4ng-7ACB6B?style=for-the-badge" alt="no watermark">
 </p>
@@ -28,7 +28,19 @@
 > 🌐 **Phát hành web tạm qua Cloudflare Tunnel:** xem `DEPLOY-WEB.md`.
 > 🎯 **Track đối tượng SAM 2** cần thêm: `pip install ultralytics` · **Tìm cảnh CLIP** cần: `pip install open_clip_torch` (trong venv backend).
 
-## ✨ 50 tính năng (v2.0)
+## ✨ 60 tính năng (v2.1)
+
+### 🤖 Tự động hoá TỐI ĐA (không editor nào có đủ bộ này)
+| Tính năng | Mô tả |
+|---|---|
+| 🚀 **AutoPilot** | 1 nút: tự dò lời thoại → cắt lặng + ừm/à → đẹp màu → chuẩn âm → 9:16 bám mặt → phụ đề viral |
+| 🎥 **Script-to-Video** | gõ chủ đề → AI viết cảnh + giọng đọc + B-roll Pexels → video hoàn chỉnh từ số 0 |
+| 🔥 **Thư mục nóng** | thả video vào folder là TỰ xử lý theo chuỗi định sẵn |
+| ⏰ **Lịch chạy đêm** | tự chạy batch cả thư mục mỗi ngày đúng giờ |
+| 📦 **Gói đăng bài** | video + thumbnail AI + caption + srt → 1 file .zip |
+| 🧩 **Template chuỗi** | lưu chuỗi bước đặt tên, áp 1 chạm |
+| 📲 **Nhận video từ iPhone** | Apple Shortcuts share → tự xử lý qua Wi-Fi |
+| 🎬 Tách cảnh tự động · 🔍 Auto punch-in theo câu · 🌏 Dịch đa ngữ 1 chạm (6 thứ tiếng/job) | |
 
 ### 🎞️ Studio dựng — timeline & lớp phủ
 | Tính năng | Mô tả |

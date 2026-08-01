@@ -1,14 +1,25 @@
 # 📜 Nhật ký cập nhật — Local Studio
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.0.0-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-50-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-2.1.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-60-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/100%25-local--first-7ACB6B?style=for-the-badge" alt="local">
 </p>
 
 > **Local Studio** — trình dựng video AI chạy **100% trên máy bạn**. Không cloud, không credit, không watermark. Footage không bao giờ rời máy.
 
 ---
+
+## 🤖 v2.1 — Tự động hoá TỐI ĐA · <sub>02/08/2026</sub>
+
+10 tính năng biến Local Studio thành dây chuyền sản xuất content:
+
+- **🚀 AutoPilot** — 1 nút "Làm hết cho tôi": tự dò lời thoại rồi tự quyết chuỗi bước → bản đăng hoàn chỉnh.
+- **🎥 Script-to-Video** (CapCut 2026) — chủ đề → AI chia cảnh + lời bình → giọng đọc AI + B-roll Pexels → video từ con số 0.
+- **🔥 Thư mục nóng** — thả video vào folder là TỰ xử lý (dò file copy xong mới chạy).
+- **⏰ Lịch chạy đêm** + **🧩 Template chuỗi** + **📦 Gói đăng bài .zip** (thumbnail AI + caption + srt + video).
+- **📲 Nhận video từ iPhone** qua Apple Shortcuts (token riêng, tự xử lý luôn).
+- **🎬 Tách cảnh** · **🔍 Auto punch-in theo câu** · **🌏 Dịch đa ngữ 1 chạm**.
 
 ## 🎬 v2.0 — Gói CapCut-parity · <sub>02/08/2026</sub>
 
