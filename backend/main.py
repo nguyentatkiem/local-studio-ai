@@ -199,12 +199,68 @@ def safe_upload_path(name: str) -> Path:
     return p
 
 # ---------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- tăng tốc phần cứng (VideoToolbox)
+PERF_FILE = BACKEND_DIR / "perf_config.json"
+PERF_CFG = {"hw": True}
+if PERF_FILE.exists():
+    try:
+        PERF_CFG.update({k: bool(v) for k, v in
+                         json.loads(PERF_FILE.read_text(encoding="utf-8")).items()
+                         if k in PERF_CFG})
+    except (json.JSONDecodeError, OSError):
+        pass
+
+HW_OK = False  # dò 1 lần lúc khởi động (bên dưới, sau khi có FFMPEG_BIN)
+
+
+def _probe_hw_encode() -> bool:
+    """Encode thử 0.2s tí hon bằng h264_videotoolbox — máy nào fail thì tự tắt."""
+    try:
+        r = subprocess.run(
+            [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.2",
+             "-c:v", "h264_videotoolbox", "-q:v", "50", "-f", "null", "-"],
+            capture_output=True, timeout=15)
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _maybe_hw(cmd: list) -> list:
+    """ĐIỂM CHẶN DUY NHẤT tăng tốc encode: đổi 'libx264 -crf N -preset P' thành
+    VideoToolbox GPU (giải phóng ~8× CPU cho các job song song) khi đang bật.
+    Giữ nguyên mọi tham số khác; libvpx/aac/copy không đụng."""
+    if not (HW_OK and PERF_CFG.get("hw", True)) or "libx264" not in cmd:
+        return cmd
+    crf = 19
+    for i, c in enumerate(cmd[:-1]):  # lấy CRF gốc để quy đổi chất lượng
+        if c == "-crf":
+            crf = _safe_int(cmd[i + 1], 19)
+            break
+    # CRF → thang chất lượng VT (cao = đẹp): 18→65, 20→60, 23→53, 26→46
+    q = max(35, min(70, int(106 - 2.3 * crf)))
+    out, i = [], 0
+    while i < len(cmd):
+        if cmd[i] == "-c:v" and i + 1 < len(cmd) and cmd[i + 1] == "libx264":
+            out += ["-c:v", "h264_videotoolbox", "-q:v", str(q), "-allow_sw", "1"]
+            i += 2
+        elif cmd[i] in ("-crf", "-preset") and i + 1 < len(cmd):
+            i += 2  # thông số riêng của x264 — bỏ khi đã sang VT
+        else:
+            out.append(cmd[i])
+            i += 1
+    return out
+
+
 def _run(cmd, **kw):
     """Run a subprocess, capture text output safely on Windows."""
     return subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8",
+        _maybe_hw(list(cmd)), capture_output=True, text=True, encoding="utf-8",
         errors="replace", **kw
     )
+
+
+HW_OK = _probe_hw_encode()  # dò VideoToolbox 1 lần lúc khởi động
 
 
 def ffprobe(path: Path) -> dict:
@@ -281,8 +337,8 @@ def run_ffmpeg_progress(args: list, duration: float, on_progress,
     """Run ffmpeg with -progress pipe:1 and report percent via callback.
     stderr ghi ra file tạm (KHÔNG PIPE — lỗi lặp mỗi frame làm đầy buffer → treo)."""
     import tempfile
-    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
-           "-progress", "pipe:1", "-nostats"] + args
+    cmd = _maybe_hw([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                     "-progress", "pipe:1", "-nostats"] + args)
     with tempfile.TemporaryFile() as ef:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=ef,
@@ -447,7 +503,7 @@ def _track_proc(job_id: str, proc):
 def _run_tracked(job_id: str, cmd, **kw):
     """Như _run nhưng kill được khi hủy job."""
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        _maybe_hw(list(cmd)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", **kw
     )
     _track_proc(job_id, proc)
@@ -824,6 +880,8 @@ def job_silence_cut(job_id: str, src: Path, margin: float):
     out = unique_out(src.stem + "_cut", ".mp4")
     cmd = [sys.executable, "-m", "auto_editor", str(src),
            "--margin", f"{margin}sec", "--no-open", "--output", str(out)]
+    if HW_OK and PERF_CFG.get("hw", True):  # encode GPU — video dài nhanh hơn hẳn
+        cmd += ["-c:v", "h264_videotoolbox", "-b:v", "6M"]
     r = _run_tracked(job_id, cmd, cwd=str(TMP))
     if r.returncode != 0 or not out.exists():
         raise RuntimeError(f"auto-editor failed: {(r.stderr_text or r.stdout_text)[-800:]}")
@@ -1094,7 +1152,7 @@ def job_bg_remove(job_id: str, src: Path, bg: str):
     # stderr encoder ra file — PIPE không được drain sẽ deadlock khi vp9/x264 in cảnh báo mỗi frame
     enc_log = TMP / f"bgenc_{job_id}.log"
     enc_ef = open(enc_log, "wb")
-    enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+    enc = subprocess.Popen(_maybe_hw(enc_cmd), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                            stderr=enc_ef)
     _track_proc(job_id, enc)
 
@@ -1250,6 +1308,8 @@ def job_auto_edit(job_id: str, src: Path, p: dict):
             cut_out = TMP / f"auto_cut_{job_id}.mp4"
             cmd = [sys.executable, "-m", "auto_editor", str(src),
                    "--margin", f"{margin}sec", "--no-open", "--output", str(cut_out)]
+            if HW_OK and PERF_CFG.get("hw", True):
+                cmd += ["-c:v", "h264_videotoolbox", "-b:v", "6M"]
             r = _run_tracked(job_id, cmd, cwd=str(TMP))
             if r.returncode != 0 or not cut_out.exists():
                 raise RuntimeError(f"auto-editor failed: {(r.stderr_text or r.stdout_text)[-500:]}")
@@ -1835,11 +1895,11 @@ def job_autoframe(job_id: str, src: Path, p: dict):
     enc_log = TMP / f"afenc_{job_id}.log"
     enc_ef = open(enc_log, "wb")
     enc = subprocess.Popen(
-        [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+        _maybe_hw([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
          "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{cw}x{h}",
          "-r", str(fps), "-i", "pipe:0",
          "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
-         "-pix_fmt", "yuv420p", str(out_v)],
+         "-pix_fmt", "yuv420p", str(out_v)]),
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=enc_ef)
     _track_proc(job_id, enc)
 
@@ -2202,12 +2262,12 @@ def job_retouch(job_id: str, src: Path, strength: float = 1.0):
     enc_log = TMP / f"rtenc_{job_id}.log"
     enc_ef = open(enc_log, "wb")
     enc = subprocess.Popen(
-        [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+        _maybe_hw([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
          "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
          "-r", str(fps), "-i", "pipe:0",
          "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
          "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
-         "-pix_fmt", "yuv420p", str(out_v)],
+         "-pix_fmt", "yuv420p", str(out_v)]),
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=enc_ef)
     _track_proc(job_id, enc)
 
@@ -2225,8 +2285,10 @@ def job_retouch(job_id: str, src: Path, strength: float = 1.0):
             if not buf or len(buf) < frame_bytes:
                 break
             frame = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3).copy()
-            small = cv2.resize(frame, (dw, dh))
-            _ok, faces = det.detect(small)
+            faces = None
+            if i % 2 == 0:  # dò mặt mỗi 2 khung (box ttl=6 che khoảng trống) — nhanh hơn ~25%
+                small = cv2.resize(frame, (dw, dh))
+                _ok, faces = det.detect(small)
             for bx in active:
                 bx[4] -= 1
             active = [bx for bx in active if bx[4] > 0]
@@ -2365,12 +2427,12 @@ def job_track(job_id: str, src: Path, p: dict):
     enc_log = TMP / f"trackenc_{job_id}.log"
     enc_ef = open(enc_log, "wb")
     enc = subprocess.Popen(
-        [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+        _maybe_hw([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
          "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
          "-r", str(fps), "-i", "pipe:0",
          "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
          "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
-         "-pix_fmt", "yuv420p", str(out_v)],
+         "-pix_fmt", "yuv420p", str(out_v)]),
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=enc_ef)
     _track_proc(job_id, enc)
 
@@ -4895,7 +4957,7 @@ def job_face_blur(job_id: str, src: Path, mode: str, strength: float):
                 "-pix_fmt", "yuv420p", str(out)]
     enc_log = TMP / f"fb_{job_id}.log"
     enc_ef = open(enc_log, "wb")
-    enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE,
+    enc = subprocess.Popen(_maybe_hw(enc_cmd), stdin=subprocess.PIPE,
                            stdout=subprocess.DEVNULL, stderr=enc_ef)
     _track_proc(job_id, enc)
 
@@ -4912,8 +4974,10 @@ def job_face_blur(job_id: str, src: Path, mode: str, strength: float):
             if not buf or len(buf) < frame_bytes:
                 break
             frame = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3).copy()
-            small = cv2.resize(frame, (dw, dh))
-            _ok, faces = det.detect(small)
+            faces = None
+            if i % 2 == 0:  # dò mặt mỗi 2 khung (box ttl=6 che khoảng trống) — nhanh hơn ~25%
+                small = cv2.resize(frame, (dw, dh))
+                _ok, faces = det.detect(small)
             for b in active:
                 b[4] -= 1
             active = [b for b in active if b[4] > 0]
@@ -5005,12 +5069,13 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
         "gpu": gpu_info(),
         "piper_voices": piper_installed_voices(),
+        "hw_encode": HW_OK and PERF_CFG.get("hw", True),
         "features": {
             "ffmpeg": ffmpeg_ok,
             "transcribe": whisper_ok,
@@ -5845,6 +5910,26 @@ class WorkersReq(BaseModel):
 def set_workers(req: WorkersReq):
     """Chỉnh số job chạy song song (1-4)."""
     return {"workers": set_worker_limit(req.workers)}
+
+
+class PerfReq(BaseModel):
+    hw: Optional[bool] = None
+
+
+@app.get("/api/perf")
+def get_perf():
+    return {"hw": PERF_CFG.get("hw", True), "hw_available": HW_OK}
+
+
+@app.post("/api/perf")
+def set_perf(req: PerfReq):
+    if req.hw is not None:
+        PERF_CFG["hw"] = bool(req.hw)
+        try:
+            PERF_FILE.write_text(json.dumps(PERF_CFG), encoding="utf-8")
+        except OSError:
+            pass
+    return {"hw": PERF_CFG.get("hw", True), "hw_available": HW_OK}
 
 
 # ---------------------------------------------------------------- Xử lý cả THƯ MỤC trong ổ cứng

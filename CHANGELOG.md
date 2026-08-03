@@ -1,7 +1,7 @@
 # 📜 Nhật ký cập nhật — Local Studio
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.2.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/version-2.3.0-FFB23F?style=for-the-badge" alt="version">
   <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-60-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/100%25-local--first-7ACB6B?style=for-the-badge" alt="local">
 </p>
@@ -9,6 +9,12 @@
 > **Local Studio** — trình dựng video AI chạy **100% trên máy bạn**. Không cloud, không credit, không watermark. Footage không bao giờ rời máy.
 
 ---
+
+## ⚡ v2.3 — Nhanh hơn trên MỌI tác vụ + Responsive · <sub>03/08/2026</sub>
+
+- **⚡ Encode GPU (VideoToolbox)** cho TOÀN BỘ job xuất video — job thật nhanh hơn **~40%**, CPU rảnh **~8×** (chạy 4 job song song không nghẽn). 1 điểm chặn `_maybe_hw()` tự quy đổi CRF→chất lượng VT; máy không hỗ trợ tự về x264; công tắc trong ⚙.
+- Cắt khoảng lặng (auto-editor) cũng encode GPU · dò mặt 1/2 khung (mờ mặt + mịn da nhanh ~25%).
+- **📱 Responsive đa thiết bị**: điện thoại/tablet xếp dọc (kho → video → tuỳ chọn), nút to dễ chạm, tay cầm timeline to hơn, tab cuộn ngang — dùng tốt qua tunnel trên iPhone.
 
 ## 💅 v2.2 — Giao diện CapCut toàn diện · <sub>02/08/2026</sub>
 

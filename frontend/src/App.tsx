@@ -500,6 +500,7 @@ export default function App() {
   const [tplPick, setTplPick] = useState("");
   const [watchCfg, setWatchCfg] = useState<WatchCfg | null>(null);
   const [ingest, setIngest] = useState<{ token: string; url: string } | null>(null);
+  const [hwOn, setHwOn] = useState(true);
   // Edit hàng loạt cả thư mục ổ cứng
   const [fdPath, setFdPath] = useState("");
   const [fdRec, setFdRec] = useState(false);
@@ -637,7 +638,12 @@ export default function App() {
       setCsAliases(s.model_aliases); setCsPresent(s.cli_present);
     } catch { /* ignore */ }
   }, []);
-  useEffect(() => { if (showSettings) { setCsTest(""); loadClaudeSettings(); getIngestInfo().then(setIngest).catch(() => {}); } }, [showSettings, loadClaudeSettings]);
+  useEffect(() => {
+    if (!showSettings) return;
+    setCsTest(""); loadClaudeSettings();
+    getIngestInfo().then(setIngest).catch(() => {});
+    fetch("/api/perf").then((r) => r.json()).then((d) => setHwOn(!!d.hw)).catch(() => {});
+  }, [showSettings, loadClaudeSettings]);
   // nạp cấu hình thư mục nóng khi mở tool folder
   useEffect(() => { if (tool === "folder") { getWatch().then((w) => { setWatchCfg(w); if (!fdPath && w.path) setFdPath(w.path); }).catch(() => {}); } }, [tool]);  // eslint-disable-line react-hooks/exhaustive-deps
   const applyClaude = async (patch: { enabled?: boolean; model?: string }) => {
@@ -853,7 +859,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v2.2 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v2.3 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -911,6 +917,18 @@ export default function App() {
                 {csBusy ? "Đang gọi Claude..." : "🔌 Test kết nối"}
               </button>
               {csTest && <span className="logindesc" style={{ margin: 0 }}>{csTest}</span>}
+            </div>
+            <div className="field" style={{ marginTop: 14 }}>
+              <label>⚡ Tăng tốc phần cứng (VideoToolbox GPU)</label>
+              <label className="chk"><input type="checkbox" checked={hwOn}
+                onChange={async (e) => {
+                  const r = await fetch("/api/perf", { method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ hw: e.target.checked }) });
+                  const d = await r.json(); setHwOn(d.hw);
+                  showToast(d.hw ? "⚡ Encode GPU BẬT — mọi job nhanh hơn" : "Encode CPU (x264 chất lượng tối đa)");
+                }} />
+                Encode video bằng GPU Apple — nhanh hơn ~40%, CPU rảnh gấp 8 lần khi chạy nhiều job</label>
             </div>
             <div className="field" style={{ marginTop: 14 }}>
               <label>📲 Nhận video từ iPhone (Apple Shortcuts)</label>

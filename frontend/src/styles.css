@@ -470,3 +470,59 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;bac
 
 /* toast + modal bo lớn */
 .modal-card{border-radius:16px}
+
+/* ================================================================
+   v2.3 — RESPONSIVE ĐA THIẾT BỊ (tablet ≤1000px · điện thoại ≤640px)
+   ================================================================ */
+@media (max-width:1000px){
+  html,body,#root{height:auto;min-height:100%}
+  body{overflow:auto;-webkit-overflow-scrolling:touch}
+  .app{height:auto;min-height:100vh;display:flex;flex-direction:column}
+  .titlebar{flex-wrap:wrap;height:auto;min-height:46px;padding:8px 10px;gap:8px;
+    position:sticky;top:0;z-index:30}
+  .pname{display:none}
+  /* 3 cột → xếp dọc: kho/công cụ → video → tuỳ chọn */
+  .mid{display:flex;flex-direction:column;overflow:visible}
+  .left,.right,.stagewrap{min-width:0;max-width:100vw;overflow-x:hidden}
+  .lp-title{flex-wrap:wrap;gap:6px}
+  .left{border-right:none;border-bottom:1px solid var(--line);
+    grid-template-rows:auto auto;max-height:none}
+  .lpanel{overflow:visible;max-height:52vh;overflow-y:auto}
+  .stagewrap{min-height:auto}
+  .player{padding:10px}
+  .canvas video{max-height:44vh}
+  .right{width:100%;border-left:none;border-top:1px solid var(--line);max-height:none}
+  .rbody{overflow:visible}
+  .toolgrid{grid-template-columns:repeat(3,1fr)}
+  .mgrid{grid-template-columns:repeat(3,1fr)}
+  .chatbox{width:min(420px,94vw);bottom:14px;right:10px}
+  .fabchat{bottom:14px;right:10px}
+}
+@media (max-width:640px){
+  body{font-size:12.5px}
+  .titlebar .gpuchip,.titlebar .offline{display:none}   /* gọn cho màn nhỏ */
+  .logo b{font-size:12.5px}
+  .btn{height:32px}                                     /* dễ chạm */
+  .btn.sm{height:28px}
+  .toolgrid{grid-template-columns:1fr 1fr}
+  .mgrid{grid-template-columns:1fr 1fr}
+  .canvas video{max-height:38vh}
+  .lpanel{max-height:46vh;padding:10px}
+  .seg button,.seg.sm button{min-height:30px}
+  .trimtrack{height:46px}
+  .trimhandle::after{width:20px;height:28px}            /* tay cầm to cho ngón tay */
+  .lyinspect{gap:7px}
+  .lyinspect input[type=range]{width:120px}
+  .modal-card{width:96vw;padding:16px 14px;max-height:92vh}
+  .cliphits{grid-template-columns:repeat(2,1fr)}
+  .transport{padding:6px 8px;gap:6px}
+  .status{display:none}
+  .cattabs{overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none}
+  .cattabs::-webkit-scrollbar{display:none}
+  .cwheels{gap:12px}
+  .cwheel{width:74px;height:74px}
+}
+/* màn rất rộng: giới hạn cột phải cho cân */
+@media (min-width:1800px){
+  .mid{grid-template-columns:340px 1fr 400px}
+}
