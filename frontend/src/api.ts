@@ -12,6 +12,8 @@ export type MediaItem = { name: string; url: string; info: MediaInfo };
 
 export type JobOutput = { name: string; url: string; size: number };
 
+export type BatchResult = { file: string; name: string; ok: boolean; dest?: string; error?: string };
+
 export type Job = {
   id: string;
   type: string;
@@ -22,6 +24,10 @@ export type Job = {
   outputs: JobOutput[];
   error: string | null;
   created: number;
+  batch_results?: BatchResult[];
+  batch_path?: string;
+  batch_steps?: { type: string; params: Record<string, unknown> }[];
+  lane?: string;
 };
 
 export type Health = {
@@ -214,8 +220,13 @@ export async function deleteTemplate(name: string): Promise<void> {
   await fetch(`/api/templates/${encodeURIComponent(name)}`, { method: "DELETE" });
 }
 
+export type WatchRule = {
+  enabled: boolean; path: string; recursive: boolean; steps: PipeStepT[]; name?: string;
+};
+
 export type WatchCfg = {
   enabled: boolean; path: string; recursive: boolean; steps: PipeStepT[];
+  rules: WatchRule[];
   schedule_enabled: boolean; schedule_time: string; processed: number; last_scan: number;
 };
 

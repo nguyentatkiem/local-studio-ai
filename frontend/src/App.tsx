@@ -26,6 +26,7 @@ const TOOL_CATS: Record<string, ToolCat> = {
   enhance: "edit", retouch: "edit", voicefx: "audio",
   autopilot: "ai", script_video: "ai", post_pack: "ai",
   scene_split: "edit", punchin: "edit", multi_translate: "ai",
+  compress: "edit", multi_export: "pub", organize: "ai",
   merge: "edit", beatsync: "edit", silence_cut: "edit", upscale: "edit",
   rife: "edit", bg_remove: "edit", reframe: "edit", speed: "edit", color: "edit",
   grade: "edit", track: "edit", stabilize: "edit", face_blur: "edit", brand: "edit",
@@ -50,6 +51,7 @@ const FEAT_KEY: Record<string, string> = {
   voicefx: "voicefx", enhance: "enhance", filler_cut: "filler_cut", retouch: "retouch",
   autopilot: "autopilot", script_video: "script_video", post_pack: "post_pack",
   scene_split: "scene_split", punchin: "punchin", multi_translate: "multi_translate",
+  compress: "compress", multi_export: "multi_export", organize: "organize",
   reframe: "ffmpeg", speed: "ffmpeg", color: "ffmpeg", music: "ffmpeg",
   stabilize: "ffmpeg", merge: "ffmpeg", audio_enhance: "ffmpeg",
   brand: "ffmpeg", audiogram: "ffmpeg",
@@ -133,7 +135,8 @@ type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" |
   | "translate" | "social_pack" | "dub" | "qc" | "script" | "thumbnail"
   | "grade" | "track" | "clipsearch" | "folder" | "pipeline"
   | "autoframe" | "voicefx" | "enhance" | "filler_cut" | "retouch"
-  | "autopilot" | "script_video" | "post_pack" | "scene_split" | "punchin" | "multi_translate";
+  | "autopilot" | "script_video" | "post_pack" | "scene_split" | "punchin" | "multi_translate"
+  | "compress" | "multi_export" | "organize";
 
 // Lớp phủ multi-track (đè lên video nền theo mốc thời gian)
 type Layer = {
@@ -177,7 +180,10 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "script_video", icon: "🎥", name: "Kịch bản → Video (Script-to-Video)", desc: "gõ chủ đề → AI chia cảnh + đọc lời + B-roll → video hoàn chỉnh", gpu: true },
   { key: "post_pack", icon: "📦", name: "Gói đăng bài 1 chạm", desc: "video + thumbnail AI + caption/hashtags + srt → 1 file .zip", gpu: true },
   { key: "pipeline", icon: "🔗", name: "Chuỗi tự động (nối nhiều bước)", desc: "xếp nhiều tính năng chạy nối tiếp trên 1 video", gpu: false },
-  { key: "folder", icon: "📁", name: "Edit hàng loạt cả THƯ MỤC", desc: "trỏ vào folder trong ổ cứng → chạy chuỗi bước cho mọi video", gpu: false },
+  { key: "folder", icon: "📁", name: "Edit hàng loạt cả THƯ MỤC", desc: "lọc thông minh · tăng dần · thư mục nóng · lịch đêm", gpu: false },
+  { key: "compress", icon: "🗜", name: "Nén dọn ổ cứng", desc: "giảm 50-80% dung lượng, GPU nhanh — chạy cả kho", gpu: false },
+  { key: "multi_export", icon: "📤", name: "Xuất đa phiên bản 1 lần", desc: "TikTok + YouTube + 1:1 + 4:5 cùng lúc", gpu: false },
+  { key: "organize", icon: "🏷", name: "AI đặt tên + gom kho", desc: "IMG_1234 → tên có nghĩa · gom thư mục theo chủ đề", gpu: true },
   { key: "viral", icon: "🔥", name: "Phụ đề Viral 1 chạm", desc: "nhận dạng → tách cụm → cháy preset viral + chuẩn âm", gpu: true },
   { key: "director", icon: "🎬", name: "Đạo diễn AI (Claude)", desc: "ra lệnh bằng lời — Claude tự xếp job", gpu: false },
   { key: "highlights", icon: "🎯", name: "AI cắt Shorts từ video dài", desc: "AI chọn khoảnh khắc → shorts 9:16", gpu: true },
@@ -483,6 +489,16 @@ export default function App() {
   const [vfxFx, setVfxFx] = useState("deep");
   const [enhMode, setEnhMode] = useState("natural");
   const [rtStr, setRtStr] = useState(1.0);
+  // Batch thế hệ 2
+  const [cpMode, setCpMode] = useState("medium");
+  const [mePresets, setMePresets] = useState<string[]>(["tiktok", "youtube"]);
+  const [ogRename, setOgRename] = useState(true);
+  const [ogGroup, setOgGroup] = useState(true);
+  const [fdInc, setFdInc] = useState(true);
+  const [ftOri, setFtOri] = useState("any");
+  const [ftSpeech, setFtSpeech] = useState("any");
+  const [ftMinDur, setFtMinDur] = useState("");
+  const [ftMinMb, setFtMinMb] = useState("");
   // Wave automation: autopilot / script-to-video / gói đăng / tách cảnh / punch-in / đa ngữ
   const [apTarget, setApTarget] = useState("tiktok");
   const [svText, setSvText] = useState("");
@@ -859,7 +875,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v2.3 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v2.4 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -2456,6 +2472,85 @@ export default function App() {
                 </>
               )}
 
+              {tool === "compress" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🗜 Giảm dung lượng thông minh (GPU encode). Bật "Chọn nhiều" chạy
+                    cả loạt, hoặc dùng trong 📁 Edit thư mục / 🔥 thư mục nóng để dọn cả kho.
+                  </div>
+                  <div className="field"><label>Mức nén</label>
+                    <div className="seg">
+                      {[["light", "Nhẹ (giữ nét)"], ["medium", "Vừa (cap 1080p)"], ["strong", "Mạnh (cap 720p)"]].map(([v, l]) => (
+                        <button key={v} className={cpMode === v ? "on" : ""} onClick={() => setCpMode(v)}>{l}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="hint">File đã tối ưu sẵn sẽ được GIỮ NGUYÊN (không nén cho xấu đi vô ích).
+                    Báo cáo % tiết kiệm hiện ở kết quả job.</div>
+                  <button className="btn pri big" onClick={() => run("compress", { mode: cpMode })}>
+                    🗜 Nén gọn
+                  </button>
+                </>
+              )}
+
+              {tool === "multi_export" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    📤 1 video → NHIỀU khung hình cùng lúc, khỏi chạy đi chạy lại.
+                    Kết hợp "Chọn nhiều" = cả lô × cả bộ khung.
+                  </div>
+                  <div className="field"><label>Chọn các khung xuất</label>
+                    <div className="segchips">
+                      {[["tiktok", "📱 TikTok 9:16"], ["youtube", "🖥 YouTube"], ["square", "⬜ 1:1"], ["reels45", "📰 4:5"]].map(([v, l]) => (
+                        <button key={v} className={"btn sm" + (mePresets.includes(v) ? " pri" : "")}
+                          onClick={() => setMePresets((ls) => ls.includes(v) ? ls.filter((x) => x !== v) : [...ls, v])}>{l}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <button className="btn pri big" disabled={mePresets.length === 0}
+                    onClick={() => run("multi_export", { presets: mePresets })}>
+                    📤 Xuất {mePresets.length} phiên bản
+                  </button>
+                </>
+              )}
+
+              {tool === "organize" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🏷 AI nghe 12s đầu mỗi file → đặt tên có nghĩa (IMG_1234 →
+                    <code> gioi-thieu-san-pham.mp4</code>) + gom vào thư mục con theo chủ đề.
+                    File không lời thoại → CLIP nhìn hình đoán chủ đề. Có báo cáo mapping cũ→mới.
+                  </div>
+                  <div className="field"><label>Thư mục cần dọn (tuyệt đối)</label>
+                    <input className="lytext" style={{ width: "100%", maxWidth: "none" }}
+                      placeholder="/Users/ban/Movies/kho-quay-tho" value={fdPath}
+                      onChange={(e) => setFdPath(e.target.value)} />
+                  </div>
+                  <div className="optrow">
+                    <label className="chk"><input type="checkbox" checked={ogRename} onChange={(e) => setOgRename(e.target.checked)} />Đổi tên theo nội dung</label>
+                    <label className="chk"><input type="checkbox" checked={ogGroup} onChange={(e) => setOgGroup(e.target.checked)} />Gom thư mục theo chủ đề</label>
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <div className="hint">⚠ Thao tác đổi tên TRỰC TIẾP trong thư mục của bạn (không xoá gì,
+                    không đè file). Báo cáo mapping giúp tra ngược khi cần.</div>
+                  <button className="btn pri big" disabled={!fdPath.trim() || (!ogRename && !ogGroup)}
+                    onClick={async () => {
+                      try {
+                        await createJob("organize", "", { path: fdPath.trim(), rename: ogRename, group: ogGroup, ai: aiEngine });
+                        setJobs(await getJobs()); setRightTab("jobs");
+                        showToast("🏷 AI đang dọn kho...");
+                      } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                    }}>🏷 Dọn kho bằng AI</button>
+                </>
+              )}
+
               {tool === "autopilot" && (
                 <>
                   <div className="hint" style={{ marginBottom: 10 }}>
@@ -2698,14 +2793,40 @@ export default function App() {
                       ))}
                     </div>
                   )}
+                  <div className="field" style={{ marginTop: 6 }}><label>🎯 Lọc thông minh (chỉ xử lý file khớp)</label>
+                    <div className="segchips">
+                      <div className="seg sm">
+                        {[["any", "Mọi khung"], ["landscape", "Chỉ NGANG"], ["portrait", "Chỉ DỌC"]].map(([v, l]) => (
+                          <button key={v} className={ftOri === v ? "on" : ""} onClick={() => setFtOri(v)}>{l}</button>))}
+                      </div>
+                      <div className="seg sm">
+                        {[["any", "Tiếng: mọi"], ["yes", "Có tiếng"], ["no", "Im lặng"]].map(([v, l]) => (
+                          <button key={v} className={ftSpeech === v ? "on" : ""} onClick={() => setFtSpeech(v)}>{l}</button>))}
+                      </div>
+                      <input className="lytext" style={{ maxWidth: 92 }} placeholder="dài ≥ (s)"
+                        value={ftMinDur} onChange={(e) => setFtMinDur(e.target.value)} />
+                      <input className="lytext" style={{ maxWidth: 92 }} placeholder="nặng ≥ MB"
+                        value={ftMinMb} onChange={(e) => setFtMinMb(e.target.value)} />
+                    </div>
+                  </div>
+                  <label className="chk"><input type="checkbox" checked={fdInc} onChange={(e) => setFdInc(e.target.checked)} />
+                    ⚡ Tăng dần — bỏ qua file đã xử lý lần trước (hủy giữa chừng → chạy lại là TIẾP TỤC)</label>
                   <div className="hint">⚙ Tham số từng bước chỉnh trong tool 🔗 Chuỗi tự động (dùng chung danh sách bước).
-                    File lỗi tự bỏ qua — cuối job có báo cáo chi tiết.</div>
+                    File lỗi tự bỏ qua — xem ✅/❌ từng file ở Hàng đợi, bấm 1 nút chạy lại chỗ lỗi.</div>
                   <button className="btn pri big" disabled={!fdScan || fdScan.files.length === 0 || pipe.length === 0}
                     onClick={async () => {
                       try {
-                        await createJob("folder_batch", "", { path: fdPath.trim(), recursive: fdRec, steps: pipe });
+                        const filters: Record<string, unknown> = {};
+                        if (ftOri !== "any") filters.orientation = ftOri;
+                        if (ftSpeech !== "any") filters.speech = ftSpeech;
+                        if (parseFloat(ftMinDur) > 0) filters.min_dur = parseFloat(ftMinDur);
+                        if (parseFloat(ftMinMb) > 0) filters.min_mb = parseFloat(ftMinMb);
+                        await createJob("folder_batch", "", {
+                          path: fdPath.trim(), recursive: fdRec, steps: pipe,
+                          incremental: fdInc, filters,
+                        });
                         setJobs(await getJobs()); setRightTab("jobs");
-                        showToast(`📁 Đang xử lý ${fdScan!.files.length} file — kết quả vào LocalStudio_Xuat`);
+                        showToast(`📁 Đang xử lý — kết quả vào LocalStudio_Xuat`);
                       } catch (e) { showToast("❌ " + String((e as Error).message)); }
                     }}>
                     📁 Chạy {fdScan ? fdScan.files.length : 0} file × {pipe.length} bước
@@ -2756,6 +2877,40 @@ export default function App() {
                       </button>
                       {watchCfg?.enabled && <span className="tllab">{watchCfg.path}</span>}
                     </div>
+                  </div>
+
+                  {(watchCfg?.rules?.length ?? 0) > 0 && (
+                    <div className="field" style={{ marginTop: 4 }}>
+                      <label>🔥 Các thư mục nóng khác (mỗi cái 1 chuỗi riêng)</label>
+                      <div className="statgrid">
+                        {watchCfg!.rules.map((r, i) => (
+                          <div key={i} className="statrow" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                            <button className={"btn sm" + (r.enabled ? " pri" : "")}
+                              onClick={async () => {
+                                const rules = watchCfg!.rules.map((x, j) => j === i ? { ...x, enabled: !x.enabled } : x);
+                                setWatchCfg(await setWatch({ rules }));
+                              }}>{r.enabled ? "BẬT" : "tắt"}</button>
+                            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}
+                              title={r.path}>{r.name || r.path.split("/").pop()} · {r.steps.length} bước</span>
+                            <button className="btn sm" style={{ color: "var(--warn)" }}
+                              onClick={async () => {
+                                const rules = watchCfg!.rules.filter((_, j) => j !== i);
+                                setWatchCfg(await setWatch({ rules }));
+                              }}>✕</button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  <div className="segchips" style={{ marginTop: 4 }}>
+                    <button className="btn sm" disabled={!fdPath.trim() || pipe.length === 0}
+                      onClick={async () => {
+                        const rules = [...(watchCfg?.rules || []),
+                          { enabled: true, path: fdPath.trim(), recursive: fdRec, steps: pipe,
+                            name: fdPath.trim().split("/").pop() || "rule" }];
+                        setWatchCfg(await setWatch({ rules }));
+                        showToast("➕ Đã thêm thư mục nóng phụ (đường dẫn + chuỗi hiện tại)");
+                      }}>➕ Thêm thư mục nóng PHỤ với chuỗi hiện tại</button>
                   </div>
 
                   <div className="field" style={{ marginTop: 4 }}>
@@ -3102,6 +3257,32 @@ export default function App() {
                     </div>
                   )}
                   <div className="jmsg">{j.status === "error" ? j.error : j.message}</div>
+                  {(j.batch_results?.length ?? 0) > 0 && (
+                    <div className="bres">
+                      {j.batch_results!.map((r, ri) => (
+                        <div key={ri} className={"bres-row" + (r.ok ? "" : " bad")}
+                          title={r.ok ? r.dest : r.error}>
+                          {r.ok ? "✅" : "❌"} {r.name}{r.ok ? "" : ` — ${(r.error || "").slice(0, 60)}`}
+                        </div>
+                      ))}
+                      {j.status !== "running" && j.batch_results!.some((r) => !r.ok) && j.batch_path && (
+                        <button className="btn sm pri" style={{ marginTop: 6 }}
+                          onClick={async () => {
+                            const failed = j.batch_results!.filter((r) => !r.ok).map((r) => r.file);
+                            try {
+                              await createJob("folder_batch", "", {
+                                path: j.batch_path, steps: j.batch_steps || [],
+                                only_files: failed,
+                              });
+                              setJobs(await getJobs());
+                              showToast(`🔁 Chạy lại ${failed.length} file lỗi`);
+                            } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                          }}>
+                          🔁 Chạy lại {j.batch_results!.filter((r) => !r.ok).length} file lỗi
+                        </button>
+                      )}
+                    </div>
+                  )}
                   {j.outputs.length > 0 && (
                     <div className="jouts">
                       {j.outputs.map((o) => (

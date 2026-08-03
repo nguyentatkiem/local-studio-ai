@@ -1,8 +1,8 @@
 # 🎬 Local Studio — AI Video Editor chạy 100% trên máy
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.3.0-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-60-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-2.4.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-63-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/cloud-0%25-FF6B57?style=for-the-badge" alt="no cloud">
   <img src="https://img.shields.io/badge/watermark-kh%C3%B4ng-7ACB6B?style=for-the-badge" alt="no watermark">
 </p>
@@ -28,7 +28,7 @@
 > 🌐 **Phát hành web tạm qua Cloudflare Tunnel:** xem `DEPLOY-WEB.md`.
 > 🎯 **Track đối tượng SAM 2** cần thêm: `pip install ultralytics` · **Tìm cảnh CLIP** cần: `pip install open_clip_torch` (trong venv backend).
 
-## ✨ 60 tính năng (v2.1)
+## ✨ 63 tính năng (v2.4)
 
 ### 🤖 Tự động hoá TỐI ĐA (không editor nào có đủ bộ này)
 | Tính năng | Mô tả |
@@ -39,6 +39,11 @@
 | ⏰ **Lịch chạy đêm** | tự chạy batch cả thư mục mỗi ngày đúng giờ |
 | 📦 **Gói đăng bài** | video + thumbnail AI + caption + srt → 1 file .zip |
 | 🧩 **Template chuỗi** | lưu chuỗi bước đặt tên, áp 1 chạm |
+| ⚡ **Batch tăng dần + resume** | chạy lại chỉ làm file MỚI; hủy giữa chừng → tiếp tục đúng chỗ |
+| 🎯 **Lọc thông minh** | chỉ xử lý file khớp: ngang/dọc · dài ≥s · nặng ≥MB · có tiếng/im lặng |
+| 🔁 **Chạy lại file lỗi 1 nút** | ✅/❌ từng file ngay trong Hàng đợi |
+| 🗜 **Nén dọn ổ cứng** · 📤 **xuất đa phiên bản** · 🏷 **AI đặt tên + gom kho** (nghe + CLIP nhìn) | |
+| 🔥 **Nhiều thư mục nóng** — mỗi folder 1 chuỗi riêng · 🚦 hàng đợi 2 làn (job nhanh không chờ job nặng) | |
 | 📲 **Nhận video từ iPhone** | Apple Shortcuts share → tự xử lý qua Wi-Fi |
 | 🎬 Tách cảnh tự động · 🔍 Auto punch-in theo câu · 🌏 Dịch đa ngữ 1 chạm (6 thứ tiếng/job) | |
 

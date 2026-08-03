@@ -545,6 +545,14 @@ def _job_wrapper(job_id: str, fn, *args):
             JOB_PROCS.pop(job_id, None)
 
 
+# Hàng đợi 2 làn: job NHANH (thuần ffmpeg, giờ chạy GPU vài giây) có làn riêng —
+# không phải xếp sau job AI nặng (SAM2/whisper/upscale chạy nhiều phút)
+FAST_TYPES = {"color", "speed", "export", "enhance", "voicefx", "grade", "cutlist",
+              "reframe", "stabilize", "music", "audio_enhance", "brand", "compress",
+              "multi_export", "scene_split", "audiogram", "merge"}
+FAST_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
+
 def submit_job(jtype: str, input_name: str, fn, *args) -> dict:
     job_id = uuid.uuid4().hex[:10]
     job = {
@@ -552,11 +560,13 @@ def submit_job(jtype: str, input_name: str, fn, *args) -> dict:
         "status": "queued", "progress": 0, "message": "Đang chờ...",
         "outputs": [], "error": None, "created": time.time(),
         "started": None, "finished": None,
+        "lane": "fast" if jtype in FAST_TYPES else "heavy",
     }
     with JOBS_LOCK:
         JOBS[job_id] = job
     with _EXEC_LOCK:  # submit trong lock → executor không bị swap+shutdown giữa chừng
-        EXECUTOR.submit(_job_wrapper, job_id, fn, *args)
+        (FAST_EXECUTOR if jtype in FAST_TYPES else EXECUTOR).submit(
+            _job_wrapper, job_id, fn, *args)
     return job
 
 
@@ -2355,6 +2365,62 @@ def job_retouch(job_id: str, src: Path, strength: float = 1.0):
         shutil.move(str(out_v), str(out))
     _set(job_id, message=f"Xong — làm mịn da, {faces_n} lượt bám mặt trên {i} khung")
     return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: nén dọn ổ cứng
+COMPRESS_MODES = {
+    # mode: (crf, trần chiều cao, nhãn)
+    "light": (23, 0, "Nhẹ — gần như không đổi chất lượng"),
+    "medium": (26, 1080, "Vừa — cap 1080p"),
+    "strong": (28, 720, "Mạnh — cap 720p, gọn tối đa"),
+}
+
+
+def job_compress(job_id: str, src: Path, p: dict):
+    """Nén dọn ổ cứng: giảm dung lượng thông minh (GPU encode nhanh), báo cáo
+    tiết kiệm được bao nhiêu. Dùng hàng loạt cho cả kho quay thô."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình")
+    dur = info["duration"] or 1
+    mode = p.get("mode") if p.get("mode") in COMPRESS_MODES else "medium"
+    crf, cap_h, label = COMPRESS_MODES[mode]
+    before = src.stat().st_size
+    vf = []
+    if cap_h and info["height"] > cap_h:
+        vf = ["-vf", f"scale=-2:{cap_h}"]
+    out = unique_out(f"{src.stem}_nen", ".mp4")
+    _set(job_id, message=f"Nén ({label})...")
+    args = ["-i", str(src)] + vf + \
+           ["-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-c:a", "aac", "-b:a", "128k", str(out)]
+    run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
+    after = out.stat().st_size
+    if after >= before * 0.97:  # không lợi gì → giữ gốc, đừng lừa người dùng
+        out.unlink(missing_ok=True)
+        raise RuntimeError(f"File đã tối ưu sẵn ({before / 1e6:.0f}MB) — nén thêm "
+                           "không lợi, giữ nguyên bản gốc")
+    _set(job_id, message=f"Xong — {before / 1e6:.0f}MB → {after / 1e6:.0f}MB "
+         f"(tiết kiệm {(1 - after / before) * 100:.0f}%)")
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: xuất đa phiên bản
+def job_multi_export(job_id: str, src: Path, p: dict):
+    """1 video → nhiều khung hình cùng lúc (TikTok 9:16 + YouTube + 1:1 + 4:5)."""
+    presets = [x for x in (p.get("presets") or []) if x in ("tiktok", "youtube", "square", "reels45")]
+    if not presets:
+        raise RuntimeError("Chọn ít nhất 1 khung xuất")
+    outputs = []
+    for i, pr in enumerate(presets):
+        _cancel_point(job_id)
+        _set(job_id, progress=int(i / len(presets) * 100),
+             message=f"[{i + 1}/{len(presets)}] Xuất {pr}...")
+        outs = job_export(job_id, src, pr)
+        outputs.extend(outs)
+    _set(job_id, message=f"Xong — {len(presets)} phiên bản: " + ", ".join(presets))
+    return outputs
 
 
 # ---------------------------------------------------------------- job: cutlist (cắt trên timeline)
@@ -5069,7 +5135,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -5096,6 +5162,9 @@ def health():
             "composite": ffmpeg_ok,
             "folder": ffmpeg_ok,
             "autopilot": ffmpeg_ok,
+            "compress": ffmpeg_ok,
+            "multi_export": ffmpeg_ok,
+            "organize": ffmpeg_ok and (llm_available() or claude_available()),
             "script_video": pexels_available() and piper_available()
             and (llm_available() or claude_available()) and ffmpeg_ok,
             "post_pack": whisper_ok and ffmpeg_ok,
@@ -5214,6 +5283,8 @@ def _run_step(job_id: str, jtype: str, src: Path, p: dict) -> Path:
         outs = job_cutlist(job_id, src, dict(p))
     elif jtype == "enhance":
         outs = job_enhance(job_id, src, dict(p))
+    elif jtype == "compress":
+        outs = job_compress(job_id, src, dict(p))
     elif jtype == "voicefx":
         outs = job_voicefx(job_id, src, dict(p))
     elif jtype == "autoframe":
@@ -5282,7 +5353,7 @@ PIPELINE_STEP_TYPES = {
     "silence_cut", "speed", "color", "grade", "cutlist", "stabilize", "reframe",
     "rife", "upscale", "bg_remove", "audio_enhance", "face_blur", "brand",
     "export", "transcribe", "viral_caption", "broll", "music",
-    "enhance", "voicefx", "autoframe", "filler_cut", "retouch",
+    "enhance", "voicefx", "autoframe", "filler_cut", "retouch", "compress",
 }
 
 
@@ -5333,6 +5404,7 @@ STEP_LABELS = {
     "filler_cut": "cắt từ đệm", "retouch": "mịn da", "punchin": "punch-in",
     "autopilot": "AutoPilot", "scene_split": "tách cảnh",
     "multi_translate": "dịch đa ngữ", "post_pack": "gói đăng bài",
+    "compress": "nén gọn", "multi_export": "xuất đa bản", "organize": "gom kho AI",
     "stabilize": "chống rung", "reframe": "khung 9:16", "rife": "nội suy",
     "upscale": "upscale", "bg_remove": "tách nền", "audio_enhance": "chuẩn âm",
     "face_blur": "che mặt", "brand": "logo/tiêu đề", "export": "xuất preset",
@@ -5368,6 +5440,14 @@ def create_job(req: JobRequest):
         if not llm_available() and not claude_available():
             raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm để viết kịch bản")
         return submit_job("script_video", "🎬 kịch bản → video", job_script_video, dict(p))
+
+    if req.type == "organize":  # AI đặt tên + gom kho — chạy trên thư mục ổ cứng
+        d = Path(str(p.get("path") or "").strip()).expanduser()
+        if not d.is_absolute() or not d.is_dir():
+            raise HTTPException(400, "Đường dẫn không phải thư mục có thật trên máy")
+        if not llm_available() and not claude_available():
+            raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm để đặt tên")
+        return submit_job("organize", f"🏷 {d.name}", job_organize, dict(p))
 
     if req.type == "folder_batch":  # edit hàng loạt cả thư mục ổ cứng — không cần file trong kho
         d = Path(str(p.get("path") or "").strip()).expanduser()
@@ -5482,6 +5562,10 @@ def create_job(req: JobRequest):
         if not whisper_available_any():
             raise HTTPException(400, "Cần whisper để bắt nhịp câu nói")
         return submit_job("punchin", src.name, job_punchin, src, dict(p))
+    if req.type == "compress":
+        return submit_job("compress", src.name, job_compress, src, dict(p))
+    if req.type == "multi_export":
+        return submit_job("multi_export", src.name, job_multi_export, src, dict(p))
     if req.type == "multi_translate":
         if not whisper_available_any():
             raise HTTPException(400, "Cần whisper để nhận dạng lời nói")
@@ -5675,6 +5759,8 @@ DIRECTOR_CATALOG = """\
 - multi_translate: 1 video → nhiều bản hardsub. params: langs(mảng mã: en/zh/ja/ko/th/fr/es/de/id/pt/ru)
 - post_pack: gói đăng bài .zip (thumbnail + caption + srt + video). params: model
 - enhance: đẹp màu 1 chạm (tự cân bằng trắng + vibrance). params: mode(natural/vivid)
+- compress: nén gọn dung lượng (GPU nhanh). params: mode(light/medium/strong)
+- multi_export: xuất nhiều khung 1 lần. params: presets(mảng: tiktok/youtube/square/reels45)
 - voicefx: đổi giọng. params: effect(chipmunk/deep/robot/phone/echo/cave)
 - autoframe: auto reframe BÁM CHỦ THỂ (AI dò mặt, crop dọc lia theo người). params: ratio(916/11/45)
 - filler_cut: tự cắt từ đệm ừm/à/uh khỏi video. params: model(tiny/base/small)
@@ -5999,9 +6085,47 @@ def _process_file_steps(job_id: str, f: Path, steps: list, outdir: Path) -> Path
         raise
 
 
+def _batch_key(f: Path) -> str:
+    st = f.stat()
+    return f"{f}|{st.st_size}|{int(st.st_mtime)}"
+
+
+def _match_filters(job_id: str, f: Path, filt: dict) -> bool:
+    """Lọc thông minh trước khi xử lý: hướng khung / thời lượng / dung lượng / có tiếng."""
+    if not filt:
+        return True
+    info = media_info(f)
+    ori = filt.get("orientation")
+    if ori in ("landscape", "portrait") and info["width"] and info["height"]:
+        is_land = info["width"] >= info["height"]
+        if (ori == "landscape") != is_land:
+            return False
+    dur = info["duration"] or 0
+    if _safe_float(filt.get("min_dur"), 0) > 0 and dur < _safe_float(filt.get("min_dur"), 0):
+        return False
+    if _safe_float(filt.get("max_dur"), 0) > 0 and dur > _safe_float(filt.get("max_dur"), 0):
+        return False
+    if _safe_float(filt.get("min_mb"), 0) > 0 \
+            and f.stat().st_size < _safe_float(filt.get("min_mb"), 0) * 1e6:
+        return False
+    sp = filt.get("speech")
+    if sp in ("yes", "no"):
+        loud = False
+        if info["has_audio"]:  # đo nhanh 60s đầu — coi có âm > -45dB là "có tiếng"
+            r = _run_tracked(job_id, [FFMPEG_BIN, "-hide_banner", "-nostats",
+                                      "-t", "60", "-i", str(f), "-vn",
+                                      "-af", "volumedetect", "-f", "null", "-"])
+            m = re.search(r"mean_volume:\s*(-?[\d.]+)", r.stderr_text or "")
+            loud = bool(m and float(m.group(1)) > -45)
+        if (sp == "yes") != loud:
+            return False
+    return True
+
+
 def job_folder_batch(job_id: str, p: dict):
-    """Edit hàng loạt cả THƯ MỤC trong ổ cứng: chạy chuỗi bước cho từng file media,
-    kết quả xuất vào <thư mục>/LocalStudio_Xuat. File lỗi bỏ qua, có báo cáo."""
+    """Edit hàng loạt cả THƯ MỤC: chạy chuỗi bước cho từng file media → LocalStudio_Xuat.
+    Tăng dần (bỏ file đã xử lý — hủy giữa chừng chạy lại là TIẾP TỤC đúng chỗ),
+    lọc thông minh, chạy lại danh sách file lỗi (only_files), kết quả có cấu trúc."""
     d = Path(str(p.get("path") or "").strip()).expanduser()
     if not d.is_absolute() or not d.is_dir():
         raise RuntimeError("Đường dẫn không phải thư mục có thật trên máy")
@@ -6009,28 +6133,51 @@ def job_folder_batch(job_id: str, p: dict):
              if isinstance(s, dict) and s.get("type") in PIPELINE_STEP_TYPES][:8]
     if not steps:
         raise RuntimeError("Chưa xếp bước nào — thêm ít nhất 1 bước xử lý")
-    files = _folder_scan(d, bool(p.get("recursive")))
+    only = [Path(x) for x in (p.get("only_files") or []) if isinstance(x, str)]
+    if only:  # chế độ CHẠY LẠI file lỗi: danh sách chỉ định, phải nằm trong thư mục
+        files = [f for f in only if f.is_file()
+                 and str(f.resolve()).startswith(str(d.resolve()))]
+    else:
+        files = _folder_scan(d, bool(p.get("recursive")))
+    incremental = bool(p.get("incremental", True)) and not only
+    if incremental:
+        state = _watch_state()
+        skipped = sum(1 for f in files if _batch_key(f) in state)
+        files = [f for f in files if _batch_key(f) not in state]
+        if skipped:
+            _set(job_id, message=f"Tăng dần: bỏ qua {skipped} file đã xử lý trước đó")
+    filt = p.get("filters") if isinstance(p.get("filters"), dict) else {}
+    if filt and files:
+        _set(job_id, progress=1, message=f"Lọc thông minh {len(files)} file...")
+        files = [f for f in files if _match_filters(job_id, f, filt)]
     if not files:
-        raise RuntimeError(f"Không tìm thấy file media nào trong {d}")
+        raise RuntimeError("Không còn file nào cần xử lý (đã lọc/đã xử lý hết) 👍")
     outdir = d / FOLDER_OUT_NAME
     outdir.mkdir(exist_ok=True)
 
     chain = " → ".join(STEP_LABELS.get(s["type"], s["type"]) for s in steps)
-    ok, fail, lines = 0, 0, [f"Thư mục: {d}", f"Chuỗi bước: {chain}",
-                             f"Số file: {len(files)}", ""]
+    ok, fail, results = 0, 0, []
+    lines = [f"Thư mục: {d}", f"Chuỗi bước: {chain}", f"Số file: {len(files)}", ""]
     for i, f in enumerate(files):
         _cancel_point(job_id)
         _set(job_id, progress=int(i / len(files) * 100),
              message=f"[{i + 1}/{len(files)}] {f.name} — {chain}")
         try:
             dest = _process_file_steps(job_id, f, steps, outdir)
+            _watch_mark(_batch_key(f))  # đánh dấu NGAY → hủy giữa chừng vẫn resume đúng chỗ
             ok += 1
             lines.append(f"✅ {f.relative_to(d)}  →  {dest.name}")
+            results.append({"file": str(f), "name": f.name, "ok": True, "dest": dest.name})
         except JobCancelled:
+            _set(job_id, message=f"Đã hủy — {ok} file xong (chạy lại sẽ TIẾP TỤC từ chỗ dừng)")
             raise
         except Exception as e:  # noqa: BLE001 - 1 file hỏng không chặn cả lô
             fail += 1
             lines.append(f"❌ {f.relative_to(d)}  —  {str(e)[:160]}")
+            results.append({"file": str(f), "name": f.name, "ok": False,
+                            "error": str(e)[:200]})
+        _set(job_id, batch_results=results, batch_path=str(d),
+             batch_steps=steps)  # cập nhật dần để UI hiện ✅/❌ realtime
     report = unique_out(f"{d.name}_batch_baocao", ".txt")
     report.write_text("\n".join(lines) + f"\n\nXong: {ok} OK · {fail} lỗi\n",
                       encoding="utf-8")
@@ -6091,6 +6238,7 @@ def delete_template(name: str):
 WATCH_FILE = BACKEND_DIR / "watch_config.json"
 WATCH_STATE_FILE = WORKSPACE / "watch_state.json"
 WATCH_CFG = {"enabled": False, "path": "", "recursive": False, "steps": [],
+             "rules": [],   # nhiều thư mục nóng: [{enabled,path,recursive,steps,name}]
              "schedule_enabled": False, "schedule_time": "02:00"}
 _WATCH_LOCK = threading.Lock()
 _watch_pending: dict = {}      # path -> size lần quét trước (chờ file copy xong)
@@ -6144,19 +6292,14 @@ def job_watch_one(job_id: str, f: Path, steps: list, outdir: Path):
     return []
 
 
-def _watch_tick():
-    """1 nhịp quét thư mục nóng: file mới + ổn định (copy xong) → xếp job."""
-    with _WATCH_LOCK:
-        cfg = dict(WATCH_CFG)
-    if not (cfg["enabled"] and cfg["path"] and cfg["steps"]):
+def _watch_one_dir(path: str, recursive: bool, steps: list):
+    """Quét 1 thư mục nóng: file mới + ổn định (copy xong) → xếp job."""
+    d = Path(path).expanduser()
+    if not d.is_dir() or not steps:
         return
-    d = Path(cfg["path"]).expanduser()
-    if not d.is_dir():
-        return
-    _watch_stats["last_scan"] = time.time()
     state = _watch_state()
     outdir = d / FOLDER_OUT_NAME
-    for f in _folder_scan(d, bool(cfg["recursive"]))[:50]:
+    for f in _folder_scan(d, recursive)[:50]:
         try:
             stt = f.stat()
         except OSError:
@@ -6172,8 +6315,20 @@ def _watch_tick():
         _watch_mark(key)
         _watch_pending.pop(str(f), None)
         outdir.mkdir(exist_ok=True)
-        submit_job("watch", f"🔥 {f.name}", job_watch_one, f,
-                   list(cfg["steps"]), outdir)
+        submit_job("watch", f"🔥 {f.name}", job_watch_one, f, list(steps), outdir)
+
+
+def _watch_tick():
+    """Mỗi nhịp: quét thư mục nóng chính + MỌI rule phụ (mỗi folder 1 chuỗi riêng)."""
+    with _WATCH_LOCK:
+        cfg = dict(WATCH_CFG)
+        rules = [dict(r) for r in cfg.get("rules", [])]
+    _watch_stats["last_scan"] = time.time()
+    if cfg["enabled"] and cfg["path"] and cfg["steps"]:
+        _watch_one_dir(cfg["path"], bool(cfg["recursive"]), cfg["steps"])
+    for r in rules:
+        if r.get("enabled") and r.get("path") and r.get("steps"):
+            _watch_one_dir(r["path"], bool(r.get("recursive")), r["steps"])
 
 
 def _schedule_tick():
@@ -6213,6 +6368,7 @@ class WatchReq(BaseModel):
     path: Optional[str] = None
     recursive: Optional[bool] = None
     steps: Optional[list] = None
+    rules: Optional[list] = None
     schedule_enabled: Optional[bool] = None
     schedule_time: Optional[str] = None
 
@@ -6239,6 +6395,20 @@ def set_watch(req: WatchReq):
         if req.steps is not None:
             WATCH_CFG["steps"] = [s for s in req.steps if isinstance(s, dict)
                                   and s.get("type") in PIPELINE_STEP_TYPES][:8]
+        if req.rules is not None:  # nhiều thư mục nóng — mỗi cái 1 chuỗi riêng
+            clean = []
+            for r in req.rules[:10]:
+                if not isinstance(r, dict):
+                    continue
+                steps = [s for s in (r.get("steps") or []) if isinstance(s, dict)
+                         and s.get("type") in PIPELINE_STEP_TYPES][:8]
+                path = str(r.get("path") or "").strip()[:500]
+                if path and steps:
+                    clean.append({"enabled": bool(r.get("enabled", True)),
+                                  "path": path, "recursive": bool(r.get("recursive")),
+                                  "steps": steps,
+                                  "name": str(r.get("name") or "")[:40]})
+            WATCH_CFG["rules"] = clean
         if req.schedule_enabled is not None:
             WATCH_CFG["schedule_enabled"] = bool(req.schedule_enabled)
         if req.schedule_time is not None:
@@ -6297,6 +6467,164 @@ async def ingest(request: Request, file: UploadFile = File(...), token: str = ""
         submit_job("watch", f"📲 {dest.name}", job_watch_one, dest, steps, OUTPUTS)
         auto = True
     return {"ok": True, "saved": dest.name, "auto_processing": auto}
+
+
+# ---------------------------------------------------------------- job: AI đặt tên + gom kho
+CLIP_SCENE_LABELS = [  # (slug thư mục, mô tả EN cho CLIP zero-shot)
+    ("con-nguoi", "a person talking to the camera"),
+    ("phong-canh", "a landscape or nature scenery"),
+    ("san-pham", "a product close-up shot"),
+    ("do-an", "food or cooking"),
+    ("dong-vat", "an animal"),
+    ("xe-co", "a car or vehicle"),
+    ("man-hinh", "a computer screen recording or slides"),
+    ("trong-nha", "an indoor room scene"),
+    ("ngoai-troi", "an outdoor street or city scene"),
+]
+
+
+def _slugify(s: str, maxlen: int = 48) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFD", str(s))
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = s.replace("đ", "d").replace("Đ", "D")
+    s = re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-").lower()
+    return s[:maxlen].strip("-") or "video"
+
+
+def job_organize(job_id: str, p: dict):
+    """AI đặt tên + gom kho hàng loạt: nghe 12s đầu mỗi file → AI đặt tên có nghĩa
+    (slug không dấu); file không lời thoại → CLIP nhìn khung giữa đoán chủ đề.
+    Đổi tên/gom NGAY TRONG thư mục + báo cáo mapping cũ→mới để tra lại."""
+    d = Path(str(p.get("path") or "").strip()).expanduser()
+    if not d.is_absolute() or not d.is_dir():
+        raise RuntimeError("Đường dẫn không phải thư mục có thật trên máy")
+    do_rename = bool(p.get("rename", True))
+    do_group = bool(p.get("group", True))
+    if not (do_rename or do_group):
+        raise RuntimeError("Chọn ít nhất: đổi tên hoặc gom nhóm")
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+    files = _folder_scan(d, bool(p.get("recursive")))[:200]
+    if not files:
+        raise RuntimeError("Không có file media nào trong thư mục")
+
+    # 1) nghe nhanh 12s đầu từng file (nếu có tiếng)
+    heard = {}  # path -> transcript ngắn
+    for i, f in enumerate(files):
+        _cancel_point(job_id)
+        _set(job_id, progress=int(i / len(files) * 45),
+             message=f"[{i + 1}/{len(files)}] Nghe thử {f.name}...")
+        info = media_info(f)
+        if not info["has_audio"]:
+            continue
+        probe = TMP / f"org_{job_id}.wav"
+        r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                  "-t", "12", "-i", str(f), "-vn", "-ac", "1",
+                                  "-ar", "16000", str(probe)])
+        if r.returncode != 0:
+            continue
+        try:
+            segs, _l, _lg = _speech_recognize(job_id, probe, "tiny", None, None, 12, 0, 0)
+            text = " ".join(s.text.strip() for s in segs)[:220]
+            if len(text) >= 12:
+                heard[str(f)] = text
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            probe.unlink(missing_ok=True)
+
+    # 2) AI đặt tên theo LÔ 20 file/lần gọi (có thoại)
+    plans = {}  # path -> {"ten": slug, "chu_de": slug}
+    spoken = [f for f in files if str(f) in heard]
+    for bi in range(0, len(spoken), 20):
+        _cancel_point(job_id)
+        batch = spoken[bi:bi + 20]
+        _set(job_id, progress=46 + int(bi / max(1, len(spoken)) * 20),
+             message=f"AI đặt tên lô {bi // 20 + 1} ({len(batch)} file)...")
+        listing = "\n".join(f'{k}. tên cũ "{f.name}" — lời thoại: "{heard[str(f)]}"'
+                            for k, f in enumerate(batch))
+        prompt = (
+            "Đặt tên file video theo NỘI DUNG lời thoại (tiếng Việt không dấu, "
+            "dạng slug-gach-noi, 3-6 từ, ngắn gọn có nghĩa) và chủ đề (1-2 từ slug).\n"
+            f"{listing}\n\nTrả về DUY NHẤT JSON: "
+            '{"items": [{"i": <số>, "ten": "<slug>", "chu_de": "<slug>"}]}')
+        try:
+            data = _extract_json(llm_generate(prompt, max_tokens=1500,
+                                              job_id=job_id, engine=ai))
+            for it in (data.get("items") or []):
+                k = _safe_int(it.get("i"), -1)
+                if 0 <= k < len(batch):
+                    plans[str(batch[k])] = {"ten": _slugify(it.get("ten", "")),
+                                            "chu_de": _slugify(it.get("chu_de", "khac"), 24)}
+        except Exception:  # noqa: BLE001 - lô lỗi → các file đó giữ tên
+            pass
+
+    # 3) file KHÔNG lời thoại → CLIP zero-shot khung giữa (nếu có open_clip)
+    silent = [f for f in files if str(f) not in heard]
+    if silent and do_group and clip_available():
+        import numpy as np
+        import torch
+        from PIL import Image
+        model, preprocess, tok, dev = _clip_model()
+        with torch.no_grad():
+            te = model.encode_text(tok([lb for _s, lb in CLIP_SCENE_LABELS]).to(dev))
+            te = (te / te.norm(dim=-1, keepdim=True)).cpu().float().numpy()
+        for i, f in enumerate(silent):
+            _cancel_point(job_id)
+            _set(job_id, progress=68 + int(i / len(silent) * 15),
+                 message=f"CLIP nhìn {f.name}...")
+            info = media_info(f)
+            if not info["width"]:
+                continue
+            fr = TMP / f"org_{job_id}.jpg"
+            r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                      "-ss", f"{(info['duration'] or 2) / 2:.1f}",
+                                      "-i", str(f), "-frames:v", "1",
+                                      "-vf", "scale=256:256", str(fr)])
+            if r.returncode != 0 or not fr.exists():
+                continue
+            try:
+                with torch.no_grad():
+                    ie = model.encode_image(preprocess(Image.open(fr).convert("RGB"))
+                                            .unsqueeze(0).to(dev))
+                    ie = (ie / ie.norm(dim=-1, keepdim=True)).cpu().float().numpy()[0]
+                best = int(np.argmax(te @ ie))
+                plans.setdefault(str(f), {"ten": "", "chu_de": CLIP_SCENE_LABELS[best][0]})
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                fr.unlink(missing_ok=True)
+
+    # 4) áp dụng: đổi tên + gom thư mục con (không đè, có báo cáo hoàn tác)
+    _set(job_id, progress=86, message="Áp dụng đổi tên/gom nhóm...")
+    lines, moved = [f"Thư mục: {d}", ""], 0
+    for f in files:
+        pl = plans.get(str(f))
+        if not pl:
+            lines.append(f"= {f.name}  (giữ nguyên — không đủ dữ liệu)")
+            continue
+        new_name = (pl["ten"] + f.suffix.lower()) if (do_rename and pl["ten"]) else f.name
+        sub = d / pl["chu_de"] if (do_group and pl.get("chu_de")) else f.parent
+        sub.mkdir(exist_ok=True)
+        dest = sub / new_name
+        n = 1
+        while dest.exists() and dest != f:
+            dest = sub / f"{Path(new_name).stem}-{n}{f.suffix.lower()}"
+            n += 1
+        if dest == f:
+            lines.append(f"= {f.name}")
+            continue
+        try:
+            shutil.move(str(f), str(dest))
+            moved += 1
+            lines.append(f"✅ {f.relative_to(d)}  →  {dest.relative_to(d)}")
+        except OSError as e:
+            lines.append(f"❌ {f.name} — {e}")
+    report = unique_out(f"{d.name}_gomkho", ".txt")
+    report.write_text("\n".join(lines) + f"\n\nĐã xử lý: {moved}/{len(files)} file\n",
+                      encoding="utf-8")
+    _set(job_id, message=f"Xong — đặt tên/gom {moved}/{len(files)} file (báo cáo kèm mapping)")
+    return [out_entry(report)]
 
 
 # ---------------------------------------------------------------- Dự án lớp phủ (save/load)

@@ -526,3 +526,10 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;bac
 @media (min-width:1800px){
   .mid{grid-template-columns:340px 1fr 400px}
 }
+
+/* kết quả batch từng file trong Hàng đợi */
+.bres{margin-top:6px;background:var(--p2);border:1px solid var(--line);border-radius:8px;
+  padding:6px 8px;max-height:150px;overflow-y:auto}
+.bres-row{font-size:10.5px;color:var(--dim);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;padding:1px 0}
+.bres-row.bad{color:var(--warn)}

@@ -1,14 +1,25 @@
 # 📜 Nhật ký cập nhật — Local Studio
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.3.0-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-60-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-2.4.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-63-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/100%25-local--first-7ACB6B?style=for-the-badge" alt="local">
 </p>
 
 > **Local Studio** — trình dựng video AI chạy **100% trên máy bạn**. Không cloud, không credit, không watermark. Footage không bao giờ rời máy.
 
 ---
+
+## 📦 v2.4 — Hàng loạt thế hệ 2 · <sub>03/08/2026</sub>
+
+9 nâng cấp biến máy thành trạm xử lý kho video:
+
+- **⚡ Tăng dần + Resume** — chạy lại thư mục chỉ làm file mới/đổi; hủy giữa chừng → chạy lại TIẾP TỤC đúng chỗ.
+- **🎯 Lọc thông minh** — chỉ ngang/dọc, dài ≥s, nặng ≥MB, có tiếng/im lặng (dò tự động).
+- **🔁 Chạy lại file lỗi 1 nút** — ✅/❌ từng file realtime trong Hàng đợi.
+- **🗜 Nén dọn ổ cứng** (3 mức, tự giữ nguyên file đã tối ưu, báo % tiết kiệm) · **📤 Xuất đa phiên bản 1 lần**.
+- **🏷 AI đặt tên + gom kho** — nghe 12s đầu đặt tên có nghĩa; file im lặng CLIP nhìn hình đoán chủ đề; báo cáo mapping.
+- **🔥 Nhiều thư mục nóng** — mỗi folder 1 chuỗi riêng · **🚦 Hàng đợi 2 làn** — job nhanh không xếp sau job AI nặng.
 
 ## ⚡ v2.3 — Nhanh hơn trên MỌI tác vụ + Responsive · <sub>03/08/2026</sub>
 
