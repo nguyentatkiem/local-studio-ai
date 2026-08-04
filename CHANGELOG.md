@@ -1,14 +1,26 @@
 # 📜 Nhật ký cập nhật — Local Studio
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.4.0-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-63-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-2.5.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-73-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/100%25-local--first-7ACB6B?style=for-the-badge" alt="local">
 </p>
 
 > **Local Studio** — trình dựng video AI chạy **100% trên máy bạn**. Không cloud, không credit, không watermark. Footage không bao giờ rời máy.
 
 ---
+
+## 🌍 v2.5 — Học từ các editor số 1 thế giới · <sub>04/08/2026</sub>
+
+10 tính năng đinh của Descript/Opus/Submagic/Pictory/Runway/Clipchamp — bản local:
+
+- **📝 Sửa video bằng TRANSCRIPT** (Descript) — bấm chữ để gạch, video tự cắt; từ đệm đánh dấu đỏ sẵn.
+- **🎙 Studio Sound** (Descript) — DeepFilterNet khử ồn + vang: đo thật giảm **-48dB** tạp âm.
+- **📈 Điểm Viral 0–99** (Opus Clip) — hook/cảm xúc/năng lượng/nhịp cắt + gợi ý cải thiện.
+- **✨ Cắt theo MÔ TẢ** (ClipAnything) — CLIP nhìn hình + nghe năng lượng, chạy cả video KHÔNG lời.
+- **🔂 Xoá câu đọc hỏng** (Descript) — giữ lần đọc tốt nhất. **💥 SFX + zoom theo từ nhấn** (Submagic).
+- **🔗 Dán link bài viết → video** (Pictory) — test thật: Wikipedia "Cà phê" → video B-roll cà phê.
+- **🗣 Speaker Coach** (Clipchamp) · **🎞 Auto Montage** (Canva) · **🏢 Brand Kit** (Veed) · **🪄 XOÁ vật thể khỏi video** beta (Runway).
 
 ## 📦 v2.4 — Hàng loạt thế hệ 2 · <sub>03/08/2026</sub>
 

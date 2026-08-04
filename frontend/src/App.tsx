@@ -27,6 +27,8 @@ const TOOL_CATS: Record<string, ToolCat> = {
   autopilot: "ai", script_video: "ai", post_pack: "ai",
   scene_split: "edit", punchin: "edit", multi_translate: "ai",
   compress: "edit", multi_export: "pub", organize: "ai",
+  textedit: "ai", studio_sound: "audio", viral_score: "ai", emphasis: "edit",
+  retake_cut: "ai", coach: "ai", clip_prompt: "ai", montage: "edit", url_video: "ai",
   merge: "edit", beatsync: "edit", silence_cut: "edit", upscale: "edit",
   rife: "edit", bg_remove: "edit", reframe: "edit", speed: "edit", color: "edit",
   grade: "edit", track: "edit", stabilize: "edit", face_blur: "edit", brand: "edit",
@@ -52,6 +54,9 @@ const FEAT_KEY: Record<string, string> = {
   autopilot: "autopilot", script_video: "script_video", post_pack: "post_pack",
   scene_split: "scene_split", punchin: "punchin", multi_translate: "multi_translate",
   compress: "compress", multi_export: "multi_export", organize: "organize",
+  textedit: "textedit", studio_sound: "studio_sound", viral_score: "viral_score",
+  emphasis: "emphasis", retake_cut: "retake_cut", coach: "coach",
+  clip_prompt: "clip_prompt", montage: "montage", url_video: "url_video",
   reframe: "ffmpeg", speed: "ffmpeg", color: "ffmpeg", music: "ffmpeg",
   stabilize: "ffmpeg", merge: "ffmpeg", audio_enhance: "ffmpeg",
   brand: "ffmpeg", audiogram: "ffmpeg",
@@ -136,7 +141,9 @@ type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" |
   | "grade" | "track" | "clipsearch" | "folder" | "pipeline"
   | "autoframe" | "voicefx" | "enhance" | "filler_cut" | "retouch"
   | "autopilot" | "script_video" | "post_pack" | "scene_split" | "punchin" | "multi_translate"
-  | "compress" | "multi_export" | "organize";
+  | "compress" | "multi_export" | "organize"
+  | "textedit" | "studio_sound" | "viral_score" | "emphasis" | "retake_cut"
+  | "coach" | "clip_prompt" | "montage" | "url_video";
 
 // Lớp phủ multi-track (đè lên video nền theo mốc thời gian)
 type Layer = {
@@ -163,6 +170,11 @@ const PIPE_PALETTE: { type: string; label: string; def: Record<string, unknown> 
   { type: "filler_cut", label: "🧹 Cắt từ đệm", def: { model: "base" } },
   { type: "retouch", label: "💆 Mịn da", def: { strength: 1 } },
   { type: "voicefx", label: "🎭 Đổi giọng", def: { effect: "deep" } },
+  { type: "studio_sound", label: "🎙 Studio Sound", def: {} },
+  { type: "retake_cut", label: "🔂 Xoá retake", def: { model: "base" } },
+  { type: "emphasis", label: "💥 SFX+zoom từ nhấn", def: { zoom: true, sfx: true } },
+  { type: "compress", label: "🗜 Nén gọn", def: { mode: "medium" } },
+  { type: "brandkit", label: "🏢 Đóng dấu thương hiệu", def: {} },
   { type: "stabilize", label: "🧷 Chống rung", def: {} },
   { type: "reframe", label: "📐 Khung 9:16", def: { mode: "blur" } },
   { type: "rife", label: "🎞️ Nội suy mượt", def: { mode: "smooth" } },
@@ -179,6 +191,15 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "autopilot", icon: "🚀", name: "AutoPilot — Làm hết cho tôi", desc: "1 nút: AI tự dò → cắt lặng+ừm → đẹp màu → chuẩn âm → 9:16 → phụ đề", gpu: true },
   { key: "script_video", icon: "🎥", name: "Kịch bản → Video (Script-to-Video)", desc: "gõ chủ đề → AI chia cảnh + đọc lời + B-roll → video hoàn chỉnh", gpu: true },
   { key: "post_pack", icon: "📦", name: "Gói đăng bài 1 chạm", desc: "video + thumbnail AI + caption/hashtags + srt → 1 file .zip", gpu: true },
+  { key: "textedit", icon: "📝", name: "Sửa video bằng TRANSCRIPT", desc: "xoá chữ là video tự cắt — edit như sửa văn bản (Descript)", gpu: false },
+  { key: "studio_sound", icon: "🎙", name: "Studio Sound", desc: "khử ồn + khử vang — mic thường nghe như thu studio", gpu: false },
+  { key: "viral_score", icon: "📈", name: "Điểm Viral 0–99", desc: "chấm hook · cảm xúc · năng lượng + gợi ý cải thiện", gpu: false },
+  { key: "clip_prompt", icon: "✨", name: "Cắt theo MÔ TẢ (ClipAnything)", desc: "gõ 'các pha cười' → AI tìm cắt — cả video không lời", gpu: true },
+  { key: "retake_cut", icon: "🔂", name: "Xoá câu đọc hỏng (retake)", desc: "quay 1 câu 5 lần → giữ lần tốt nhất, cắt các lần hỏng", gpu: false },
+  { key: "emphasis", icon: "💥", name: "SFX + zoom theo từ nhấn", desc: "whoosh/pop/ding + punch-in đúng từ nhấn (Submagic)", gpu: false },
+  { key: "coach", icon: "🗣", name: "Speaker Coach", desc: "chấm tốc độ nói · từ đệm · khoảng dừng + góp ý", gpu: false },
+  { key: "url_video", icon: "🔗", name: "Dán LINK bài viết → Video", desc: "blog/bài báo → kịch bản → video hoàn chỉnh (Pictory)", gpu: true },
+  { key: "montage", icon: "🎞", name: "Auto Montage", desc: "chọn loạt ảnh/clip + nhạc → tự dựng video tổng hợp", gpu: false },
   { key: "pipeline", icon: "🔗", name: "Chuỗi tự động (nối nhiều bước)", desc: "xếp nhiều tính năng chạy nối tiếp trên 1 video", gpu: false },
   { key: "folder", icon: "📁", name: "Edit hàng loạt cả THƯ MỤC", desc: "lọc thông minh · tăng dần · thư mục nóng · lịch đêm", gpu: false },
   { key: "compress", icon: "🗜", name: "Nén dọn ổ cứng", desc: "giảm 50-80% dung lượng, GPU nhanh — chạy cả kho", gpu: false },
@@ -489,6 +510,23 @@ export default function App() {
   const [vfxFx, setVfxFx] = useState("deep");
   const [enhMode, setEnhMode] = useState("natural");
   const [rtStr, setRtStr] = useState(1.0);
+  // Wave editor số 1 thế giới
+  const [teWords, setTeWords] = useState<{ t: string; s: number; e: number; filler: boolean }[] | null>(null);
+  const [teDel, setTeDel] = useState<Set<number>>(new Set());
+  const [teBusy, setTeBusy] = useState(false);
+  const [ssMix, setSsMix] = useState(0);
+  const [empZoom, setEmpZoom] = useState(true);
+  const [empSfx, setEmpSfx] = useState(true);
+  const [cpPrompt, setCpPrompt] = useState("");
+  const [cpCount, setCpCount] = useState(3);
+  const [cpDur, setCpDur] = useState(12);
+  const [mtgPiece, setMtgPiece] = useState(2.4);
+  const [mtgMusic, setMtgMusic] = useState("");
+  const [mtgTarget, setMtgTarget] = useState("169");
+  const [uvUrl, setUvUrl] = useState("");
+  const [bkLogo, setBkLogo] = useState("");
+  const [bkSign, setBkSign] = useState("");
+  const [bkCorner, setBkCorner] = useState("br");
   // Batch thế hệ 2
   const [cpMode, setCpMode] = useState("medium");
   const [mePresets, setMePresets] = useState<string[]>(["tiktok", "youtube"]);
@@ -659,6 +697,7 @@ export default function App() {
     setCsTest(""); loadClaudeSettings();
     getIngestInfo().then(setIngest).catch(() => {});
     fetch("/api/perf").then((r) => r.json()).then((d) => setHwOn(!!d.hw)).catch(() => {});
+    fetch("/api/brand").then((r) => r.json()).then((b) => { setBkLogo(b.logo || ""); setBkCorner(b.corner || "br"); setBkSign(b.sign || ""); }).catch(() => {});
   }, [showSettings, loadClaudeSettings]);
   // nạp cấu hình thư mục nóng khi mở tool folder
   useEffect(() => { if (tool === "folder") { getWatch().then((w) => { setWatchCfg(w); if (!fdPath && w.path) setFdPath(w.path); }).catch(() => {}); } }, [tool]);  // eslint-disable-line react-hooks/exhaustive-deps
@@ -875,7 +914,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v2.4 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v2.5 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -933,6 +972,28 @@ export default function App() {
                 {csBusy ? "Đang gọi Claude..." : "🔌 Test kết nối"}
               </button>
               {csTest && <span className="logindesc" style={{ margin: 0 }}>{csTest}</span>}
+            </div>
+            <div className="field" style={{ marginTop: 14 }}>
+              <label>🏢 Brand Kit — đóng dấu thương hiệu mọi video (bước "Đóng dấu" trong chuỗi)</label>
+              <div className="segchips">
+                <select value={bkLogo} onChange={(e) => setBkLogo(e.target.value)}>
+                  <option value="">— logo (ảnh trong kho) —</option>
+                  {imageFiles.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                </select>
+                <div className="seg sm">
+                  {[["tl", "↖"], ["tr", "↗"], ["bl", "↙"], ["br", "↘"]].map(([v, l]) => (
+                    <button key={v} className={bkCorner === v ? "on" : ""} onClick={() => setBkCorner(v)}>{l}</button>
+                  ))}
+                </div>
+                <input className="lytext" style={{ maxWidth: 140 }} placeholder="chữ ký @kênh"
+                  value={bkSign} maxLength={60} onChange={(e) => setBkSign(e.target.value)} />
+                <button className="btn sm pri" onClick={async () => {
+                  await fetch("/api/brand", { method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ logo: bkLogo, corner: bkCorner, sign: bkSign, opacity: 0.75 }) });
+                  showToast("🏢 Đã lưu Brand Kit");
+                }}>Lưu</button>
+              </div>
             </div>
             <div className="field" style={{ marginTop: 14 }}>
               <label>⚡ Tăng tốc phần cứng (VideoToolbox GPU)</label>
@@ -2472,6 +2533,272 @@ export default function App() {
                 </>
               )}
 
+              {tool === "textedit" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    📝 Tính năng định danh của Descript: <b>bấm vào chữ để gạch bỏ —
+                    video tự cắt đúng đoạn đó</b>. Từ đệm (ừm/à) được đánh dấu đỏ sẵn.
+                  </div>
+                  <button className="btn pri big" disabled={teBusy || !selected}
+                    onClick={async () => {
+                      if (!selected) return;
+                      setTeBusy(true); setTeWords(null); setTeDel(new Set());
+                      try {
+                        const job = await createJob("word_map", selected.name, { model: whModel });
+                        for (let i = 0; i < 200; i++) {
+                          await new Promise((r) => setTimeout(r, 1500));
+                          const js = await getJobs();
+                          const j = js.find((x) => x.id === job.id);
+                          if (j?.status === "error") throw new Error(j.error || "lỗi");
+                          if (j?.status === "done") {
+                            const o = j.outputs.find((x) => x.name.endsWith(".json"));
+                            if (!o) throw new Error("không có dữ liệu chữ");
+                            const d = await (await fetch(o.url)).json();
+                            setTeWords(d.words);
+                            setTeDel(new Set(d.words.flatMap((w: { filler: boolean }, k: number) => w.filler ? [k] : [])));
+                            break;
+                          }
+                        }
+                      } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                      finally { setTeBusy(false); }
+                    }}>
+                    {teBusy ? "⏳ Đang nghe video..." : "🎧 Phân tích transcript"}
+                  </button>
+                  {teWords && (
+                    <>
+                      <div className="tewrap">
+                        {teWords.map((w, k) => (
+                          <span key={k}
+                            className={"teword" + (teDel.has(k) ? " del" : "") + (w.filler ? " fil" : "")}
+                            title={`${w.s.toFixed(1)}s`}
+                            onClick={() => setTeDel((s) => {
+                              const n = new Set(s);
+                              if (n.has(k)) n.delete(k); else n.add(k);
+                              return n;
+                            })}>{w.t}</span>
+                        ))}
+                      </div>
+                      <div className="segchips" style={{ marginTop: 8 }}>
+                        <span className="tllab">{teDel.size} từ sẽ bị cắt</span>
+                        <button className="btn sm" onClick={() => setTeDel(new Set(teWords.flatMap((w, k) => w.filler ? [k] : [])))}>Chỉ từ đệm</button>
+                        <button className="btn sm" onClick={() => setTeDel(new Set())}>Bỏ chọn hết</button>
+                      </div>
+                      <button className="btn pri big" disabled={teDel.size === 0}
+                        onClick={() => {
+                          // các khoảng bị xoá → gộp → phần BÙ = đoạn giữ
+                          const dur = selected!.info.duration;
+                          const cuts = [...teDel].sort((a, b) => a - b)
+                            .map((k) => [Math.max(0, teWords[k].s - 0.03), Math.min(dur, teWords[k].e + 0.03)]);
+                          const merged: number[][] = [];
+                          for (const [a, b] of cuts) {
+                            if (merged.length && a <= merged[merged.length - 1][1] + 0.12)
+                              merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], b);
+                            else merged.push([a, b]);
+                          }
+                          const keep: { start: number; end: number }[] = [];
+                          let pos = 0;
+                          for (const [a, b] of merged) {
+                            if (a - pos > 0.12) keep.push({ start: pos, end: a });
+                            pos = Math.max(pos, b);
+                          }
+                          if (dur - pos > 0.12) keep.push({ start: pos, end: dur });
+                          if (!keep.length) { showToast("⚠️ Xoá hết thì không còn gì"); return; }
+                          runOne("cutlist", { segments: keep });
+                        }}>
+                        ✂ Cắt {teDel.size} từ đã gạch khỏi video
+                      </button>
+                    </>
+                  )}
+                </>
+              )}
+
+              {tool === "studio_sound" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎙 DeepFilterNet phục chế giọng: khử ồn quạt/gió/phòng vang —
+                    mic điện thoại nghe như thu studio. Chạy được cả file audio thuần.
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Giữ lại "không khí" gốc</span><b>{Math.round(ssMix * 100)}%</b></div>
+                    <input type="range" min={0} max={0.5} step={0.05} value={ssMix}
+                      onChange={(e) => setSsMix(parseFloat(e.target.value))} />
+                  </div>
+                  <button className="btn pri big" onClick={() => run("studio_sound", { mix: ssMix })}>
+                    🎙 Phục chế âm thanh
+                  </button>
+                </>
+              )}
+
+              {tool === "viral_score" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    📈 Chấm kiểu Opus Clip: hook 3s đầu · cung cảm xúc · giá trị ·
+                    năng lượng audio · nhịp cắt → <b>điểm 0–99</b> + gợi ý cải thiện.
+                    Chạy batch để xếp hạng cả loạt shorts trước khi đăng.
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <button className="btn pri big" onClick={() => run("viral_score", { model: whModel, ai: aiEngine })}>
+                    📈 Chấm điểm viral
+                  </button>
+                </>
+              )}
+
+              {tool === "clip_prompt" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    ✨ ClipAnything: mô tả khoảnh khắc — AI <b>nhìn hình + nghe năng
+                    lượng</b> để tìm, chạy được cả video KHÔNG lời (gaming/vlog/thể thao).
+                  </div>
+                  <input className="lytext" style={{ width: "100%", maxWidth: "none" }}
+                    placeholder='vd: "các pha ghi bàn", "lúc mọi người cười", "cảnh sản phẩm cận"'
+                    value={cpPrompt} maxLength={300} onChange={(e) => setCpPrompt(e.target.value)} />
+                  <div className="field" style={{ marginTop: 8 }}>
+                    <div className="sl-h"><span>Số khoảnh khắc</span><b>{cpCount}</b></div>
+                    <input type="range" min={1} max={6} step={1} value={cpCount}
+                      onChange={(e) => setCpCount(Number(e.target.value))} />
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Độ dài mỗi clip</span><b>{cpDur}s</b></div>
+                    <input type="range" min={5} max={30} step={1} value={cpDur}
+                      onChange={(e) => setCpDur(Number(e.target.value))} />
+                  </div>
+                  <button className="btn pri big" disabled={!cpPrompt.trim()}
+                    onClick={() => run("clip_prompt", { prompt: cpPrompt.trim(), count: cpCount, clip_dur: cpDur })}>
+                    ✨ Tìm & cắt khoảnh khắc
+                  </button>
+                </>
+              )}
+
+              {tool === "retake_cut" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🔂 Quay một mình hay đọc lại 1 câu nhiều lần? AI tìm các câu bị lặp,
+                    <b> giữ lần đọc tốt nhất</b> (ít ừm/à nhất, ưu tiên lần cuối) và cắt các lần hỏng.
+                  </div>
+                  <div className="field"><label>Model Whisper</label>
+                    <div className="seg">
+                      {["base", "small", "large-v3-turbo"].map((m) => (
+                        <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <button className="btn pri big" onClick={() => run("retake_cut", { model: whModel })}>
+                    🔂 Dọn retake
+                  </button>
+                </>
+              )}
+
+              {tool === "emphasis" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    💥 "Ngữ pháp retention" kiểu Submagic/MrBeast: AI đo từ nào được
+                    NHẤN MẠNH nhất → punch-in zoom + whoosh/pop/ding đúng chỗ (tối đa 1 nhấn/3s).
+                  </div>
+                  <div className="optrow">
+                    <label className="chk"><input type="checkbox" checked={empZoom} onChange={(e) => setEmpZoom(e.target.checked)} />Zoom theo từ nhấn</label>
+                    <label className="chk"><input type="checkbox" checked={empSfx} onChange={(e) => setEmpSfx(e.target.checked)} />Hiệu ứng âm</label>
+                  </div>
+                  <button className="btn pri big" disabled={!empZoom && !empSfx}
+                    onClick={() => run("emphasis", { zoom: empZoom, sfx: empSfx, model: "tiny" })}>
+                    💥 Áp SFX + zoom
+                  </button>
+                </>
+              )}
+
+              {tool === "coach" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🗣 Speaker Coach (Clipchamp/Microsoft): đo tốc độ nói, từ đệm,
+                    khoảng dừng + AI góp ý cụ thể kèm bài tập — luyện trình bày trước khi đăng.
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <button className="btn pri big" onClick={() => run("coach", { model: whModel, ai: aiEngine })}>
+                    🗣 Chấm phần trình bày
+                  </button>
+                </>
+              )}
+
+              {tool === "url_video" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🔗 Kiểu Pictory: dán link bài blog/bài báo → AI trích nội dung,
+                    viết kịch bản, đọc giọng AI + B-roll → video hoàn chỉnh. Hợp cả
+                    biến giáo trình AI-LMS thành video bài giảng.
+                  </div>
+                  <input className="lytext" style={{ width: "100%", maxWidth: "none" }}
+                    placeholder="https://bai-viet-cua-ban..." value={uvUrl}
+                    onChange={(e) => setUvUrl(e.target.value)} />
+                  <div className="field" style={{ marginTop: 8 }}><label>Giọng đọc</label>
+                    <div className="seg">
+                      {(health?.piper_voices?.length ? health.piper_voices : ["vi"]).map((v) => (
+                        <button key={v} className={svVoice === v ? "on" : ""}
+                          onClick={() => setSvVoice(v)}>{VOICE_LABELS[v] || v}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="optrow">
+                    <label className="chk"><input type="checkbox" checked={svPortrait} onChange={(e) => setSvPortrait(e.target.checked)} />Khung dọc 9:16</label>
+                    <label className="chk"><input type="checkbox" checked={svCaption} onChange={(e) => setSvCaption(e.target.checked)} />Phụ đề viral</label>
+                  </div>
+                  <button className="btn pri big" disabled={!/^https?:\/\//.test(uvUrl.trim())}
+                    onClick={async () => {
+                      try {
+                        await createJob("url_video", "", {
+                          url: uvUrl.trim(), voice: svVoice, scenes: svScenes,
+                          target: svPortrait ? "portrait" : "landscape",
+                          caption: svCaption, ai: aiEngine,
+                        });
+                        setJobs(await getJobs()); setRightTab("jobs");
+                        showToast("🔗 Đang biến bài viết thành video...");
+                      } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                    }}>🔗 Link → Video</button>
+                </>
+              )}
+
+              {tool === "montage" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎞 Bật <b>"Chọn nhiều"</b> ở kho media, tick loạt ảnh + clip theo thứ
+                    tự → tự dựng montage (ảnh {mtgPiece.toFixed(1)}s/mảnh, clip lấy đoạn giữa) + nhạc nền.
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Độ dài mỗi mảnh</span><b>{mtgPiece.toFixed(1)}s</b></div>
+                    <input type="range" min={1.2} max={4} step={0.2} value={mtgPiece}
+                      onChange={(e) => setMtgPiece(parseFloat(e.target.value))} />
+                  </div>
+                  <div className="field"><label>Khung</label>
+                    <div className="seg">
+                      {[["169", "🖥 16:9"], ["916", "📱 9:16"], ["11", "⬜ 1:1"]].map(([v, l]) => (
+                        <button key={v} className={mtgTarget === v ? "on" : ""} onClick={() => setMtgTarget(v)}>{l}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="field"><label>Nhạc nền (tuỳ chọn)</label>
+                    <select value={mtgMusic} onChange={(e) => setMtgMusic(e.target.value)}>
+                      <option value="">— không nhạc —</option>
+                      {audioFiles.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                    </select>
+                  </div>
+                  <button className="btn pri big" onClick={() => runMulti("montage", {
+                    piece: mtgPiece, target: mtgTarget, music: mtgMusic || undefined,
+                  })}>🎞 Dựng montage</button>
+                </>
+              )}
+
               {tool === "compress" && (
                 <>
                   <div className="hint" style={{ marginBottom: 10 }}>
@@ -2729,7 +3056,7 @@ export default function App() {
                   </div>
                   <div className="field"><label>Hiệu ứng lên đối tượng</label>
                     <div className="seg">
-                      {[["blur", "🌫 Làm mờ"], ["pixelate", "🟪 Che ô"], ["spotlight", "🔦 Spotlight"], ["green", "🟩 Tách nền"]].map(([v, l]) => (
+                      {[["blur", "🌫 Làm mờ"], ["pixelate", "🟪 Che ô"], ["spotlight", "🔦 Spotlight"], ["green", "🟩 Tách nền"], ["remove", "🪄 XOÁ khỏi video (beta)"]].map(([v, l]) => (
                         <button key={v} className={trackFx === v ? "on" : ""} onClick={() => setTrackFx(v)}>{l}</button>
                       ))}
                     </div>

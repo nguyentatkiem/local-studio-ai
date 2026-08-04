@@ -61,6 +61,15 @@ if [ ! -f yunet/face_detection_yunet_2023mar.onnx ]; then
   mkdir -p yunet && dl yunet/face_detection_yunet_2023mar.onnx "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 fi
 
+# 7a. DeepFilterNet (Studio Sound — khử ồn/vang, binary Rust standalone)
+if [ ! -x deepfilter/deep-filter ]; then
+  echo "==> DeepFilterNet (Studio Sound)"
+  mkdir -p deepfilter
+  A=$([ "$ARCH" = "arm64" ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin)
+  dl deepfilter/deep-filter "https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/deep-filter-0.5.6-$A"
+  chmod +x deepfilter/deep-filter
+fi
+
 # 7b. SAM 2 tiny (track đối tượng — cần thêm: pip install ultralytics trong venv backend)
 if [ ! -f sam2/sam2.1_t.pt ]; then
   echo "==> SAM 2 tiny (track đối tượng)"

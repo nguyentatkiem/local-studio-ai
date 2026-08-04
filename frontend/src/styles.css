@@ -533,3 +533,11 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;bac
 .bres-row{font-size:10.5px;color:var(--dim);white-space:nowrap;overflow:hidden;
   text-overflow:ellipsis;padding:1px 0}
 .bres-row.bad{color:var(--warn)}
+
+/* transcript editor (sửa video bằng chữ) */
+.tewrap{margin-top:10px;background:var(--p2);border:1px solid var(--line);border-radius:10px;
+  padding:10px;max-height:300px;overflow-y:auto;line-height:2.1;font-size:13px}
+.teword{cursor:pointer;padding:2px 3px;border-radius:5px;margin:0 1px;transition:background .1s}
+.teword:hover{background:var(--p4)}
+.teword.fil{color:var(--warn);text-decoration:underline dotted}
+.teword.del{background:rgba(255,107,87,.22);color:var(--faint);text-decoration:line-through}
