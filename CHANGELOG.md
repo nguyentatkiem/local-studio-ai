@@ -1,14 +1,21 @@
 # 📜 Nhật ký cập nhật — Local Studio
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.5.0-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-73-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-2.6.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-75-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/100%25-local--first-7ACB6B?style=for-the-badge" alt="local">
 </p>
 
 > **Local Studio** — trình dựng video AI chạy **100% trên máy bạn**. Không cloud, không credit, không watermark. Footage không bao giờ rời máy.
 
 ---
+
+## 🎤 v2.6 — Giọng CỦA BẠN (Voice Clone + Overdub) · <sub>04/08/2026</sub>
+
+- **🎤 GIỌNG CỦA TÔI** (Descript Overdub) — chọn 10-20s mẫu giọng + gõ transcript → máy đọc MỌI văn bản bằng chính giọng bạn. F5-TTS tiếng Việt ViVoice (1000h, chạy MPS local, model 1.35GB đã strip từ 5.4GB). Dùng được ở TTS · Lồng tiếng · Script-to-Video · Link→Video.
+- **🩹 Overdub vá lời sai** — nói nhầm 1 câu? Chọn khoảng thời gian + gõ câu đúng → giọng clone đọc lại, tự khớp độ dài (atempo) + crossfade 40ms vá thẳng vào video. Test thật: thay [2.5s→5.2s] chuẩn từng mốc.
+- Ghi chú trung thực: lip-sync (Wav2Lip) + eye-contact CHƯA ship — model mở hiện tại không đạt chuẩn chất lượng; chờ thế hệ tốt hơn.
+- ⚠ Giọng clone chỉ dùng với giọng CỦA BẠN hoặc người đã đồng ý — model license CC-BY-NC (phi thương mại).
 
 ## 🌍 v2.5 — Học từ các editor số 1 thế giới · <sub>04/08/2026</sub>
 

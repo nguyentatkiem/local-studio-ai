@@ -1,8 +1,8 @@
 # 🎬 Local Studio — AI Video Editor chạy 100% trên máy
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.5.0-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-73-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-2.6.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-75-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/cloud-0%25-FF6B57?style=for-the-badge" alt="no cloud">
   <img src="https://img.shields.io/badge/watermark-kh%C3%B4ng-7ACB6B?style=for-the-badge" alt="no watermark">
 </p>
@@ -28,7 +28,7 @@
 > 🌐 **Phát hành web tạm qua Cloudflare Tunnel:** xem `DEPLOY-WEB.md`.
 > 🎯 **Track đối tượng SAM 2** cần thêm: `pip install ultralytics` · **Tìm cảnh CLIP** cần: `pip install open_clip_torch` (trong venv backend).
 
-## ✨ 73 tính năng (v2.5)
+## ✨ 75 tính năng (v2.6)
 
 ### 🤖 Tự động hoá TỐI ĐA (không editor nào có đủ bộ này)
 | Tính năng | Mô tả |
@@ -62,6 +62,7 @@
 | Tính năng | Engine |
 |---|---|
 | 🎯 **Track đối tượng** — bấm vào vật/người → mờ/che/spotlight/tách nền/**XOÁ khỏi video (beta)** | **SAM 2** (Meta) · MPS |
+| 🎤 **GIỌNG CỦA TÔI** — clone giọng bạn từ 10-20s mẫu (F5-TTS ViVoice 1000h) · 🩹 **Overdub** vá lời sai bằng gõ chữ | F5-TTS vi · MPS |
 | 📝 **Sửa video bằng TRANSCRIPT** (xoá chữ = video tự cắt — Descript) · 🔂 **xoá câu đọc hỏng** · 🎙 **Studio Sound** khử ồn+vang DeepFilterNet | Whisper · deep-filter |
 | 📈 **Điểm Viral 0–99** (Opus) · 🗣 **Speaker Coach** · ✨ **cắt theo MÔ TẢ** cả video không lời (ClipAnything) | Qwen/Claude · CLIP |
 | 💥 **SFX + zoom theo từ nhấn** (Submagic) · 🔗 **dán link bài viết → video** (Pictory) · 🎞 **Auto Montage** · 🏢 **Brand Kit** | |

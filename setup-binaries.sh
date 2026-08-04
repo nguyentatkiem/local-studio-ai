@@ -61,6 +61,12 @@ if [ ! -f yunet/face_detection_yunet_2023mar.onnx ]; then
   mkdir -p yunet && dl yunet/face_detection_yunet_2023mar.onnx "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 fi
 
+# 7z. F5-TTS tiếng Việt (Voice Clone — cần thêm: pip install f5-tts trong venv backend)
+if [ ! -d f5tts ] || [ -z "$(ls f5tts/*.pt f5tts/*.safetensors 2>/dev/null)" ]; then
+  echo "==> F5-TTS Vietnamese ViVoice (~1.4GB — Voice Clone)"
+  echo "    (tải bằng: huggingface-cli download hynt/F5-TTS-Vietnamese-ViVoice --local-dir binaries/f5tts)"
+fi
+
 # 7a. DeepFilterNet (Studio Sound — khử ồn/vang, binary Rust standalone)
 if [ ! -x deepfilter/deep-filter ]; then
   echo "==> DeepFilterNet (Studio Sound)"

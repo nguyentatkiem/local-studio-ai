@@ -12,7 +12,7 @@ import {
 
 // Nhãn giọng Piper (key khớp backend PIPER_VOICE_MAP)
 const VOICE_LABELS: Record<string, string> = {
-  vi: "🇻🇳 Nữ — vais1000", vi2: "🇻🇳 Nam — 25hours",
+  clone: "🎤 GIỌNG TÔI", vi: "🇻🇳 Nữ — vais1000", vi2: "🇻🇳 Nam — 25hours",
   en: "🇺🇸 Nữ — lessac", en2: "🇺🇸 Nữ — amy", en3: "🇺🇸 Nam — ryan (HQ)",
 };
 
@@ -28,6 +28,7 @@ const TOOL_CATS: Record<string, ToolCat> = {
   scene_split: "edit", punchin: "edit", multi_translate: "ai",
   compress: "edit", multi_export: "pub", organize: "ai",
   textedit: "ai", studio_sound: "audio", viral_score: "ai", emphasis: "edit",
+  voice_clone: "audio", overdub: "audio",
   retake_cut: "ai", coach: "ai", clip_prompt: "ai", montage: "edit", url_video: "ai",
   merge: "edit", beatsync: "edit", silence_cut: "edit", upscale: "edit",
   rife: "edit", bg_remove: "edit", reframe: "edit", speed: "edit", color: "edit",
@@ -57,6 +58,7 @@ const FEAT_KEY: Record<string, string> = {
   textedit: "textedit", studio_sound: "studio_sound", viral_score: "viral_score",
   emphasis: "emphasis", retake_cut: "retake_cut", coach: "coach",
   clip_prompt: "clip_prompt", montage: "montage", url_video: "url_video",
+  voice_clone: "voice_clone", overdub: "overdub",
   reframe: "ffmpeg", speed: "ffmpeg", color: "ffmpeg", music: "ffmpeg",
   stabilize: "ffmpeg", merge: "ffmpeg", audio_enhance: "ffmpeg",
   brand: "ffmpeg", audiogram: "ffmpeg",
@@ -93,6 +95,8 @@ const TOOL_REQS: Record<string, string> = {
   post_pack: "cần whisper (faster/MLX)",
   punchin: "cần whisper (faster/MLX)",
   multi_translate: "cần whisper + Claude/Qwen",
+  voice_clone: "cần model F5-TTS ViVoice trong binaries/f5tts + pip install f5-tts",
+  overdub: "cần Giọng của tôi (F5-TTS) thiết lập xong",
 };
 
 // Ngôn ngữ đích cho Dịch phụ đề AI
@@ -143,7 +147,8 @@ type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" |
   | "autopilot" | "script_video" | "post_pack" | "scene_split" | "punchin" | "multi_translate"
   | "compress" | "multi_export" | "organize"
   | "textedit" | "studio_sound" | "viral_score" | "emphasis" | "retake_cut"
-  | "coach" | "clip_prompt" | "montage" | "url_video";
+  | "coach" | "clip_prompt" | "montage" | "url_video"
+  | "voice_clone" | "overdub";
 
 // Lớp phủ multi-track (đè lên video nền theo mốc thời gian)
 type Layer = {
@@ -193,6 +198,8 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "post_pack", icon: "📦", name: "Gói đăng bài 1 chạm", desc: "video + thumbnail AI + caption/hashtags + srt → 1 file .zip", gpu: true },
   { key: "textedit", icon: "📝", name: "Sửa video bằng TRANSCRIPT", desc: "xoá chữ là video tự cắt — edit như sửa văn bản (Descript)", gpu: false },
   { key: "studio_sound", icon: "🎙", name: "Studio Sound", desc: "khử ồn + khử vang — mic thường nghe như thu studio", gpu: false },
+  { key: "voice_clone", icon: "🎤", name: "GIỌNG CỦA TÔI (voice clone)", desc: "clone giọng bạn từ 10-20s mẫu → đọc mọi văn bản (Descript)", gpu: true },
+  { key: "overdub", icon: "🩹", name: "Overdub — vá lời sai", desc: "nói sai 1 câu? gõ chữ đúng, giọng CLONE đọc vá vào video", gpu: true },
   { key: "viral_score", icon: "📈", name: "Điểm Viral 0–99", desc: "chấm hook · cảm xúc · năng lượng + gợi ý cải thiện", gpu: false },
   { key: "clip_prompt", icon: "✨", name: "Cắt theo MÔ TẢ (ClipAnything)", desc: "gõ 'các pha cười' → AI tìm cắt — cả video không lời", gpu: true },
   { key: "retake_cut", icon: "🔂", name: "Xoá câu đọc hỏng (retake)", desc: "quay 1 câu 5 lần → giữ lần tốt nhất, cắt các lần hỏng", gpu: false },
@@ -524,6 +531,13 @@ export default function App() {
   const [mtgMusic, setMtgMusic] = useState("");
   const [mtgTarget, setMtgTarget] = useState("169");
   const [uvUrl, setUvUrl] = useState("");
+  const [vpReady, setVpReady] = useState(false);
+  const [vpRef, setVpRef] = useState("");
+  const [vpText, setVpText] = useState("");
+  const [vcTry, setVcTry] = useState("Xin chào, đây là giọng nói được nhân bản của tôi. Nghe có giống không?");
+  const [odStart, setOdStart] = useState("");
+  const [odEnd, setOdEnd] = useState("");
+  const [odText, setOdText] = useState("");
   const [bkLogo, setBkLogo] = useState("");
   const [bkSign, setBkSign] = useState("");
   const [bkCorner, setBkCorner] = useState("br");
@@ -699,6 +713,12 @@ export default function App() {
     fetch("/api/perf").then((r) => r.json()).then((d) => setHwOn(!!d.hw)).catch(() => {});
     fetch("/api/brand").then((r) => r.json()).then((b) => { setBkLogo(b.logo || ""); setBkCorner(b.corner || "br"); setBkSign(b.sign || ""); }).catch(() => {});
   }, [showSettings, loadClaudeSettings]);
+  useEffect(() => {
+    if (tool !== "voice_clone" && tool !== "overdub") return;
+    fetch("/api/voice-profile").then((r) => r.json())
+      .then((d) => { setVpReady(!!d.ready); setVpRef(d.ref_audio || ""); setVpText(d.ref_text || ""); })
+      .catch(() => {});
+  }, [tool]);
   // nạp cấu hình thư mục nóng khi mở tool folder
   useEffect(() => { if (tool === "folder") { getWatch().then((w) => { setWatchCfg(w); if (!fdPath && w.path) setFdPath(w.path); }).catch(() => {}); } }, [tool]);  // eslint-disable-line react-hooks/exhaustive-deps
   const applyClaude = async (patch: { enabled?: boolean; model?: string }) => {
@@ -914,7 +934,7 @@ export default function App() {
       {/* ================= TITLEBAR ================= */}
       <header className="titlebar">
         <div className="logo"><span className="mk">L</span><b>LOCAL STUDIO</b></div>
-        <span className="pname">v2.5 — dựng &amp; xử lý AI trên máy</span>
+        <span className="pname">v2.6 — dựng &amp; xử lý AI trên máy</span>
         <div className="spacer" />
         <div className={"offline" + (health ? "" : " err")}>
           <span className="d" /><span>{health ? "OFFLINE · FOOTAGE KHÔNG RỜI MÁY" : "MẤT KẾT NỐI BACKEND"}</span>
@@ -1681,7 +1701,7 @@ export default function App() {
                   </div>
                   <div className="field"><label>Giọng đọc</label>
                     <div className="seg">
-                      {(health?.piper_voices?.length ? health.piper_voices : ["vi", "en"]).map((v) => (
+                      {[...(feats.voice_clone ? ["clone"] : []), ...(health?.piper_voices?.length ? health.piper_voices : ["vi", "en"])].map((v) => (
                         <button key={v} className={ttsVoice === v ? "on" : ""}
                           onClick={() => setTtsVoice(v)}>{VOICE_LABELS[v] || v}</button>
                       ))}
@@ -2213,7 +2233,7 @@ export default function App() {
                   </div>
                   <div className="field"><label>Giọng đọc đích (vi→dịch tiếng Việt, en→English)</label>
                     <div className="seg">
-                      {(health?.piper_voices?.length ? health.piper_voices : ["vi", "en"]).map((v) => (
+                      {[...(feats.voice_clone ? ["clone"] : []), ...(health?.piper_voices?.length ? health.piper_voices : ["vi", "en"])].map((v) => (
                         <button key={v} className={dubVoice === v ? "on" : ""}
                           onClick={() => setDubVoice(v)}>{VOICE_LABELS[v] || v}</button>
                       ))}
@@ -2629,6 +2649,82 @@ export default function App() {
                 </>
               )}
 
+              {tool === "voice_clone" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎤 Clone giọng CỦA BẠN (F5-TTS ViVoice, 100% local): chọn 1 file
+                    audio/video mẫu <b>10-20s nói rõ, ít ồn</b> trong kho + gõ ĐÚNG những
+                    gì đã nói trong mẫu → từ đó máy đọc mọi văn bản bằng giọng bạn.
+                  </div>
+                  <div className="field"><label>File giọng mẫu (trong kho media)</label>
+                    <select value={vpRef} onChange={(e) => setVpRef(e.target.value)}>
+                      <option value="">— chọn file có tiếng nói —</option>
+                      {media.filter((m) => m.info.has_audio).map((m) => (
+                        <option key={m.name} value={m.name}>{m.name} ({fmtDur(m.info.duration)})</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="field"><label>Transcript của mẫu (gõ ĐÚNG từng chữ đã nói)</label>
+                    <textarea className="ttsbox" rows={2} maxLength={500} value={vpText}
+                      placeholder="vd: Xin chào các bạn, mình là Kiêm..." onChange={(e) => setVpText(e.target.value)} />
+                  </div>
+                  <button className="btn pri big" disabled={!vpRef || vpText.trim().length < 10}
+                    onClick={async () => {
+                      const r = await fetch("/api/voice-profile", { method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ ref_audio: vpRef, ref_text: vpText.trim() }) });
+                      const d = await r.json().catch(() => ({}));
+                      if (!r.ok) { showToast("❌ " + (d.detail || "lỗi")); return; }
+                      setVpReady(!!d.ready);
+                      showToast(d.ready ? "🎤 Đã lưu Giọng của tôi!" : "⚠ Lưu xong nhưng thiếu model F5");
+                    }}>💾 Lưu giọng mẫu</button>
+                  {vpReady && (
+                    <>
+                      <div className="field" style={{ marginTop: 12 }}><label>Đọc thử bằng giọng clone</label>
+                        <textarea className="ttsbox" rows={3} maxLength={1200} value={vcTry}
+                          onChange={(e) => setVcTry(e.target.value)} />
+                      </div>
+                      <button className="btn pri big" disabled={!vcTry.trim()}
+                        onClick={async () => {
+                          try {
+                            await createJob("tts", "", { text: vcTry.trim(), voice: "clone", speed: 1.0 });
+                            setJobs(await getJobs()); setRightTab("jobs");
+                            showToast("🎤 Giọng clone đang đọc (lần đầu nạp model ~20s)...");
+                          } catch (e) { showToast("❌ " + String((e as Error).message)); }
+                        }}>▶ Đọc thử giọng của tôi</button>
+                      <div className="hint">Giọng clone dùng được ở: 🗣️ TTS · 🎙️ Lồng tiếng ·
+                        🎥 Script-to-Video · 🔗 Link→Video · 🩹 Overdub.</div>
+                    </>
+                  )}
+                </>
+              )}
+
+              {tool === "overdub" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🩹 Overdub kiểu Descript: nói sai/thiếu 1 câu? Kéo IN/OUT trên
+                    timeline để lấy mốc (hiện ở chân timeline) → nhập vào đây + gõ câu
+                    ĐÚNG — giọng <b>clone của bạn</b> đọc lại và vá thẳng vào video.
+                  </div>
+                  {!vpReady && <div className="hint">⚠ Chưa có Giọng của tôi — thiết lập ở tool 🎤 trước.</div>}
+                  <div className="segchips">
+                    <input className="lytext" style={{ maxWidth: 110 }} placeholder="từ giây (vd 12.5)"
+                      value={odStart} onChange={(e) => setOdStart(e.target.value)} />
+                    <input className="lytext" style={{ maxWidth: 110 }} placeholder="đến giây (vd 15.2)"
+                      value={odEnd} onChange={(e) => setOdEnd(e.target.value)} />
+                  </div>
+                  <div className="field" style={{ marginTop: 8 }}><label>Câu ĐÚNG cần thay vào khoảng đó</label>
+                    <textarea className="ttsbox" rows={2} maxLength={400} value={odText}
+                      onChange={(e) => setOdText(e.target.value)} />
+                  </div>
+                  <button className="btn pri big"
+                    disabled={!vpReady || !odText.trim() || !(parseFloat(odEnd) > parseFloat(odStart))}
+                    onClick={() => run("overdub", {
+                      start: parseFloat(odStart), end: parseFloat(odEnd), text: odText.trim(),
+                    })}>🩹 Vá lời bằng giọng clone</button>
+                </>
+              )}
+
               {tool === "viral_score" && (
                 <>
                   <div className="hint" style={{ marginBottom: 10 }}>
@@ -2744,7 +2840,7 @@ export default function App() {
                     onChange={(e) => setUvUrl(e.target.value)} />
                   <div className="field" style={{ marginTop: 8 }}><label>Giọng đọc</label>
                     <div className="seg">
-                      {(health?.piper_voices?.length ? health.piper_voices : ["vi"]).map((v) => (
+                      {[...(feats.voice_clone ? ["clone"] : []), ...(health?.piper_voices?.length ? health.piper_voices : ["vi"])].map((v) => (
                         <button key={v} className={svVoice === v ? "on" : ""}
                           onClick={() => setSvVoice(v)}>{VOICE_LABELS[v] || v}</button>
                       ))}
@@ -2909,7 +3005,7 @@ export default function App() {
                     onChange={(e) => setSvText(e.target.value)} />
                   <div className="field"><label>Giọng đọc</label>
                     <div className="seg">
-                      {(health?.piper_voices?.length ? health.piper_voices : ["vi"]).map((v) => (
+                      {[...(feats.voice_clone ? ["clone"] : []), ...(health?.piper_voices?.length ? health.piper_voices : ["vi"])].map((v) => (
                         <button key={v} className={svVoice === v ? "on" : ""}
                           onClick={() => setSvVoice(v)}>{VOICE_LABELS[v] || v}</button>
                       ))}

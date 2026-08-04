@@ -9,6 +9,7 @@ backend/brand_config.json
 backend/claude_config.json
 backend/ingest_token.txt
 backend/perf_config.json
+backend/voice_profile.json
 backend/watch_config.json
 binaries/
 desktop/node_modules/

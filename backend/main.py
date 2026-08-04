@@ -1681,8 +1681,9 @@ def job_script_video(job_id: str, p: dict):
         raise RuntimeError("Nhập chủ đề hoặc kịch bản trước")
     if not pexels_available():
         raise RuntimeError("Cần PEXELS_API_KEY trong backend/.env để tải B-roll")
+    use_clone = p.get("voice") == "clone" and voice_clone_ready()
     voice = p.get("voice") if p.get("voice") in PIPER_VOICE_MAP else "vi"
-    if not (PIPER_VOICES_DIR / PIPER_VOICE_MAP[voice]).exists():
+    if not use_clone and not (PIPER_VOICES_DIR / PIPER_VOICE_MAP[voice]).exists():
         raise RuntimeError(f"Chưa tải giọng Piper '{voice}'")
     portrait = p.get("target") != "landscape"
     W, H = (1080, 1920) if portrait else (1920, 1080)
@@ -1690,7 +1691,7 @@ def job_script_video(job_id: str, p: dict):
     ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
 
     _set(job_id, progress=3, message=f"AI ({ai}) viết kịch bản {n_scene} cảnh...")
-    lang_note = "tiếng Việt" if voice.startswith("vi") else "English"
+    lang_note = "tiếng Việt" if (use_clone or voice.startswith("vi")) else "English"
     prompt = (
         f"Viết kịch bản video ngắn dạng voice-over bằng {lang_note} từ đầu vào sau "
         f"(có thể là CHỦ ĐỀ hoặc kịch bản thô):\n\n{text_in}\n\n"
@@ -1713,7 +1714,10 @@ def job_script_video(job_id: str, p: dict):
             _set(job_id, progress=base, message=f"Cảnh {i + 1}/{len(scenes)}: đọc lời bình...")
             vo = TMP / f"sv_{job_id}_{i}.wav"
             tmp.append(vo)
-            _piper_synth(job_id, vo_text, voice, vo)
+            if use_clone:
+                _f5_synth(job_id, vo_text, vo)
+            else:
+                _piper_synth(job_id, vo_text, voice, vo)
             vdur = (media_info(vo)["duration"] or 2) + 0.45  # thở nhẹ cuối câu
 
             _set(job_id, progress=base + 3,
@@ -1786,6 +1790,185 @@ def job_script_video(job_id: str, p: dict):
     finally:
         for f in tmp:
             f.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- Voice Clone (F5-TTS tiếng Việt)
+F5_DIR = BINARIES / "f5tts"
+VOICE_PROFILE_FILE = BACKEND_DIR / "voice_profile.json"
+_F5_CACHE = None
+_F5_LOCK = threading.Lock()
+
+
+def _f5_files():
+    """Tìm ckpt + vocab trong binaries/f5tts (chịu được khác biệt layout repo)."""
+    ckpt = None
+    vocab = None
+    if F5_DIR.exists():
+        for f in sorted(F5_DIR.rglob("*")):
+            if f.suffix in (".pt", ".safetensors") and (ckpt is None or f.stat().st_size > ckpt.stat().st_size):
+                ckpt = f
+            if f.name == "vocab.txt":
+                vocab = f
+    return ckpt, vocab
+
+
+def f5_available() -> bool:
+    try:
+        import f5_tts  # noqa: F401
+    except ImportError:
+        return False
+    ckpt, vocab = _f5_files()
+    return bool(ckpt and vocab)
+
+
+def _voice_profile() -> dict:
+    if VOICE_PROFILE_FILE.exists():
+        try:
+            d = json.loads(VOICE_PROFILE_FILE.read_text(encoding="utf-8"))
+            if isinstance(d, dict) and d.get("ref_audio"):
+                return d
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def voice_clone_ready() -> bool:
+    prof = _voice_profile()
+    return f5_available() and bool(prof) and (UPLOADS / str(prof.get("ref_audio"))).is_file()
+
+
+def _f5_synth(job_id: str, text: str, out_wav: Path, speed: float = 1.0):
+    """Sinh giọng CLONE từ hồ sơ giọng người dùng (F5-TTS ViVoice, MPS).
+    Model nạp 1 lần (~15s lần đầu), sau đó nhanh."""
+    global _F5_CACHE
+    prof = _voice_profile()
+    if not prof:
+        raise RuntimeError("Chưa thiết lập Giọng của tôi (tool 🎤 — chọn mẫu 10-30s + gõ transcript)")
+    ref = safe_upload_path(str(prof["ref_audio"]))
+    if not ref.is_file():
+        raise RuntimeError("File giọng mẫu không còn trong kho media")
+    ckpt, vocab = _f5_files()
+    with _F5_LOCK:
+        if _F5_CACHE is None:
+            _set(job_id, message="Nạp model giọng clone (lần đầu ~15-30s)...")
+            from f5_tts.api import F5TTS
+            import torch
+            dev = "mps" if torch.backends.mps.is_available() else "cpu"
+            # checkpoint ViVoice train trên kiến trúc F5TTS_Base (v0) — KHÔNG phải v1 mặc định
+            _F5_CACHE = F5TTS(model="F5TTS_Base", ckpt_file=str(ckpt),
+                              vocab_file=str(vocab), device=dev)
+        wav, sr, _ = _F5_CACHE.infer(
+            ref_file=str(ref), ref_text=str(prof.get("ref_text") or ""),
+            gen_text=text, speed=min(1.5, max(0.7, speed)), remove_silence=True)
+    import soundfile as sf
+    sf.write(str(out_wav), wav, sr)
+    if not out_wav.exists() or out_wav.stat().st_size < 1000:
+        raise RuntimeError("F5-TTS không sinh được audio")
+
+
+class VoiceProfileReq(BaseModel):
+    ref_audio: str = ""
+    ref_text: str = ""
+
+
+@app.get("/api/voice-profile")
+def get_voice_profile():
+    prof = _voice_profile()
+    return {"ready": voice_clone_ready(), "f5": f5_available(),
+            "ref_audio": prof.get("ref_audio", ""), "ref_text": prof.get("ref_text", "")}
+
+
+@app.post("/api/voice-profile")
+def set_voice_profile(req: VoiceProfileReq):
+    if req.ref_audio:
+        f = safe_upload_path(req.ref_audio)
+        if not f.is_file():
+            raise HTTPException(404, "Không thấy file mẫu trong kho media")
+        inf = media_info(f)
+        if not inf["has_audio"]:
+            raise HTTPException(400, "File mẫu không có âm thanh")
+        if not (4 <= (inf["duration"] or 0) <= 60):
+            raise HTTPException(400, "Mẫu giọng nên dài 4-60 giây (tốt nhất 10-20s, nói rõ, ít ồn)")
+    VOICE_PROFILE_FILE.write_text(json.dumps(
+        {"ref_audio": req.ref_audio[:200], "ref_text": req.ref_text[:500]},
+        ensure_ascii=False), encoding="utf-8")
+    global _F5_CACHE  # đổi mẫu → không cần reload model, chỉ đổi ref lúc infer
+    return {"ready": voice_clone_ready()}
+
+
+def job_clone_tts(job_id: str, text: str, speed: float):
+    """Đọc văn bản bằng GIỌNG CLONE của người dùng (F5-TTS ViVoice)."""
+    if not f5_available():
+        raise RuntimeError("Chưa có model F5-TTS (binaries/f5tts) — chạy setup-binaries.sh")
+    out = unique_out("giong_toi", ".wav")
+    _set(job_id, progress=-1, message="Giọng clone đang đọc...")
+    _f5_synth(job_id, text[:1200], out, speed)
+    mp3 = out.with_suffix(".mp3")
+    r = _run([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+              "-i", str(out), "-c:a", "libmp3lame", "-b:a", "192k", str(mp3)])
+    outs = [out_entry(out)]
+    if r.returncode == 0 and mp3.exists():
+        outs.append(out_entry(mp3))
+    _set(job_id, message=f"Xong — giọng clone đọc {len(text)} ký tự")
+    return outs
+
+
+def job_overdub(job_id: str, src: Path, p: dict):
+    """Overdub kiểu Descript: nói sai 1 câu? Chọn khoảng thời gian + gõ chữ ĐÚNG —
+    giọng CLONE đọc lại và vá thẳng vào video (khớp độ dài bằng atempo)."""
+    info = media_info(src)
+    if not info["has_audio"]:
+        raise RuntimeError("Video không có âm thanh")
+    dur = info["duration"] or 1
+    a = min(dur - 0.2, max(0.0, _safe_float(p.get("start"), 0)))
+    b = min(dur, max(a + 0.3, _safe_float(p.get("end"), a + 1)))
+    text = str(p.get("text") or "").strip()[:400]
+    if not text:
+        raise RuntimeError("Gõ câu ĐÚNG cần thay vào")
+    slot = b - a
+    _set(job_id, progress=5, message=f"Giọng clone đọc câu thay thế ({slot:.1f}s)...")
+    piece = TMP / f"od_{job_id}.wav"
+    fit = TMP / f"od_{job_id}_fit.wav"
+    try:
+        _f5_synth(job_id, text, piece)
+        _cancel_point(job_id)
+        pd = media_info(piece)["duration"] or 0.5
+        tempo = pd / slot
+        if not 0.6 <= tempo <= 1.6:
+            raise RuntimeError(
+                f"Câu mới đọc hết {pd:.1f}s nhưng khoảng chọn chỉ {slot:.1f}s — "
+                "sửa lại text ngắn/dài hơn hoặc nới khoảng thời gian")
+        tempo = min(1.5, max(0.66, tempo))
+        r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                  "-i", str(piece), "-af",
+                                  f"atempo={tempo:.4f},apad=whole_dur={slot:.3f},"
+                                  f"atrim=0:{slot:.3f},aformat=sample_rates=48000:"
+                                  "channel_layouts=stereo", str(fit)])
+        if r.returncode != 0:
+            raise RuntimeError("Khớp thời lượng lỗi")
+        _set(job_id, progress=60, message="Vá đoạn audio vào video (crossfade 40ms)...")
+        out = unique_out(f"{src.stem}_overdub", ".mp4")
+        # thay khoảng [a,b]: gốc bịt tiếng khoảng đó + đè đoạn mới (delay a)
+        fc = (f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+              f"volume=enable='between(t,{a + 0.02:.3f},{b - 0.02:.3f})':volume=0[base];"
+              f"[1:a]adelay={int(a * 1000)}:all=1,afade=t=in:st={a:.3f}:d=0.04,"
+              f"afade=t=out:st={max(a, b - 0.04):.3f}:d=0.04[patch];"
+              f"[base][patch]amix=inputs=2:duration=first:normalize=0[aout]")
+        vcopy = (info.get("vcodec") or "") in ("h264", "hevc", "mpeg4", "av1")
+        vopts = ["-c:v", "copy"] if vcopy else \
+            ["-c:v", "libx264", "-crf", "19", "-preset", "medium", "-pix_fmt", "yuv420p"]
+        r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                  "-i", str(src), "-i", str(fit),
+                                  "-filter_complex", fc, "-map", "0:v?", "-map", "[aout]"]
+                         + (vopts if info["width"] else [])
+                         + ["-c:a", "aac", "-b:a", "192k", str(out)])
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Vá audio lỗi: {r.stderr_text[-250:]}")
+    finally:
+        piece.unlink(missing_ok=True)
+        fit.unlink(missing_ok=True)
+    _set(job_id, message=f"Xong — overdub {a:.1f}s→{b:.1f}s bằng giọng clone")
+    return [out_entry(out)]
 
 
 # ---------------------------------------------------------------- job: URL/Blog → Video
@@ -4682,8 +4865,9 @@ def job_dub(job_id: str, src: Path, p: dict):
     if not info["width"]:
         raise RuntimeError("Cần video có hình để lồng tiếng")
     dur = info["duration"] or 1
+    use_clone = p.get("voice") == "clone" and voice_clone_ready()
     voice = p.get("voice") if p.get("voice") in PIPER_VOICE_MAP else "vi"
-    if not (PIPER_VOICES_DIR / PIPER_VOICE_MAP[voice]).exists():
+    if not use_clone and not (PIPER_VOICES_DIR / PIPER_VOICE_MAP[voice]).exists():
         raise RuntimeError(f"Chưa tải giọng Piper '{voice}'")
     model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
     src_lang = p.get("source_lang") if p.get("source_lang") in ("vi", "en") else None
@@ -4696,7 +4880,7 @@ def job_dub(job_id: str, src: Path, p: dict):
 
     ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
     # giọng vi/vi2/... → ngôn ngữ đích suy từ tiền tố (vi*/en*)
-    tgt_name = LANG_NAMES["vi" if voice.startswith("vi") else "en"]
+    tgt_name = LANG_NAMES["vi" if (use_clone or voice.startswith("vi")) else "en"]
     _set(job_id, progress=48, message=f"Dịch {len(segs)} câu sang {tgt_name}...")
     translated = _ai_translate_lines([s.text.strip() for s in segs], tgt_name, ai, job_id)
     _cancel_point(job_id)
@@ -4710,7 +4894,10 @@ def job_dub(job_id: str, src: Path, p: dict):
             _set(job_id, progress=48 + int(i / len(segs) * 38),
                  message=f"Piper đọc câu {i + 1}/{len(segs)}...")
             raw = TMP / f"dub_{job_id}_{i}.wav"
-            _piper_synth(job_id, t.strip(), voice, raw)
+            if use_clone:
+                _f5_synth(job_id, t.strip(), raw)
+            else:
+                _piper_synth(job_id, t.strip(), voice, raw)
             tmp.append(raw)
             d = media_info(raw)["duration"] or 0.5
             slot = max(0.3, s.end - s.start)
@@ -5804,7 +5991,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "2.5.0",
+        "version": "2.6.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -5835,6 +6022,8 @@ def health():
             "multi_export": ffmpeg_ok,
             "organize": ffmpeg_ok and (llm_available() or claude_available()),
             "studio_sound": dfn_available() and ffmpeg_ok,
+            "voice_clone": f5_available(),
+            "overdub": f5_available() and ffmpeg_ok,
             "viral_score": whisper_ok and ffmpeg_ok,
             "emphasis": whisper_ok and ffmpeg_ok,
             "textedit": whisper_ok and ffmpeg_ok,
@@ -6103,6 +6292,7 @@ STEP_LABELS = {
     "multi_translate": "dịch đa ngữ", "post_pack": "gói đăng bài",
     "compress": "nén gọn", "multi_export": "xuất đa bản", "organize": "gom kho AI",
     "studio_sound": "Studio Sound", "retake_cut": "xoá retake", "emphasis": "SFX+zoom từ nhấn",
+    "clone_tts": "giọng clone đọc", "overdub": "overdub vá lời",
     "brandkit": "đóng dấu thương hiệu", "viral_score": "điểm viral", "coach": "speaker coach",
     "clip_prompt": "cắt theo prompt", "montage": "auto montage", "word_map": "phân tích chữ",
     "url_video": "link → video",
@@ -6131,6 +6321,10 @@ def create_job(req: JobRequest):
         voice = p.get("voice") if p.get("voice") in PIPER_VOICE_MAP else "vi"
         speed = min(1.5, max(0.6, _safe_float(p.get("speed"), 1.0)))
         label = text[:40] + ("…" if len(text) > 40 else "")
+        if p.get("voice") == "clone":  # 🎤 giọng CLONE của người dùng
+            if not voice_clone_ready():
+                raise HTTPException(400, "Chưa thiết lập Giọng của tôi (tool 🎤)")
+            return submit_job("clone_tts", label, job_clone_tts, text, speed)
         return submit_job("tts", label, job_tts, text, voice, speed)
 
     if req.type == "url_video":  # dán link bài viết → video — không cần file nguồn
@@ -6276,6 +6470,10 @@ def create_job(req: JobRequest):
         if not dfn_available():
             raise HTTPException(400, "Chưa có deep-filter — chạy ./setup-binaries.sh")
         return submit_job("studio_sound", src.name, job_studio_sound, src, dict(p))
+    if req.type == "overdub":
+        if not voice_clone_ready():
+            raise HTTPException(400, "Cần thiết lập Giọng của tôi trước (tool 🎤)")
+        return submit_job("overdub", src.name, job_overdub, src, dict(p))
     if req.type == "viral_score":
         if not whisper_available_any():
             raise HTTPException(400, "Cần whisper")
