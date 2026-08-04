@@ -2,6 +2,8 @@
 Local Studio - Backend AI service
 100% local: FastAPI + FFmpeg + faster-whisper + auto-editor + Real-ESRGAN (ncnn-vulkan)
 """
+import os as _os
+_os.environ.setdefault("PYTHONHASHSEED", "0")  # con `python -m` kế thừa giá trị HỢP LỆ
 import colorsys
 import hashlib
 import hmac
@@ -237,8 +239,12 @@ def _maybe_hw(cmd: list) -> list:
         if c == "-crf":
             crf = _safe_int(cmd[i + 1], 19)
             break
-    # CRF → thang chất lượng VT (cao = đẹp): 18→65, 20→60, 23→53, 26→46
-    q = max(35, min(70, int(106 - 2.3 * crf)))
+    # CRF ≤ 16 = yêu cầu chất lượng LƯU TRỮ gần lossless → giữ libx264 (VT không
+    # đạt được mức đó); từ 17 trở lên mới đổi sang GPU cho nhanh
+    if crf <= 16:
+        return cmd
+    # CRF → thang chất lượng VT (cao = đẹp): 18→68, 20→63, 23→56, 26→49
+    q = max(38, min(80, int(112 - 2.5 * crf)))
     out, i = [], 0
     while i < len(cmd):
         if cmd[i] == "-c:v" and i + 1 < len(cmd) and cmd[i + 1] == "libx264":
@@ -549,7 +555,8 @@ def _job_wrapper(job_id: str, fn, *args):
 # không phải xếp sau job AI nặng (SAM2/whisper/upscale chạy nhiều phút)
 FAST_TYPES = {"color", "speed", "export", "enhance", "voicefx", "grade", "cutlist",
               "reframe", "stabilize", "music", "audio_enhance", "brand", "compress",
-              "multi_export", "scene_split", "audiogram", "merge"}
+              "multi_export", "scene_split", "audiogram", "merge", "composite",
+              "brandkit"}
 FAST_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 
@@ -1715,7 +1722,7 @@ def job_script_video(job_id: str, p: dict):
             vo = TMP / f"sv_{job_id}_{i}.wav"
             tmp.append(vo)
             if use_clone:
-                _f5_synth(job_id, vo_text, vo)
+                _f5_synth(job_id, vo_text, vo, nfe=16)
             else:
                 _piper_synth(job_id, vo_text, voice, vo)
             vdur = (media_info(vo)["duration"] or 2) + 0.45  # thở nhẹ cuối câu
@@ -1837,7 +1844,8 @@ def voice_clone_ready() -> bool:
     return f5_available() and bool(prof) and (UPLOADS / str(prof.get("ref_audio"))).is_file()
 
 
-def _f5_synth(job_id: str, text: str, out_wav: Path, speed: float = 1.0):
+def _f5_synth(job_id: str, text: str, out_wav: Path, speed: float = 1.0,
+              nfe: int = 24):
     """Sinh giọng CLONE từ hồ sơ giọng người dùng (F5-TTS ViVoice, MPS).
     Model nạp 1 lần (~15s lần đầu), sau đó nhanh."""
     global _F5_CACHE
@@ -1859,7 +1867,11 @@ def _f5_synth(job_id: str, text: str, out_wav: Path, speed: float = 1.0):
                               vocab_file=str(vocab), device=dev)
         wav, sr, _ = _F5_CACHE.infer(
             ref_file=str(ref), ref_text=str(prof.get("ref_text") or ""),
-            gen_text=text, speed=min(1.5, max(0.7, speed)), remove_silence=True)
+            gen_text=text, speed=min(1.5, max(0.7, speed)), remove_silence=True,
+            seed=0, nfe_step=max(12, min(32, nfe)))
+        # F5 seed_everything() ghi PYTHONHASHSEED vào env server → phải reset về giá
+        # trị HỢP LỆ, nếu không mọi `python -m` con (piper/auto-editor) sẽ sập
+        os.environ["PYTHONHASHSEED"] = "0"
     import soundfile as sf
     sf.write(str(out_wav), wav, sr)
     if not out_wav.exists() or out_wav.stat().st_size < 1000:
@@ -1920,8 +1932,13 @@ def job_overdub(job_id: str, src: Path, p: dict):
     if not info["has_audio"]:
         raise RuntimeError("Video không có âm thanh")
     dur = info["duration"] or 1
-    a = min(dur - 0.2, max(0.0, _safe_float(p.get("start"), 0)))
-    b = min(dur, max(a + 0.3, _safe_float(p.get("end"), a + 1)))
+    raw_a = _safe_float(p.get("start"), 0)
+    raw_b = _safe_float(p.get("end"), raw_a + 1)
+    if raw_b - raw_a < 0.3:  # đảo ngược / quá hẹp → báo rõ, không âm thầm dời chỗ
+        raise RuntimeError(f"Khoảng thời gian không hợp lệ: 'từ' ({raw_a:.1f}s) phải "
+                           f"NHỎ hơn 'đến' ({raw_b:.1f}s) ít nhất 0.3s")
+    a = min(dur - 0.2, max(0.0, raw_a))
+    b = min(dur, max(a + 0.3, raw_b))
     text = str(p.get("text") or "").strip()[:400]
     if not text:
         raise RuntimeError("Gõ câu ĐÚNG cần thay vào")
@@ -1934,10 +1951,12 @@ def job_overdub(job_id: str, src: Path, p: dict):
         _cancel_point(job_id)
         pd = media_info(piece)["duration"] or 0.5
         tempo = pd / slot
-        if not 0.6 <= tempo <= 1.6:
+        # câu NGẮN hơn ô: không cần ép nhanh — apad đệm im lặng cho đủ (không méo).
+        # chỉ CHẶN khi câu quá DÀI (atempo trần 1.5; hơn nữa sẽ bị atrim cắt cụt chữ)
+        if tempo > 1.5:
             raise RuntimeError(
-                f"Câu mới đọc hết {pd:.1f}s nhưng khoảng chọn chỉ {slot:.1f}s — "
-                "sửa lại text ngắn/dài hơn hoặc nới khoảng thời gian")
+                f"Câu mới đọc hết {pd:.1f}s — quá dài so với khoảng chọn {slot:.1f}s. "
+                "Rút ngắn câu hoặc nới rộng khoảng thời gian.")
         tempo = min(1.5, max(0.66, tempo))
         r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
                                   "-i", str(piece), "-af",
@@ -2422,6 +2441,8 @@ def job_multi_translate(job_id: str, src: Path, p: dict):
     if not segs:
         raise RuntimeError("Video không có lời thoại để dịch")
     texts = [s.text.strip() for s in segs]
+    # audio giống nhau ở mọi ngôn ngữ (chỉ khác phụ đề) → copy nếu đã aac, khỏi encode lại
+    acopy = ["-c:a", "copy"] if info.get("acodec") == "aac" else ["-c:a", "aac", "-b:a", "192k"]
     outputs = []
     for li, lang in enumerate(langs):
         _cancel_point(job_id)
@@ -2440,8 +2461,8 @@ def job_multi_translate(job_id: str, src: Path, p: dict):
         r = _run_tracked(job_id, [
             FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
             "-vf", f"subtitles={srt.name}:force_style='Fontsize=18,Outline=1,MarginV=28'",
-            "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
-            "-c:a", "aac", "-b:a", "192k", str(burned)], cwd=str(OUTPUTS))
+            "-c:v", "libx264", "-crf", "20", "-preset", "veryfast"]
+            + acopy + [str(burned)], cwd=str(OUTPUTS))
         if r.returncode == 0 and burned.exists():
             outputs.append(burned)
         else:
@@ -2883,74 +2904,57 @@ def job_emphasis(job_id: str, src: Path, p: dict):
     _set(job_id, progress=50,
          message=f"{len(events)} từ nhấn: " + ", ".join(e.word.strip() for e in events[:5]) + "...")
 
-    # video: zoom 1.08 trong cửa sổ 0.7s quanh từ nhấn (cắt đoạn + concat)
+    # video: zoom 1.08 tại các cửa sổ quanh từ nhấn — 1 PASS DUY NHẤT (overlay bản
+    # phóng to gated by enable) → KHÔNG cắt-nối nên KHÔNG lệch tiếng (fix drift)
     w2, h2 = w // 2 * 2, h // 2 * 2
-    vin = src
+    windows = []
+    for e in events:
+        a, b = max(0.0, e.start - 0.04), min(dur, e.start + 0.72)
+        if not windows or a > windows[-1][1]:
+            windows.append([a, b])
+        else:
+            windows[-1][1] = max(windows[-1][1], b)
+    zoom_vf = None
+    if do_zoom and windows:
+        enable = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in windows)
+        zoom_vf = (f"[0:v]scale={w2}:{h2}:flags=fast_bilinear,split[bg][z];"
+                   f"[z]scale=iw*1.08:ih*1.08,crop={w2}:{h2}[zc];"
+                   f"[bg][zc]overlay=enable='{enable}'[vout]")
     tmp = []
     try:
-        if do_zoom:
-            bounds = [0.0]
-            for e in events:
-                a, b = max(0.0, e.start - 0.04), min(dur, e.start + 0.72)
-                if a > bounds[-1] + 0.15:
-                    bounds += [a, b]
-            if bounds[-1] < dur - 0.15:
-                bounds.append(dur)
-            clips, lst = [], TMP / f"em_{job_id}.txt"
-            tmp.append(lst)
-            zoom_on = False
-            segs2 = list(zip(bounds, bounds[1:]))
-            for i, (a, b) in enumerate(segs2):
-                _cancel_point(job_id)
-                _set(job_id, progress=52 + int(i / len(segs2) * 30),
-                     message=f"Punch-in {i + 1}/{len(segs2)}...")
-                c = TMP / f"em_{job_id}_{i}.mp4"
-                tmp.append(c)
-                vf = (f"scale=trunc(iw*1.08/2)*2:trunc(ih*1.08/2)*2,crop={w2}:{h2}"
-                      if zoom_on else "scale=trunc(iw/2)*2:trunc(ih/2)*2")
-                r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
-                                          "-ss", f"{a:.3f}", "-to", f"{b:.3f}", "-i", str(src),
-                                          "-vf", vf, "-c:v", "libx264", "-crf", "20",
-                                          "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                                          "-c:a", "aac", "-ar", "48000", "-ac", "2", str(c)])
-                if r.returncode != 0:
-                    raise RuntimeError(f"Đoạn {i} lỗi: {r.stderr_text[-150:]}")
-                clips.append(c)
-                zoom_on = not zoom_on
-            lst.write_text("".join(f"file '{c.as_posix()}'\n" for c in clips), encoding="utf-8")
-            vz = TMP / f"em_{job_id}_z.mp4"
-            tmp.append(vz)
-            r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
-                                      "-f", "concat", "-safe", "0", "-i", str(lst),
-                                      "-c", "copy", str(vz)])
-            if r.returncode != 0:
-                raise RuntimeError("Nối zoom lỗi")
-            vin = vz
-
         out = unique_out(f"{src.stem}_nhan", ".mp4")
+        _set(job_id, progress=60, message="Áp zoom + trộn hiệu ứng âm (1 pass)...")
+        # SFX tổng hợp tại chỗ bằng lavfi (offline): ding/pop/whoosh — đặt tại
+        # e.start trên TIMELINE GỐC (video không đổi độ dài → khớp tiếng chính xác)
+        sfx_srcs = [
+            "sine=frequency=1400:duration=0.18,volume=0.5,afade=t=out:st=0.02:d=0.16",
+            "sine=frequency=250:duration=0.12,volume=0.7,afade=t=out:st=0:d=0.12",
+            "anoisesrc=color=pink:duration=0.3,volume=0.45,afade=t=in:st=0:d=0.1,afade=t=out:st=0.1:d=0.2,highpass=f=400",
+        ]
+        inputs = ["-i", str(src)]
+        parts = []
+        if zoom_vf:
+            parts.append(zoom_vf)
+        vmap = "[vout]" if zoom_vf else "0:v"
         if do_sfx:
-            # SFX tổng hợp tại chỗ bằng lavfi (offline, không cần file): whoosh/pop/ding
-            _set(job_id, progress=86, message="Trộn hiệu ứng âm whoosh/pop/ding...")
-            sfx_srcs = [
-                "sine=frequency=1400:duration=0.18,volume=0.5,afade=t=out:st=0.02:d=0.16",  # ding
-                "sine=frequency=250:duration=0.12,volume=0.7,afade=t=out:st=0:d=0.12",       # pop
-                "anoisesrc=color=pink:duration=0.3,volume=0.45,afade=t=in:st=0:d=0.1,afade=t=out:st=0.1:d=0.2,highpass=f=400",  # whoosh
-            ]
-            inputs = ["-i", str(vin)]
-            parts = []
             for i, e in enumerate(events):
                 inputs += ["-f", "lavfi", "-t", "0.5", "-i", sfx_srcs[i % 3]]
                 parts.append(f"[{i + 1}:a]adelay={int(max(0, e.start - 0.03) * 1000)}:all=1[s{i}]")
             mix = "[0:a]" + "".join(f"[s{i}]" for i in range(len(events)))
-            fc = ";".join(parts) + f";{mix}amix=inputs={len(events) + 1}:duration=first:" \
-                                   "normalize=0,alimiter=limit=0.95[aout]"
-            r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error"]
-                             + inputs + ["-filter_complex", fc, "-map", "0:v", "-map", "[aout]",
-                                         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(out)])
-            if r.returncode != 0 or not out.exists():
-                raise RuntimeError(f"Trộn SFX lỗi: {r.stderr_text[-250:]}")
+            parts.append(f"{mix}amix=inputs={len(events) + 1}:duration=first:"
+                         "normalize=0,alimiter=limit=0.95[aout]")
+            amap = "[aout]"
         else:
-            shutil.copy(vin, out) if vin != src else shutil.copy(src, out)
+            amap = "0:a"
+        cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error"] + inputs
+        if parts:
+            cmd += ["-filter_complex", ";".join(parts)]
+        cmd += ["-map", vmap, "-map", amap,
+                "-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", str(out)]
+        r = _run_tracked(job_id, cmd)
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Áp zoom/SFX lỗi: {r.stderr_text[-250:]}")
     finally:
         for f in tmp:
             f.unlink(missing_ok=True)
@@ -3020,9 +3024,9 @@ def job_compress(job_id: str, src: Path, p: dict):
     after = out.stat().st_size
     if after >= before * 0.97:  # không lợi gì → giữ gốc, đừng lừa người dùng
         out.unlink(missing_ok=True)
-        raise RuntimeError(f"File đã tối ưu sẵn ({before / 1e6:.0f}MB) — nén thêm "
+        raise RuntimeError(f"File đã tối ưu sẵn ({_fmt_size(before)}) — nén thêm "
                            "không lợi, giữ nguyên bản gốc")
-    _set(job_id, message=f"Xong — {before / 1e6:.0f}MB → {after / 1e6:.0f}MB "
+    _set(job_id, message=f"Xong — {_fmt_size(before)} → {_fmt_size(after)} "
          f"(tiết kiệm {(1 - after / before) * 100:.0f}%)")
     return [out_entry(out)]
 
@@ -4895,7 +4899,7 @@ def job_dub(job_id: str, src: Path, p: dict):
                  message=f"Piper đọc câu {i + 1}/{len(segs)}...")
             raw = TMP / f"dub_{job_id}_{i}.wav"
             if use_clone:
-                _f5_synth(job_id, t.strip(), raw)
+                _f5_synth(job_id, t.strip(), raw, nfe=16)
             else:
                 _piper_synth(job_id, t.strip(), voice, raw)
             tmp.append(raw)
@@ -5340,6 +5344,12 @@ def job_broll(job_id: str, src: Path, p: dict):
 AILMS_DB = Path.home() / "ai-lms" / "data" / "lms.db"
 AILMS_DEPARTMENTS = {"Marketing", "Sales", "Kế toán - Tài chính", "Nhân sự",
                      "Vận hành", "Kỹ thuật - IT", "Ban lãnh đạo"}
+
+
+def _fmt_size(n) -> str:
+    """Dung lượng đơn vị thích ứng (fix hiển thị '0MB' cho file dưới 1MB)."""
+    n = float(n or 0)
+    return f"{n / 1e9:.2f}GB" if n >= 1e9 else f"{n / 1e6:.1f}MB" if n >= 1e6 else f"{n / 1e3:.0f}KB"
 
 
 def _safe_int(v, default: int) -> int:
@@ -5991,10 +6001,11 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "2.6.0",
+        "version": "2.6.1",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
+        "fast_workers": FAST_EXECUTOR._max_workers,
         "gpu": gpu_info(),
         "piper_voices": piper_installed_voices(),
         "hw_encode": HW_OK and PERF_CFG.get("hw", True),
@@ -6142,7 +6153,7 @@ def _run_step(job_id: str, jtype: str, src: Path, p: dict) -> Path:
     if jtype == "silence_cut":
         outs = job_silence_cut(job_id, src, min(2.0, max(0.0, _safe_float(p.get("margin"), 0.2))))
     elif jtype == "speed":
-        outs = job_speed(job_id, src, min(4.0, max(0.25, _safe_float(p.get("factor"), 2.0))))
+        outs = job_speed(job_id, src, min(4.0, max(0.25, _safe_float(p.get("factor"), 1.0))))
     elif jtype == "color":
         outs = job_color(job_id, src, p.get("filter") if p.get("filter") in COLOR_FILTERS else "vivid")
     elif jtype == "grade":
@@ -6332,6 +6343,8 @@ def create_job(req: JobRequest):
             raise HTTPException(400, "Cần PEXELS_API_KEY + Piper TTS")
         if not llm_available() and not claude_available():
             raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm")
+        if p.get("voice") == "clone" and not voice_clone_ready():
+            raise HTTPException(400, "Chưa thiết lập Giọng của tôi (tool 🎤)")
         return submit_job("url_video", "🔗 link → video", job_url_video, dict(p))
 
     if req.type == "script_video":  # kịch bản → video — không cần file nguồn
@@ -6341,6 +6354,8 @@ def create_job(req: JobRequest):
             raise HTTPException(400, "Cần Piper TTS (giọng đọc)")
         if not llm_available() and not claude_available():
             raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm để viết kịch bản")
+        if p.get("voice") == "clone" and not voice_clone_ready():
+            raise HTTPException(400, "Chưa thiết lập Giọng của tôi (tool 🎤)")
         return submit_job("script_video", "🎬 kịch bản → video", job_script_video, dict(p))
 
     if req.type == "organize":  # AI đặt tên + gom kho — chạy trên thư mục ổ cứng
@@ -6411,7 +6426,7 @@ def create_job(req: JobRequest):
             mode = "blur"
         return submit_job("reframe", src.name, job_reframe, src, mode)
     if req.type == "speed":
-        factor = min(4.0, max(0.25, _safe_float(p.get("factor"), 2.0)))
+        factor = min(4.0, max(0.25, _safe_float(p.get("factor"), 1.0)))
         return submit_job("speed", src.name, job_speed, src, factor)
     if req.type == "color":
         name = p.get("filter", "vivid")
@@ -6600,7 +6615,9 @@ def create_job(req: JobRequest):
     if req.type == "dub":
         if not whisper_available_any():
             raise HTTPException(400, "Cần whisper (faster/MLX) để nhận dạng lời nói")
-        if not piper_available():
+        if p.get("voice") == "clone" and not voice_clone_ready():
+            raise HTTPException(400, "Chưa thiết lập Giọng của tôi (tool 🎤)")
+        if p.get("voice") != "clone" and not piper_available():
             raise HTTPException(400, "Cần Piper TTS (giọng vi/en) để lồng tiếng")
         if not llm_available() and not claude_available():
             raise HTTPException(400, "Cần Claude CLI hoặc mlx-lm để dịch")
@@ -7039,15 +7056,24 @@ def _batch_key(f: Path) -> str:
     return f"{f}|{st.st_size}|{int(st.st_mtime)}"
 
 
+def _incr_key(f: Path, steps: list) -> str:
+    """Khoá 'đã xử lý' gắn với CHUỖI BƯỚC cụ thể — chuỗi khác / thư mục nóng khác
+    không lẫn dấu của nhau (fix: incremental bỏ nhầm file của pipeline khác)."""
+    h = hashlib.md5(json.dumps(steps, sort_keys=True, ensure_ascii=False).encode()
+                    ).hexdigest()[:8]
+    return f"{_batch_key(f)}|{h}"
+
+
 def _match_filters(job_id: str, f: Path, filt: dict) -> bool:
     """Lọc thông minh trước khi xử lý: hướng khung / thời lượng / dung lượng / có tiếng."""
     if not filt:
         return True
     info = media_info(f)
     ori = filt.get("orientation")
-    if ori in ("landscape", "portrait") and info["width"] and info["height"]:
-        is_land = info["width"] >= info["height"]
-        if (ori == "landscape") != is_land:
+    if ori in ("landscape", "portrait"):
+        if not info["width"] or not info["height"]:
+            return False  # không đọc được kích thước (file hỏng/audio) → loại
+        if (ori == "landscape") != (info["width"] >= info["height"]):
             return False
     dur = info["duration"] or 0
     if _safe_float(filt.get("min_dur"), 0) > 0 and dur < _safe_float(filt.get("min_dur"), 0):
@@ -7091,8 +7117,8 @@ def job_folder_batch(job_id: str, p: dict):
     incremental = bool(p.get("incremental", True)) and not only
     if incremental:
         state = _watch_state()
-        skipped = sum(1 for f in files if _batch_key(f) in state)
-        files = [f for f in files if _batch_key(f) not in state]
+        skipped = sum(1 for f in files if _incr_key(f, steps) in state)
+        files = [f for f in files if _incr_key(f, steps) not in state]
         if skipped:
             _set(job_id, message=f"Tăng dần: bỏ qua {skipped} file đã xử lý trước đó")
     filt = p.get("filters") if isinstance(p.get("filters"), dict) else {}
@@ -7113,7 +7139,7 @@ def job_folder_batch(job_id: str, p: dict):
              message=f"[{i + 1}/{len(files)}] {f.name} — {chain}")
         try:
             dest = _process_file_steps(job_id, f, steps, outdir)
-            _watch_mark(_batch_key(f))  # đánh dấu NGAY → hủy giữa chừng vẫn resume đúng chỗ
+            _watch_mark(_incr_key(f, steps))  # đánh dấu NGAY → hủy giữa chừng vẫn resume đúng chỗ
             ok += 1
             lines.append(f"✅ {f.relative_to(d)}  →  {dest.name}")
             results.append({"file": str(f), "name": f.name, "ok": True, "dest": dest.name})
@@ -7223,12 +7249,16 @@ def _watch_state() -> dict:
     return {}
 
 
+_WATCH_STATE_LOCK = threading.Lock()  # read-modify-write watch_state.json phải nguyên tử
+
+
 def _watch_mark(key: str):
-    st = _watch_state()
-    st[key] = time.time()
-    if len(st) > 3000:  # gọn state
-        st = dict(sorted(st.items(), key=lambda kv: -kv[1])[:2000])
-    WATCH_STATE_FILE.write_text(json.dumps(st), encoding="utf-8")
+    with _WATCH_STATE_LOCK:  # tránh mất dấu khi nhiều file batch ghi song song
+        st = _watch_state()
+        st[key] = time.time()
+        if len(st) > 3000:  # gọn state
+            st = dict(sorted(st.items(), key=lambda kv: -kv[1])[:2000])
+        WATCH_STATE_FILE.write_text(json.dumps(st), encoding="utf-8")
 
 
 def job_watch_one(job_id: str, f: Path, steps: list, outdir: Path):
@@ -7253,7 +7283,7 @@ def _watch_one_dir(path: str, recursive: bool, steps: list):
             stt = f.stat()
         except OSError:
             continue
-        key = f"{f}|{stt.st_size}|{int(stt.st_mtime)}"
+        key = _incr_key(f, steps)  # gắn với chuỗi của thư mục nóng này
         if key in state:
             continue
         # file phải "đứng yên": size không đổi giữa 2 nhịp + mtime cũ hơn 8s
@@ -7718,14 +7748,15 @@ def thumb(name: str):
     if not src.is_file():
         raise HTTPException(404, "not found")
     t = THUMBS / (name + ".jpg")
-    if not t.exists() or t.stat().st_mtime < src.stat().st_mtime:
-        info = media_info(src)
-        ss = max(0.0, (info["duration"] or 0) * 0.25)
-        r = _run([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
-                  "-ss", str(ss), "-i", str(src), "-frames:v", "1",
-                  "-vf", "scale=320:-2", str(t)])
-        if r.returncode != 0 or not t.exists():
-            raise HTTPException(404, "no thumbnail")
+    with _cache_lock("thumb:" + name):
+        if not t.exists() or t.stat().st_mtime < src.stat().st_mtime:
+            info = media_info(src)
+            ss = max(0.0, (info["duration"] or 0) * 0.25)
+            r = _run([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                      "-ss", str(ss), "-i", str(src), "-frames:v", "1",
+                      "-vf", "scale=320:-2", str(t)])
+            if r.returncode != 0 or not t.exists():
+                raise HTTPException(404, "no thumbnail")
     return FileResponse(str(t), media_type="image/jpeg")
 
 
@@ -7738,6 +7769,13 @@ _PREVIEW_LOCKS_GUARD = threading.Lock()
 def _preview_lock(name: str) -> threading.Lock:
     with _PREVIEW_LOCKS_GUARD:
         return _PREVIEW_LOCKS.setdefault(name, threading.Lock())
+
+
+def _cache_lock(tag: str) -> threading.Lock:
+    """Khoá theo tài nguyên (tên+loại) — nhiều request cùng thumb/wave/strip 1 file
+    không cùng transcode/render trùng lặp (chờ cái đầu xong rồi trả cache)."""
+    with _PREVIEW_LOCKS_GUARD:
+        return _PREVIEW_LOCKS.setdefault("c:" + tag, threading.Lock())
 
 
 @app.delete("/api/media/{name}")
@@ -7790,14 +7828,15 @@ def wave_media(name: str):
     if not media_info(src)["has_audio"]:
         raise HTTPException(415, "File không có âm thanh")
     out = PREVIEWS / (name + ".wave.png")
-    if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
-        r = _run([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
-                  "-i", str(src), "-filter_complex",
-                  "aformat=channel_layouts=mono,compand,"
-                  "showwavespic=s=1200x96:colors=#FFB23F",
-                  "-frames:v", "1", str(out)])
-        if r.returncode != 0 or not out.exists():
-            raise HTTPException(500, "Không tạo được waveform")
+    with _cache_lock("wave:" + name):
+        if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
+            r = _run([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                      "-i", str(src), "-filter_complex",
+                      "aformat=channel_layouts=mono,compand,"
+                      "showwavespic=s=1200x96:colors=#FFB23F",
+                      "-frames:v", "1", str(out)])
+            if r.returncode != 0 or not out.exists():
+                raise HTTPException(500, "Không tạo được waveform")
     return FileResponse(str(out), media_type="image/png")
 
 
@@ -7811,14 +7850,15 @@ def strip_media(name: str):
     if not info["width"] or (info["duration"] or 0) < 0.2:
         raise HTTPException(415, "File không phải video")
     out = PREVIEWS / (name + ".strip.jpg")
-    if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
-        dur = info["duration"]
-        r = _run([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
-                  "-i", str(src), "-vf",
-                  f"fps=10/{dur:.3f},scale=160:90:force_original_aspect_ratio=increase,"
-                  "crop=160:90,tile=10x1", "-frames:v", "1", "-q:v", "4", str(out)])
-        if r.returncode != 0 or not out.exists():
-            raise HTTPException(500, "Không tạo được filmstrip")
+    with _cache_lock("strip:" + name):
+        if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
+            dur = info["duration"]
+            r = _run([FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                      "-i", str(src), "-vf",
+                      f"fps=10/{dur:.3f},scale=160:90:force_original_aspect_ratio=increase,"
+                      "crop=160:90,tile=10x1", "-frames:v", "1", "-q:v", "4", str(out)])
+            if r.returncode != 0 or not out.exists():
+                raise HTTPException(500, "Không tạo được filmstrip")
     return FileResponse(str(out), media_type="image/jpeg")
 
 

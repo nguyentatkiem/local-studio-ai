@@ -1,7 +1,7 @@
 # 📜 Nhật ký cập nhật — Local Studio
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.6.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/version-2.6.1-FFB23F?style=for-the-badge" alt="version">
   <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-75-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/100%25-local--first-7ACB6B?style=for-the-badge" alt="local">
 </p>
@@ -9,6 +9,15 @@
 > **Local Studio** — trình dựng video AI chạy **100% trên máy bạn**. Không cloud, không credit, không watermark. Footage không bao giờ rời máy.
 
 ---
+
+## 🛠 v2.6.1 — Test kỹ + fix + tăng tốc · <sub>04/08/2026</sub>
+
+Audit đa agent (40 agent: rà code + dùng thật, kiểm chứng đối kháng) → 26 lỗi confirmed, fix hết:
+- 🔴 **PYTHONHASHSEED**: F5 voice-clone ghi seed rác vào env server → mọi `python -m` con (Piper/auto-editor) SẬP sau đó. Fix: truyền seed=0 + reset env + set từ khởi động. (đã tận mắt thấy lỗi này lúc làm v2.6)
+- 🔴 **incremental lẫn chuỗi**: batch/thư mục nóng khoá "đã xử lý" theo file → chuỗi khác bỏ nhầm file của nhau. Fix: khoá gắn hash chuỗi bước.
+- 🔴 **Overdub** từ chối câu sửa ngắn (apad đã lo) + nhận khoảng đảo start>end. Fix: chỉ chặn câu quá dài + validate.
+- ⚡ **Tăng tốc**: composite vào làn nhanh (khỏi chờ job AI); F5 nfe 32→16/24 (dub/script nhanh gấp ~1.4×); thumb/wave/strip khoá chống trùng; multi_translate copy audio; emphasis 1-pass (hết lệch tiếng).
+- UX: guard voice="clone" cho dub/script/link; compress hiện KB/MB đúng; speed lỗi factor giữ 1×; nén CRF≤16 giữ x264 chất lượng lưu trữ; orientation filter loại file hỏng; health báo cả 2 làn.
 
 ## 🎤 v2.6 — Giọng CỦA BẠN (Voice Clone + Overdub) · <sub>04/08/2026</sub>
 
