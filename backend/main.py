@@ -524,10 +524,30 @@ def _set(job_id: str, **kw):
         JOBS[job_id].update(kw)
 
 
+# ---- Thông báo khi việc xong (Telegram — cấu hình ở .env / /api/notify)
+NOTIFY_TYPES = {"folder_batch", "watch", "script_video", "url_video", "autopilot",
+                "organize", "clip_prompt", "multi_translate", "montage", "brandify"}
+
+
+def _notify(text: str):
+    token = os.environ.get("TELEGRAM_TOKEN", "").strip()
+    chat = os.environ.get("TELEGRAM_CHAT", "").strip()
+    if not (token and chat):
+        return
+    try:
+        import httpx
+        httpx.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                   json={"chat_id": chat, "text": text[:3500]}, timeout=10)
+    except Exception:  # noqa: BLE001 - thông báo lỗi không được làm chết job
+        pass
+
+
 def _job_wrapper(job_id: str, fn, *args):
     with JOBS_LOCK:
         if JOBS[job_id]["status"] == "cancelled":
             return
+        jtype = JOBS[job_id]["type"]
+        jinput = JOBS[job_id]["input"]
     _set(job_id, status="running", started=time.time())
     try:
         outputs = fn(job_id, *args)
@@ -537,6 +557,8 @@ def _job_wrapper(job_id: str, fn, *args):
         done_msg = last if last.startswith("Xong") else "Hoàn thành"
         _set(job_id, status="done", progress=100, outputs=outputs,
              finished=time.time(), message=done_msg)
+        if jtype in NOTIFY_TYPES:  # chỉ báo việc dài/hàng loạt (khỏi spam job nhanh)
+            _notify(f"✅ Local Studio — {jtype} ({jinput}) XONG.\n{done_msg[:200]}")
     except JobCancelled:
         _set(job_id, status="cancelled", finished=time.time(), message="Đã hủy")
     except Exception as e:  # noqa: BLE001 - surface any job error to UI
@@ -545,6 +567,8 @@ def _job_wrapper(job_id: str, fn, *args):
         else:
             _set(job_id, status="error", error=str(e)[-1000:], finished=time.time(),
                  message=("Lỗi: " + str(e))[:160])
+            if jtype in NOTIFY_TYPES:
+                _notify(f"❌ Local Studio — {jtype} ({jinput}) LỖI: {str(e)[:200]}")
     finally:
         CANCEL_REQUESTED.discard(job_id)
         with JOBS_LOCK:
@@ -2992,6 +3016,118 @@ def job_word_map(job_id: str, src: Path, p: dict):
     return [out_entry(out)]
 
 
+# ---------------------------------------------------------------- job: chuẩn âm phát sóng (R128)
+def job_normalize(job_id: str, src: Path, p: dict):
+    """Loudnorm 2-PASS chuẩn EBU R128 — đo chính xác rồi chuẩn hoá về mốc nền tảng
+    (-14 LUFS YouTube/TikTok, -16 podcast), True Peak ≤ -1 dBTP. Đo lại xác nhận."""
+    info = media_info(src)
+    if not info["has_audio"]:
+        raise RuntimeError("Tệp không có âm thanh")
+    dur = info["duration"] or 1
+    target = {"youtube": -14, "tiktok": -14, "podcast": -16, "tv": -23}.get(p.get("target"), -14)
+    _set(job_id, progress=5, message=f"Pass 1/2 — đo loudness (đích {target} LUFS)...")
+    r = _run_tracked(job_id, [FFMPEG_BIN, "-hide_banner", "-nostats", "-i", str(src),
+                              "-vn", "-af",
+                              f"loudnorm=I={target}:TP=-1.0:LRA=11:print_format=json",
+                              "-f", "null", "-"])
+    try:
+        m = _extract_json(r.stderr_text[-1400:])
+        vals = {k: float(m[k]) for k in ("input_i", "input_tp", "input_lra", "input_thresh")}
+        # Âm thanh im lặng → loudnorm trả -inf/NaN cho measured_I; pass-2 nhận sẽ crash.
+        # (Tín hiệu thật dù rất nhỏ vẫn cho số hữu hạn > -70, nên vẫn chuẩn hoá bình thường.)
+        if not all(math.isfinite(v) for v in vals.values()) or vals["input_i"] <= -70:
+            raise RuntimeError("Âm thanh gần như im lặng — không có gì để chuẩn âm")
+        meas = (f":measured_I={vals['input_i']}:measured_TP={vals['input_tp']}"
+                f":measured_LRA={vals['input_lra']}:measured_thresh={vals['input_thresh']}"
+                f":offset={_safe_float(m.get('target_offset'), 0)}")
+    except (ValueError, TypeError, KeyError):
+        meas = ""  # đo lỗi (không phải im lặng) → loudnorm 1-pass động vẫn tốt
+    _cancel_point(job_id)
+    _set(job_id, progress=40, message="Pass 2/2 — chuẩn hoá + giới hạn đỉnh...")
+    # linear=true chỉ hợp lệ khi có measured_* (2-pass); thiếu thì dùng chế độ động
+    af = f"loudnorm=I={target}:TP=-1.0:LRA=11{meas}" + (":linear=true" if meas else "")
+    lufs_in = _measure_lufs(job_id, src)
+    if info["width"]:
+        out = unique_out(f"{src.stem}_r128", ".mp4")
+        vcopy = (info.get("vcodec") or "") in ("h264", "hevc", "mpeg4", "av1")
+        vopts = ["-c:v", "copy"] if vcopy else \
+            ["-c:v", "libx264", "-crf", "19", "-preset", "medium", "-pix_fmt", "yuv420p"]
+        args = ["-i", str(src), "-af", af] + vopts + \
+               ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", str(out)]
+    else:
+        out = unique_out(f"{src.stem}_r128", ".mp3")
+        args = ["-i", str(src), "-af", af, "-c:a", "libmp3lame", "-b:a", "320k", str(out)]
+    run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=min(94, 40 + pr * 0.5)), job_id)
+    lufs_out = _measure_lufs(job_id, out)
+    note = ""
+    if math.isfinite(lufs_in) and math.isfinite(lufs_out):
+        note = f" · {lufs_in:.1f} → {lufs_out:.1f} LUFS (đích {target})"
+    _set(job_id, message="Xong — chuẩn âm R128" + note)
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: cân màu tự động (đồng nhất)
+def job_color_match(job_id: str, src: Path, p: dict):
+    """Cân màu tự động cho đồng nhất: auto cân bằng trắng (colorcorrect) + kéo
+    tương phản/độ sáng về mốc trung tính — giảm chênh sáng-tối giữa các cảnh."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình")
+    dur = info["duration"] or 1
+    strength = min(1.0, max(0.2, _safe_float(p.get("strength"), 0.6)))
+    # colorcorrect analyze=average: cân bằng trắng theo trung bình toàn khung →
+    # các cảnh ám xanh/vàng khác nhau được kéo về trung tính giống nhau
+    vf = (f"colorcorrect=analyze=average:saturation={1 + 0.05 * strength:.3f},"
+          f"eq=contrast={1 + 0.05 * strength:.3f}:gamma={1 + 0.03 * strength:.3f}")
+    out = unique_out(f"{src.stem}_canmau", ".mp4")
+    _set(job_id, message="Cân màu tự động (đồng nhất cảnh)...")
+    args = ["-i", str(src), "-vf", vf, "-c:v", "libx264", "-crf", "18",
+            "-preset", "medium", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", str(out)]
+    run_ffmpeg_progress(args, dur, lambda pr: _set(job_id, progress=pr), job_id)
+    return [out_entry(out)]
+
+
+# ---------------------------------------------------------------- job: mục lục chương (auto-chapter)
+def job_auto_chapter(job_id: str, src: Path, p: dict):
+    """Auto-chapter kiểu YouTube: AI chia video thành các chương theo chủ đề →
+    danh sách 'mm:ss Tên chương' dán thẳng vào mô tả YouTube."""
+    info = media_info(src)
+    dur = info["duration"] or 1
+    if dur < 60:
+        raise RuntimeError("Video ngắn (<60s) không cần mục lục chương")
+    model_size = p.get("model") if p.get("model") in WHISPER_MODELS else "base"
+    ai = "claude" if p.get("ai") == "claude" and claude_available() else "local"
+    seg_list, _l, _lg = _speech_recognize(
+        job_id, src, model_size, None, p.get("engine"), dur, 3, 60)
+    lines = _transcript_lines(seg_list)
+    if not lines:
+        raise RuntimeError("Video không có lời thoại để chia chương")
+    text_all = "\n".join(lines)[:16000]
+    n = max(3, min(12, int(dur / 90)))
+    _set(job_id, progress=65, message=f"AI ({ai}) chia ~{n} chương...")
+    prompt = (
+        f"Transcript video ({dur:.0f}s) có mốc [giây]:\n\n{text_all}\n\n"
+        f"Chia thành khoảng {n} chương theo chủ đề. Trả về DUY NHẤT JSON: "
+        '{"chapters": [{"t": <giây bắt đầu>, "name": "<tên chương ngắn tiếng Việt>"}]}. '
+        "Chương ĐẦU TIÊN phải bắt đầu ở giây 0.")
+    try:
+        data = _extract_json(llm_generate(prompt, max_tokens=800, job_id=job_id, engine=ai))
+        chaps = [(max(0, _safe_float(c.get("t"), 0)), str(c.get("name", ""))[:80])
+                 for c in (data.get("chapters") or []) if c.get("name")]
+    except Exception:  # noqa: BLE001
+        chaps = []
+    chaps.sort()
+    if not chaps or chaps[0][0] > 1:
+        chaps.insert(0, (0.0, "Mở đầu"))
+    lines_out = [f"{int(t // 60):02d}:{int(t % 60):02d} {name}" for t, name in chaps]
+    out = unique_out(f"{src.stem}_chuong", ".txt")
+    out.write_text("📑 MỤC LỤC CHƯƠNG (dán vào mô tả YouTube):\n\n"
+                   + "\n".join(lines_out) + "\n", encoding="utf-8")
+    _set(job_id, message=f"Xong — {len(chaps)} chương")
+    return [out_entry(out)]
+
+
 # ---------------------------------------------------------------- job: nén dọn ổ cứng
 COMPRESS_MODES = {
     # mode: (crf, trần chiều cao, nhãn)
@@ -3554,7 +3690,9 @@ def job_montage(job_id: str, files: list, p: dict):
 
 # ---------------------------------------------------------------- Brand Kit
 BRAND_FILE = BACKEND_DIR / "brand_config.json"
-BRAND_CFG = {"logo": "", "corner": "br", "opacity": 0.7, "sign": ""}
+# Hồ sơ thương hiệu FULL: logo/chữ ký + intro/outro + chuỗi bước + chuẩn âm + nhãn AI
+BRAND_CFG = {"logo": "", "corner": "br", "opacity": 0.7, "sign": "",
+             "intro": "", "outro": "", "steps": [], "normalize": True, "ai_tag": True}
 if BRAND_FILE.exists():
     try:
         BRAND_CFG.update({k: v for k, v in
@@ -3569,6 +3707,11 @@ class BrandReq(BaseModel):
     corner: Optional[str] = None
     opacity: Optional[float] = None
     sign: Optional[str] = None
+    intro: Optional[str] = None
+    outro: Optional[str] = None
+    steps: Optional[list] = None
+    normalize: Optional[bool] = None
+    ai_tag: Optional[bool] = None
 
 
 @app.get("/api/brand")
@@ -3586,11 +3729,133 @@ def set_brand(req: BrandReq):
         BRAND_CFG["opacity"] = min(1.0, max(0.1, _safe_float(req.opacity, 0.7)))
     if req.sign is not None:
         BRAND_CFG["sign"] = str(req.sign)[:60]
+    if req.intro is not None:
+        BRAND_CFG["intro"] = str(req.intro)[:200]
+    if req.outro is not None:
+        BRAND_CFG["outro"] = str(req.outro)[:200]
+    if req.steps is not None:
+        BRAND_CFG["steps"] = [s for s in req.steps if isinstance(s, dict)
+                              and s.get("type") in PIPELINE_STEP_TYPES][:6]
+    if req.normalize is not None:
+        BRAND_CFG["normalize"] = bool(req.normalize)
+    if req.ai_tag is not None:
+        BRAND_CFG["ai_tag"] = bool(req.ai_tag)
     try:
         BRAND_FILE.write_text(json.dumps(BRAND_CFG, ensure_ascii=False), encoding="utf-8")
     except OSError:
         pass
     return BRAND_CFG
+
+
+def _norm_clip_to(job_id: str, f: Path, w: int, h: int, fps: int, out: Path):
+    """Chuẩn hoá 1 clip về đúng khung/fps/48k-stereo để concat (intro/outro)."""
+    info = media_info(f)
+    vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+          f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,fps={fps},setsar=1")
+    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", str(f)]
+    if not info["has_audio"]:
+        cmd += ["-f", "lavfi", "-t", f"{info['duration'] or 3:.3f}",
+                "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v", "-map", "1:a"]
+    else:
+        cmd += ["-map", "0:v:0", "-map", "0:a:0"]
+    cmd += ["-vf", vf, "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", "-ac", "2",
+            "-b:a", "192k", str(out)]
+    r = _run_tracked(job_id, cmd)
+    if r.returncode != 0 or not out.exists():
+        raise RuntimeError(f"Chuẩn hoá clip lỗi: {r.stderr_text[-200:]}")
+
+
+def job_brandify(job_id: str, src: Path, p: dict):
+    """Áp HỒ SƠ THƯƠNG HIỆU 1 chạm: chuỗi bước → logo/chữ ký → intro/outro →
+    chuẩn âm R128 → nhãn AI. Cấu hình ở ⚙ Cài đặt (Brand Kit)."""
+    info = media_info(src)
+    if not info["width"]:
+        raise RuntimeError("Cần video có hình")
+    w, h = info["width"] // 2 * 2, info["height"] // 2 * 2
+    fps = int(round(info["fps"] or 30))
+    cur, produced, did = src, [], []
+    try:
+        # 1) chuỗi bước thương hiệu (vd đẹp màu → khung 9:16)
+        for st in (BRAND_CFG.get("steps") or [])[:6]:
+            _cancel_point(job_id)
+            _set(job_id, message=f"Thương hiệu: {STEP_LABELS.get(st['type'], st['type'])}...")
+            primary, outs = _run_step(job_id, st["type"], cur, st.get("params") or {})
+            produced.extend(outs)
+            cur = primary
+            did.append(STEP_LABELS.get(st["type"], st["type"]))
+        # 2) logo + chữ ký
+        logo = None
+        if BRAND_CFG.get("logo"):
+            lp = safe_upload_path(str(BRAND_CFG["logo"]))
+            if lp.is_file() and lp.suffix.lower() in IMAGE_EXT:
+                logo = lp
+        if logo or BRAND_CFG.get("sign"):
+            _set(job_id, message="Thương hiệu: đóng logo + chữ ký...")
+            outs = job_brand(job_id, cur, "", str(BRAND_CFG.get("sign") or "")[:60], logo,
+                             BRAND_CFG.get("corner", "br"),
+                             min(1.0, max(0.1, _safe_float(BRAND_CFG.get("opacity"), 0.7))), 0.01)
+            produced.extend(OUTPUTS / o["name"] for o in outs)
+            cur = OUTPUTS / outs[0]["name"]
+            did.append("logo/chữ ký")
+        # 3) chuẩn âm R128 (trước khi ghép intro/outro để đồng nhất mức)
+        if BRAND_CFG.get("normalize") and info["has_audio"]:
+            _set(job_id, message="Thương hiệu: chuẩn âm -14 LUFS...")
+            try:
+                outs = job_normalize(job_id, cur, {"target": "youtube"})
+                produced.extend(OUTPUTS / o["name"] for o in outs)
+                cur = OUTPUTS / outs[0]["name"]
+                did.append("chuẩn âm")
+            except Exception:  # noqa: BLE001 - chuẩn âm lỗi thì bỏ qua
+                pass
+        # 4) intro + outro (chuẩn hoá cùng khung rồi concat)
+        clips_seq = []
+        for key, tag in (("intro", "intro"), ("__main__", ""), ("outro", "outro")):
+            if key == "__main__":
+                mnorm = TMP / f"bf_{job_id}_main.mp4"
+                _norm_clip_to(job_id, cur, w, h, fps, mnorm)
+                produced.append(mnorm)
+                clips_seq.append(mnorm)
+                continue
+            name = BRAND_CFG.get(key)
+            if not name:
+                continue
+            f = safe_upload_path(str(name))
+            if not f.is_file():
+                continue
+            _set(job_id, message=f"Thương hiệu: ghép {tag}...")
+            nc = TMP / f"bf_{job_id}_{tag}.mp4"
+            _norm_clip_to(job_id, f, w, h, fps, nc)
+            produced.append(nc)
+            if tag == "intro":
+                clips_seq.insert(0, nc)
+                did.append("intro")
+            else:
+                clips_seq.append(nc)
+                did.append("outro")
+        # 5) xuất cuối (concat nếu có intro/outro) + nhãn AI vào metadata
+        ai_meta = (["-metadata", "comment=Created with Local Studio (AI-assisted)"]
+                   if BRAND_CFG.get("ai_tag") else [])
+        out = unique_out(f"{src.stem}_brand", ".mp4")
+        if len(clips_seq) > 1:
+            lst = TMP / f"bf_{job_id}.txt"
+            produced.append(lst)
+            lst.write_text("".join(f"file '{c.as_posix()}'\n" for c in clips_seq), encoding="utf-8")
+            r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                      "-f", "concat", "-safe", "0", "-i", str(lst),
+                                      "-c", "copy"] + ai_meta + [str(out)])
+        else:  # chỉ main → copy + gắn metadata
+            r = _run_tracked(job_id, [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                                      "-i", str(clips_seq[0]), "-c", "copy"] + ai_meta + [str(out)])
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError(f"Xuất bản thương hiệu lỗi: {r.stderr_text[-250:]}")
+    finally:
+        for f in produced:
+            f.unlink(missing_ok=True)
+    if not did:
+        raise RuntimeError("Hồ sơ thương hiệu trống — thiết lập logo/chữ ký/intro/chuỗi ở ⚙")
+    _set(job_id, message="Xong — thương hiệu: " + " → ".join(did))
+    return [out_entry(out)]
 
 
 # ---------------------------------------------------------------- job: composite (multi-track)
@@ -6001,7 +6266,7 @@ def health():
     return {
         "status": "ok",
         "app": "Local Studio",
-        "version": "2.6.1",
+        "version": "2.7.0",
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "workers": WORKER_LIMIT,
@@ -6031,6 +6296,11 @@ def health():
             "autopilot": ffmpeg_ok,
             "compress": ffmpeg_ok,
             "multi_export": ffmpeg_ok,
+            "normalize": ffmpeg_ok,
+            "color_match": ffmpeg_ok,
+            "auto_chapter": whisper_ok and (llm_available() or claude_available()),
+            "brandify": ffmpeg_ok,
+            "notify": bool(os.environ.get("TELEGRAM_TOKEN", "").strip()),
             "organize": ffmpeg_ok and (llm_available() or claude_available()),
             "studio_sound": dfn_available() and ffmpeg_ok,
             "voice_clone": f5_available(),
@@ -6164,6 +6434,10 @@ def _run_step(job_id: str, jtype: str, src: Path, p: dict) -> Path:
         outs = job_enhance(job_id, src, dict(p))
     elif jtype == "compress":
         outs = job_compress(job_id, src, dict(p))
+    elif jtype == "normalize":
+        outs = job_normalize(job_id, src, dict(p))
+    elif jtype == "color_match":
+        outs = job_color_match(job_id, src, dict(p))
     elif jtype == "studio_sound":
         outs = job_studio_sound(job_id, src, dict(p))
     elif jtype == "retake_cut":
@@ -6250,7 +6524,7 @@ PIPELINE_STEP_TYPES = {
     "rife", "upscale", "bg_remove", "audio_enhance", "face_blur", "brand",
     "export", "transcribe", "viral_caption", "broll", "music",
     "enhance", "voicefx", "autoframe", "filler_cut", "retouch", "compress",
-    "studio_sound", "retake_cut", "emphasis", "brandkit",
+    "studio_sound", "retake_cut", "emphasis", "brandkit", "normalize", "color_match",
 }
 
 
@@ -6302,6 +6576,8 @@ STEP_LABELS = {
     "autopilot": "AutoPilot", "scene_split": "tách cảnh",
     "multi_translate": "dịch đa ngữ", "post_pack": "gói đăng bài",
     "compress": "nén gọn", "multi_export": "xuất đa bản", "organize": "gom kho AI",
+    "normalize": "chuẩn âm R128", "color_match": "cân màu", "auto_chapter": "mục lục chương",
+    "brandify": "đóng thương hiệu",
     "studio_sound": "Studio Sound", "retake_cut": "xoá retake", "emphasis": "SFX+zoom từ nhấn",
     "clone_tts": "giọng clone đọc", "overdub": "overdub vá lời",
     "brandkit": "đóng dấu thương hiệu", "viral_score": "điểm viral", "coach": "speaker coach",
@@ -6481,6 +6757,16 @@ def create_job(req: JobRequest):
         return submit_job("punchin", src.name, job_punchin, src, dict(p))
     if req.type == "compress":
         return submit_job("compress", src.name, job_compress, src, dict(p))
+    if req.type == "normalize":
+        return submit_job("normalize", src.name, job_normalize, src, dict(p))
+    if req.type == "color_match":
+        return submit_job("color_match", src.name, job_color_match, src, dict(p))
+    if req.type == "auto_chapter":
+        if not whisper_available_any() or (not llm_available() and not claude_available()):
+            raise HTTPException(400, "Cần whisper + Claude/Qwen")
+        return submit_job("auto_chapter", src.name, job_auto_chapter, src, dict(p))
+    if req.type == "brandify":
+        return submit_job("brandify", src.name, job_brandify, src, dict(p))
     if req.type == "studio_sound":
         if not dfn_available():
             raise HTTPException(400, "Chưa có deep-filter — chạy ./setup-binaries.sh")
@@ -6971,6 +7257,21 @@ class PerfReq(BaseModel):
 @app.get("/api/perf")
 def get_perf():
     return {"hw": PERF_CFG.get("hw", True), "hw_available": HW_OK}
+
+
+@app.get("/api/notify")
+def notify_status():
+    return {"enabled": bool(os.environ.get("TELEGRAM_TOKEN", "").strip()
+                            and os.environ.get("TELEGRAM_CHAT", "").strip())}
+
+
+@app.post("/api/notify/test")
+def notify_test():
+    if not (os.environ.get("TELEGRAM_TOKEN", "").strip()
+            and os.environ.get("TELEGRAM_CHAT", "").strip()):
+        raise HTTPException(400, "Chưa cấu hình TELEGRAM_TOKEN + TELEGRAM_CHAT trong backend/.env")
+    _notify("🔔 Local Studio — thử thông báo. Bạn sẽ nhận tin khi việc hàng loạt xong.")
+    return {"ok": True}
 
 
 @app.post("/api/perf")

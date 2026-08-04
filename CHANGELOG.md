@@ -1,14 +1,24 @@
 # 📜 Nhật ký cập nhật — Local Studio
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.6.1-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-75-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-2.7.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-79-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/100%25-local--first-7ACB6B?style=for-the-badge" alt="local">
 </p>
 
 > **Local Studio** — trình dựng video AI chạy **100% trên máy bạn**. Không cloud, không credit, không watermark. Footage không bao giờ rời máy.
 
 ---
+
+## 🏢 v2.7 — Bộ thương hiệu + Chuẩn hoá xuất bản · <sub>04/08/2026</sub>
+
+Làm video "sẵn sàng đăng" bằng 1 chạm: đóng dấu thương hiệu đồng nhất, chuẩn âm chuẩn nền tảng, cân màu đồng nhất cảnh, tự chia chương, báo Telegram khi việc hàng loạt xong.
+
+- **🏢 Đóng thương hiệu 1 chạm** (`brandify`) — lưu 1 **hồ sơ thương hiệu** (logo + góc + chữ ký + intro + outro + chuỗi bước + tuỳ chọn chuẩn âm/nhãn AI) rồi áp cho MỌI video: đẹp màu → logo/chữ ký → chuẩn âm → ghép intro/outro cùng khung hình. Test thật: 6s + intro 26s → **32.19s** liền mạch, gắn metadata `Created with Local Studio (AI-assisted)`.
+- **🔊 Chuẩn âm R128 2-pass** (`normalize`) — đo chính xác (EBU R128) rồi chuẩn hoá về mốc nền tảng: **-14 LUFS** YouTube/TikTok, -16 podcast, -23 TV; True Peak ≤ -1 dBTP; đo lại xác nhận. Test thật: -20.4 → -16.6 LUFS. Chặn sạch clip im lặng (không còn crash `measured_I=-inf`).
+- **🎨 Cân màu đồng nhất** (`color_match`) — auto cân bằng trắng theo trung bình khung + kéo tương phản/gamma về trung tính → các cảnh ám xanh/vàng khác nhau về cùng tông.
+- **📑 Mục lục chương tự động** (`auto_chapter`) — AI (local) nghe transcript rồi chia chương theo chủ đề → danh sách `mm:ss Tên chương` dán thẳng mô tả YouTube. Test thật: video 62s → 3 chương đúng chủ đề.
+- **🔔 Báo Telegram khi xong** (`notify`) — thêm `TELEGRAM_TOKEN` + `TELEGRAM_CHAT` vào `backend/.env` → nhận tin khi việc **hàng loạt / thư mục nóng / lịch đêm / script** hoàn tất hoặc lỗi (không spam job nhanh).
 
 ## 🛠 v2.6.1 — Test kỹ + fix + tăng tốc · <sub>04/08/2026</sub>
 

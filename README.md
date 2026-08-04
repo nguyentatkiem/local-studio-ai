@@ -1,8 +1,8 @@
 # 🎬 Local Studio — AI Video Editor chạy 100% trên máy
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.6.1-FFB23F?style=for-the-badge" alt="version">
-  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-75-46D6C6?style=for-the-badge" alt="features">
+  <img src="https://img.shields.io/badge/version-2.7.0-FFB23F?style=for-the-badge" alt="version">
+  <img src="https://img.shields.io/badge/t%C3%ADnh%20n%C4%83ng-79-46D6C6?style=for-the-badge" alt="features">
   <img src="https://img.shields.io/badge/cloud-0%25-FF6B57?style=for-the-badge" alt="no cloud">
   <img src="https://img.shields.io/badge/watermark-kh%C3%B4ng-7ACB6B?style=for-the-badge" alt="no watermark">
 </p>
@@ -28,7 +28,16 @@
 > 🌐 **Phát hành web tạm qua Cloudflare Tunnel:** xem `DEPLOY-WEB.md`.
 > 🎯 **Track đối tượng SAM 2** cần thêm: `pip install ultralytics` · **Tìm cảnh CLIP** cần: `pip install open_clip_torch` (trong venv backend).
 
-## ✨ 75 tính năng (v2.6)
+## ✨ 79 tính năng (v2.7)
+
+### 🏢 Sẵn sàng đăng — bộ thương hiệu + chuẩn hoá xuất bản (v2.7)
+| Tính năng | Mô tả |
+|---|---|
+| 🏢 **Đóng thương hiệu 1 chạm** | 1 hồ sơ (logo + chữ ký + intro/outro + chuỗi bước) → áp cho MỌI video: đẹp màu → logo/chữ ký → chuẩn âm → ghép intro/outro cùng khung; gắn nhãn AI-assisted |
+| 🔊 **Chuẩn âm R128 2-pass** | đo EBU R128 rồi chuẩn về -14 LUFS (YouTube/TikTok) · -16 podcast · -23 TV, True Peak ≤ -1 dBTP |
+| 🎨 **Cân màu đồng nhất** | auto cân bằng trắng + kéo tương phản/gamma → các cảnh khác tông về cùng một màu |
+| 📑 **Mục lục chương tự động** | AI nghe transcript → `mm:ss Tên chương` dán thẳng mô tả YouTube |
+| 🔔 **Báo Telegram khi xong** | việc hàng loạt / thư mục nóng / lịch đêm / script xong → nhắn Telegram (cấu hình `.env`) |
 
 ### 🤖 Tự động hoá TỐI ĐA (không editor nào có đủ bộ này)
 | Tính năng | Mô tả |

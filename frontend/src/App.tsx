@@ -27,6 +27,7 @@ const TOOL_CATS: Record<string, ToolCat> = {
   autopilot: "ai", script_video: "ai", post_pack: "ai",
   scene_split: "edit", punchin: "edit", multi_translate: "ai",
   compress: "edit", multi_export: "pub", organize: "ai",
+  brandify: "pub", normalize: "audio", color_match: "edit", auto_chapter: "ai",
   textedit: "ai", studio_sound: "audio", viral_score: "ai", emphasis: "edit",
   voice_clone: "audio", overdub: "audio",
   retake_cut: "ai", coach: "ai", clip_prompt: "ai", montage: "edit", url_video: "ai",
@@ -58,7 +59,8 @@ const FEAT_KEY: Record<string, string> = {
   textedit: "textedit", studio_sound: "studio_sound", viral_score: "viral_score",
   emphasis: "emphasis", retake_cut: "retake_cut", coach: "coach",
   clip_prompt: "clip_prompt", montage: "montage", url_video: "url_video",
-  voice_clone: "voice_clone", overdub: "overdub",
+  voice_clone: "voice_clone", overdub: "overdub", brandify: "brandify",
+  normalize: "normalize", color_match: "color_match", auto_chapter: "auto_chapter",
   reframe: "ffmpeg", speed: "ffmpeg", color: "ffmpeg", music: "ffmpeg",
   stabilize: "ffmpeg", merge: "ffmpeg", audio_enhance: "ffmpeg",
   brand: "ffmpeg", audiogram: "ffmpeg",
@@ -148,7 +150,7 @@ type ToolKey = "auto_edit" | "transcribe" | "silence_cut" | "upscale" | "rife" |
   | "compress" | "multi_export" | "organize"
   | "textedit" | "studio_sound" | "viral_score" | "emphasis" | "retake_cut"
   | "coach" | "clip_prompt" | "montage" | "url_video"
-  | "voice_clone" | "overdub";
+  | "voice_clone" | "overdub" | "brandify" | "normalize" | "color_match" | "auto_chapter";
 
 // Lớp phủ multi-track (đè lên video nền theo mốc thời gian)
 type Layer = {
@@ -179,6 +181,8 @@ const PIPE_PALETTE: { type: string; label: string; def: Record<string, unknown> 
   { type: "retake_cut", label: "🔂 Xoá retake", def: { model: "base" } },
   { type: "emphasis", label: "💥 SFX+zoom từ nhấn", def: { zoom: true, sfx: true } },
   { type: "compress", label: "🗜 Nén gọn", def: { mode: "medium" } },
+  { type: "normalize", label: "🎚 Chuẩn âm R128", def: { target: "youtube" } },
+  { type: "color_match", label: "🎨 Cân màu", def: { strength: 0.6 } },
   { type: "brandkit", label: "🏢 Đóng dấu thương hiệu", def: {} },
   { type: "stabilize", label: "🧷 Chống rung", def: {} },
   { type: "reframe", label: "📐 Khung 9:16", def: { mode: "blur" } },
@@ -195,6 +199,7 @@ const PIPE_PALETTE: { type: string; label: string; def: Record<string, unknown> 
 const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: boolean }[] = [
   { key: "autopilot", icon: "🚀", name: "AutoPilot — Làm hết cho tôi", desc: "1 nút: AI tự dò → cắt lặng+ừm → đẹp màu → chuẩn âm → 9:16 → phụ đề", gpu: true },
   { key: "script_video", icon: "🎥", name: "Kịch bản → Video (Script-to-Video)", desc: "gõ chủ đề → AI chia cảnh + đọc lời + B-roll → video hoàn chỉnh", gpu: true },
+  { key: "brandify", icon: "🏢", name: "Đóng thương hiệu 1 chạm", desc: "áp cả hồ sơ: chuỗi + logo + chuẩn âm + intro/outro", gpu: false },
   { key: "post_pack", icon: "📦", name: "Gói đăng bài 1 chạm", desc: "video + thumbnail AI + caption/hashtags + srt → 1 file .zip", gpu: true },
   { key: "textedit", icon: "📝", name: "Sửa video bằng TRANSCRIPT", desc: "xoá chữ là video tự cắt — edit như sửa văn bản (Descript)", gpu: false },
   { key: "studio_sound", icon: "🎙", name: "Studio Sound", desc: "khử ồn + khử vang — mic thường nghe như thu studio", gpu: false },
@@ -209,6 +214,9 @@ const TOOLS: { key: ToolKey; icon: string; name: string; desc: string; gpu: bool
   { key: "montage", icon: "🎞", name: "Auto Montage", desc: "chọn loạt ảnh/clip + nhạc → tự dựng video tổng hợp", gpu: false },
   { key: "pipeline", icon: "🔗", name: "Chuỗi tự động (nối nhiều bước)", desc: "xếp nhiều tính năng chạy nối tiếp trên 1 video", gpu: false },
   { key: "folder", icon: "📁", name: "Edit hàng loạt cả THƯ MỤC", desc: "lọc thông minh · tăng dần · thư mục nóng · lịch đêm", gpu: false },
+  { key: "normalize", icon: "🎚", name: "Chuẩn âm phát sóng (R128)", desc: "loudnorm 2-pass -14 LUFS chuẩn YouTube/TikTok", gpu: false },
+  { key: "color_match", icon: "🎨", name: "Cân màu đồng nhất", desc: "auto cân bằng trắng — cảnh sáng/tối lệch về đều", gpu: false },
+  { key: "auto_chapter", icon: "📑", name: "Mục lục chương (YouTube)", desc: "AI chia chương + timestamp dán vào mô tả", gpu: false },
   { key: "compress", icon: "🗜", name: "Nén dọn ổ cứng", desc: "giảm 50-80% dung lượng, GPU nhanh — chạy cả kho", gpu: false },
   { key: "multi_export", icon: "📤", name: "Xuất đa phiên bản 1 lần", desc: "TikTok + YouTube + 1:1 + 4:5 cùng lúc", gpu: false },
   { key: "organize", icon: "🏷", name: "AI đặt tên + gom kho", desc: "IMG_1234 → tên có nghĩa · gom thư mục theo chủ đề", gpu: true },
@@ -541,6 +549,13 @@ export default function App() {
   const [bkLogo, setBkLogo] = useState("");
   const [bkSign, setBkSign] = useState("");
   const [bkCorner, setBkCorner] = useState("br");
+  const [bkIntro, setBkIntro] = useState("");
+  const [bkOutro, setBkOutro] = useState("");
+  const [bkNorm, setBkNorm] = useState(true);
+  const [bkAiTag, setBkAiTag] = useState(true);
+  const [nmTarget, setNmTarget] = useState("youtube");
+  const [cmStrength, setCmStrength] = useState(0.6);
+  const [notifyOn, setNotifyOn] = useState(false);
   // Batch thế hệ 2
   const [cpMode, setCpMode] = useState("medium");
   const [mePresets, setMePresets] = useState<string[]>(["tiktok", "youtube"]);
@@ -711,7 +726,12 @@ export default function App() {
     setCsTest(""); loadClaudeSettings();
     getIngestInfo().then(setIngest).catch(() => {});
     fetch("/api/perf").then((r) => r.json()).then((d) => setHwOn(!!d.hw)).catch(() => {});
-    fetch("/api/brand").then((r) => r.json()).then((b) => { setBkLogo(b.logo || ""); setBkCorner(b.corner || "br"); setBkSign(b.sign || ""); }).catch(() => {});
+    fetch("/api/brand").then((r) => r.json()).then((b) => {
+      setBkLogo(b.logo || ""); setBkCorner(b.corner || "br"); setBkSign(b.sign || "");
+      setBkIntro(b.intro || ""); setBkOutro(b.outro || "");
+      setBkNorm(b.normalize !== false); setBkAiTag(b.ai_tag !== false);
+    }).catch(() => {});
+    fetch("/api/notify").then((r) => r.json()).then((d) => setNotifyOn(!!d.enabled)).catch(() => {});
   }, [showSettings, loadClaudeSettings]);
   useEffect(() => {
     if (tool !== "voice_clone" && tool !== "overdub") return;
@@ -994,10 +1014,10 @@ export default function App() {
               {csTest && <span className="logindesc" style={{ margin: 0 }}>{csTest}</span>}
             </div>
             <div className="field" style={{ marginTop: 14 }}>
-              <label>🏢 Brand Kit — đóng dấu thương hiệu mọi video (bước "Đóng dấu" trong chuỗi)</label>
-              <div className="segchips">
+              <label>🏢 HỒ SƠ THƯƠNG HIỆU — áp 1 chạm bằng tool "🏢 Đóng thương hiệu"</label>
+              <div className="segchips" style={{ marginBottom: 6 }}>
                 <select value={bkLogo} onChange={(e) => setBkLogo(e.target.value)}>
-                  <option value="">— logo (ảnh trong kho) —</option>
+                  <option value="">— logo (ảnh) —</option>
                   {imageFiles.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
                 </select>
                 <div className="seg sm">
@@ -1005,16 +1025,48 @@ export default function App() {
                     <button key={v} className={bkCorner === v ? "on" : ""} onClick={() => setBkCorner(v)}>{l}</button>
                   ))}
                 </div>
-                <input className="lytext" style={{ maxWidth: 140 }} placeholder="chữ ký @kênh"
+                <input className="lytext" style={{ maxWidth: 130 }} placeholder="chữ ký @kênh"
                   value={bkSign} maxLength={60} onChange={(e) => setBkSign(e.target.value)} />
+              </div>
+              <div className="segchips" style={{ marginBottom: 6 }}>
+                <select value={bkIntro} onChange={(e) => setBkIntro(e.target.value)}>
+                  <option value="">— intro (video, tuỳ chọn) —</option>
+                  {media.filter((m) => m.info.width && m.info.duration > 0.2).map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                </select>
+                <select value={bkOutro} onChange={(e) => setBkOutro(e.target.value)}>
+                  <option value="">— outro (video, tuỳ chọn) —</option>
+                  {media.filter((m) => m.info.width && m.info.duration > 0.2).map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                </select>
+              </div>
+              <div className="segchips">
+                <label className="chk"><input type="checkbox" checked={bkNorm} onChange={(e) => setBkNorm(e.target.checked)} />Chuẩn âm -14 LUFS</label>
+                <label className="chk"><input type="checkbox" checked={bkAiTag} onChange={(e) => setBkAiTag(e.target.checked)} />Nhãn "AI-assisted"</label>
                 <button className="btn sm pri" onClick={async () => {
                   await fetch("/api/brand", { method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ logo: bkLogo, corner: bkCorner, sign: bkSign, opacity: 0.75 }) });
-                  showToast("🏢 Đã lưu Brand Kit");
-                }}>Lưu</button>
+                    body: JSON.stringify({ logo: bkLogo, corner: bkCorner, sign: bkSign, opacity: 0.75,
+                      intro: bkIntro, outro: bkOutro, normalize: bkNorm, ai_tag: bkAiTag,
+                      steps: pipe.length ? pipe : undefined }) });
+                  showToast("🏢 Đã lưu hồ sơ thương hiệu" + (pipe.length ? " (gồm " + pipe.length + " bước chuỗi hiện tại)" : ""));
+                }}>💾 Lưu hồ sơ</button>
               </div>
+              <div className="hint">💡 Chuỗi bước lấy từ tool 🔗 Chuỗi tự động đang mở (nếu có). Áp bằng tool 🏢 hoặc bước "Đóng dấu" trong chuỗi.</div>
             </div>
+            {!notifyOn && (
+              <div className="field" style={{ marginTop: 10 }}>
+                <label>🔔 Thông báo Telegram khi việc hàng loạt/đêm xong</label>
+                <div className="csrow">Thêm <code>TELEGRAM_TOKEN</code> + <code>TELEGRAM_CHAT</code> vào <code>backend/.env</code> rồi khởi động lại — sẽ nhận tin khi batch/lịch/script xong.</div>
+              </div>
+            )}
+            {notifyOn && (
+              <div className="field" style={{ marginTop: 10 }}>
+                <label>🔔 Thông báo Telegram — ĐANG BẬT</label>
+                <button className="btn sm" onClick={async () => {
+                  const r = await fetch("/api/notify/test", { method: "POST" });
+                  showToast(r.ok ? "🔔 Đã gửi tin thử — kiểm tra Telegram" : "❌ Gửi thất bại");
+                }}>Gửi tin thử</button>
+              </div>
+            )}
             <div className="field" style={{ marginTop: 14 }}>
               <label>⚡ Tăng tốc phần cứng (VideoToolbox GPU)</label>
               <label className="chk"><input type="checkbox" checked={hwOn}
@@ -2645,6 +2697,84 @@ export default function App() {
                   </div>
                   <button className="btn pri big" onClick={() => run("studio_sound", { mix: ssMix })}>
                     🎙 Phục chế âm thanh
+                  </button>
+                </>
+              )}
+
+              {tool === "brandify" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🏢 Áp CẢ HỒ SƠ THƯƠNG HIỆU trong 1 chạm: chuỗi bước đã đặt → logo +
+                    chữ ký → chuẩn âm -14 LUFS → ghép intro/outro → nhãn AI. Cấu hình
+                    ở ⚙ Cài đặt (Brand Kit). Kết hợp "Chọn nhiều" cho cả loạt video.
+                  </div>
+                  <div className="hint">💡 Mọi video ra đồng bộ font/màu/giọng/nhạc thương hiệu — kênh chuyên nghiệp, nhất quán.</div>
+                  <br />
+                  <button className="btn pri big" onClick={() => run("brandify", {})}>
+                    🏢 Đóng thương hiệu
+                  </button>
+                </>
+              )}
+
+              {tool === "normalize" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎚 Loudnorm 2-pass chuẩn EBU R128 — đo chính xác rồi kéo về mốc nền
+                    tảng, đỉnh ≤ -1 dBTP. Hết cảnh video này to video kia nhỏ khi đăng.
+                  </div>
+                  <div className="field"><label>Mốc chuẩn</label>
+                    <div className="seg">
+                      {[["youtube", "YouTube/TikTok -14"], ["podcast", "Podcast -16"], ["tv", "TV -23"]].map(([v, l]) => (
+                        <button key={v} className={nmTarget === v ? "on" : ""} onClick={() => setNmTarget(v)}>{l}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <button className="btn pri big" onClick={() => run("normalize", { target: nmTarget })}>
+                    🎚 Chuẩn âm
+                  </button>
+                </>
+              )}
+
+              {tool === "color_match" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    🎨 Cân màu tự động cho đồng nhất: auto cân bằng trắng — các cảnh
+                    ám xanh/vàng/lệch sáng được kéo về trung tính giống nhau.
+                  </div>
+                  <div className="field">
+                    <div className="sl-h"><span>Cường độ</span><b>{cmStrength.toFixed(1)}</b></div>
+                    <input type="range" min={0.2} max={1} step={0.1} value={cmStrength}
+                      onChange={(e) => setCmStrength(parseFloat(e.target.value))} />
+                  </div>
+                  <button className="btn pri big" onClick={() => run("color_match", { strength: cmStrength })}>
+                    🎨 Cân màu
+                  </button>
+                </>
+              )}
+
+              {tool === "auto_chapter" && (
+                <>
+                  <div className="hint" style={{ marginBottom: 10 }}>
+                    📑 AI nghe video dài → chia chương theo chủ đề → danh sách
+                    "mm:ss Tên chương" dán thẳng vào mô tả YouTube (video ≥ 60s).
+                  </div>
+                  <div className="field"><label>Model Whisper</label>
+                    <div className="seg">
+                      {["base", "small", "large-v3-turbo"].map((m) => (
+                        <button key={m} className={whModel === m ? "on" : ""} onClick={() => setWhModel(m)}>{m}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {feats.claude && (
+                    <div className="field"><label>Não AI</label>
+                      <div className="seg">
+                        <button className={aiEngine === "local" ? "on" : ""} onClick={() => setAiEngine("local")}>Local (Qwen)</button>
+                        <button className={aiEngine === "claude" ? "on" : ""} onClick={() => setAiEngine("claude")}>✨ Claude (sub)</button>
+                      </div>
+                    </div>
+                  )}
+                  <button className="btn pri big" onClick={() => run("auto_chapter", { model: whModel, ai: aiEngine })}>
+                    📑 Tạo mục lục chương
                   </button>
                 </>
               )}
